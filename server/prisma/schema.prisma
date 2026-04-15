@@ -1,0 +1,705 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Usuario {
+  id       String   @id @default(cuid())
+  email    String   @unique
+  senha    String
+  nome     String
+  ativo    Boolean  @default(true)
+  criadoEm DateTime @default(now())
+
+  projetosUsuario IaProjetoUsuario[]
+  mensagens       CrmMensagemWhatsapp[]
+}
+
+model EmpresaEmitente {
+  id                     String              @id @default(cuid())
+  nome                   String
+  cnpj                   String              @unique
+  inscricaoMunicipal     String
+  regime                 String              @default("2")
+  aliquotaIss            Float               @default(0.05)
+  itemListaServico       String              @default("1.01")
+  codTributacao          String              @default("0101")
+  certNome               String?
+  certValidade           DateTime?
+  ativo                  Boolean             @default(true)
+  criadoEm               DateTime            @default(now())
+  atualizadoEm           DateTime            @updatedAt
+  bairro                 String?
+  cep                    String?
+  cidade                 String?
+  codigoMunicipio        String?
+  complemento            String?
+  email                  String?
+  endereco               String?
+  inscricaoEstadual      String?
+  nomeFantasia           String?
+  numero                 String?
+  telefone               String?
+  uf                     String?
+  smtpFrom               String?
+  smtpHost               String?
+  smtpPass               String?
+  smtpPort               Int?
+  smtpSecure             Boolean             @default(false)
+  smtpUser               String?
+  certPass               String?
+  logoPath               String?
+  pixClientId            String?
+  pixChave               String?
+  boletoClientId         String?
+  boletoNumeroCliente    String?
+  boletoContaCorrente    String?
+  boletoModalidade       String?             @default("1")
+  boletoContratoCobranca String?
+  boletoMultaPercent     Float?              @default(2)
+  boletoJurosDiaPercent  Float?              @default(0.033)
+  codigoNbs              String?
+  codigoServicoNacional  String?
+  regimeTributacao       String?
+  timbradoPath           String?
+
+  cobrancas          Cobranca[]
+  contratos          Contrato[]
+  notas              NotaFiscal[]
+  propostas          Proposta[]
+  templateDocumentos TemplateDocumento[]
+  lancamentos        Lancamento[]
+}
+
+model Tomador {
+  id                String          @id @default(cuid())
+  nome              String
+  cpfCnpj           String          @unique
+  email             String?
+  telefone          String?
+  endereco          String?
+  numero            String?
+  complemento       String?
+  bairro            String?
+  cidade            String?
+  codigoMunicipio   String?
+  uf                String?
+  cep               String?
+  inscMunicipal     String?
+  criadoEm          DateTime        @default(now())
+  atualizadoEm      DateTime        @updatedAt
+  inscricaoEstadual String?
+  nomeFantasia      String?
+  dataNascimento    DateTime?
+  nacionalidade     String?
+  estadoCivil       String?
+  profissao         String?
+  rg                String?
+  rgOrgaoEmissor    String?
+  naturalidade      String?
+  capitalSocial     Int?
+  dataConstituicao  DateTime?
+  tipoSocietario    String?
+  objetoSocial      String?
+  regimeCasamento   String?
+
+  administradores Administrador[]
+  contratos       Contrato[]
+  propostas       Proposta[]
+}
+
+model Administrador {
+  id              String    @id @default(cuid())
+  tomadorId       String
+  nome            String
+  cpf             String?
+  cargo           String?   @default("Administrador")
+  nacionalidade   String?
+  estadoCivil     String?
+  profissao       String?
+  rg              String?
+  rgOrgaoEmissor  String?
+  dataNascimento  DateTime?
+  naturalidade    String?
+  endereco        String?
+  numero          String?
+  complemento     String?
+  bairro          String?
+  cidade          String?
+  uf              String?
+  cep             String?
+  criadoEm        DateTime  @default(now())
+  atualizadoEm    DateTime  @updatedAt
+  regimeCasamento String?
+
+  tomador Tomador @relation(fields: [tomadorId], references: [id])
+}
+
+model Contrato {
+  id                   String          @id @default(cuid())
+  emitenteId           String
+  tomadorId            String
+  descricaoServico     String
+  valor                Int
+  diaVencimento        Int
+  issRetido            Boolean         @default(false)
+  ativo                Boolean         @default(true)
+  observacoes          String?
+  criadoEm             DateTime        @default(now())
+  atualizadoEm         DateTime        @updatedAt
+  codigoNbs            String?
+  itemListaServico     String?
+  retirCofins          Boolean         @default(false)
+  retirCsll            Boolean         @default(false)
+  retirIr              Boolean         @default(false)
+  retirPis             Boolean         @default(false)
+  nomeServico          String?
+  gerarCobrancaAuto    Boolean         @default(true)
+  metodoCobr           String          @default("PIX_BOLETO")
+  emitirNfseAuto       Boolean         @default(true)
+  tipoContrato         String          @default("RECORRENTE")
+  totalParcelas        Int?
+  contratoAssinadoPath String?
+  contratoAssinadoNome String?
+  contratoAssinadoEm   DateTime?
+
+  cobrancas Cobranca[]
+  emitente  EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  tomador   Tomador         @relation(fields: [tomadorId], references: [id])
+  notas     NotaFiscal[]
+  proposta  Proposta?
+}
+
+model Proposta {
+  id                        String            @id @default(cuid())
+  emitenteId                String
+  tomadorId                 String
+  titulo                    String
+  textoHtml                 String
+  status                    String            @default("RASCUNHO")
+  valorEstimado             Int?
+  validadeAte               DateTime?
+  tokenAceite               String            @unique @default(cuid())
+  paktSignUrl               String?
+  aceitoEm                  DateTime?
+  aceitoIp                  String?
+  contratoId                String?           @unique
+  criadoEm                  DateTime          @default(now())
+  atualizadoEm              DateTime          @updatedAt
+  paktDocumentId            String?
+  contratoDiaVencimento     Int?
+  contratoMetodoCobr        String?           @default("PIX_BOLETO")
+  contratoTipoContrato      String?           @default("RECORRENTE")
+  contratoTotalParcelas     Int?
+  contratoEmitirNfseAuto    Boolean?          @default(true)
+  contratoGerarCobrancaAuto Boolean?          @default(true)
+  contratoIssRetido         Boolean?          @default(false)
+  contratoDescricao         String?
+  paktSignedPdfPath         String?
+  templatesGerar            String?
+  honorariosExitoPerc       Int?              // % honorários de êxito (ex: 30 = 30%)
+
+  documentosGerados DocumentoGerado[]
+  contrato          Contrato?         @relation(fields: [contratoId], references: [id])
+  emitente          EmpresaEmitente   @relation(fields: [emitenteId], references: [id])
+  tomador           Tomador           @relation(fields: [tomadorId], references: [id])
+}
+
+model TemplateDocumento {
+  id           String            @id @default(cuid())
+  emitenteId   String
+  tipo         String
+  titulo       String
+  textoHtml    String
+  ativo        Boolean           @default(true)
+  criadoEm     DateTime          @default(now())
+  atualizadoEm DateTime          @updatedAt
+  cabecalhoPath String?
+
+  documentosGerados DocumentoGerado[]
+  emitente          EmpresaEmitente   @relation(fields: [emitenteId], references: [id])
+}
+
+model DocumentoGerado {
+  id         String            @id @default(cuid())
+  propostaId String
+  templateId String
+  tipo       String
+  titulo     String
+  pdfPath    String?
+  criadoEm   DateTime          @default(now())
+  docxPath   String?
+
+  proposta Proposta          @relation(fields: [propostaId], references: [id])
+  template TemplateDocumento @relation(fields: [templateId], references: [id])
+}
+
+model Cobranca {
+  id                   String          @id @default(cuid())
+  contratoId           String
+  emitenteId           String
+  competencia          String
+  valor                Int
+  vencimento           String
+  pixTxid              String?
+  pixBrcode            String?
+  pixQrcode            String?
+  pixStatus            String          @default("PENDENTE")
+  pixExpiresAt         DateTime?
+  boletoNossoNumero    Int?
+  boletoLinhaDigitavel String?
+  boletoCodigoBarras   String?
+  boletoUrlPdf         String?
+  boletoStatus         String          @default("AGUARDANDO")
+  boletoPagoEm         String?
+  boletoValorPago      Int?
+  criadoEm             DateTime        @default(now())
+  atualizadoEm         DateTime        @updatedAt
+  pixEndToEndId        String?
+  pixPagadorDoc        String?
+  pixPagadorNome       String?
+  pixPagoEm            DateTime?
+
+  contrato Contrato        @relation(fields: [contratoId], references: [id])
+  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+}
+
+model NotaFiscal {
+  id           String          @id @default(cuid())
+  contratoId   String
+  emitenteId   String
+  competencia  String
+  valor        Int
+  numero       String?
+  codigoVerif  String?
+  status       String          @default("PENDENTE")
+  xmlRetorno   String?
+  linkNfse     String?
+  erroMsg      String?
+  emitidoEm    DateTime?
+  criadoEm     DateTime        @default(now())
+  atualizadoEm DateTime        @updatedAt
+
+  contrato Contrato        @relation(fields: [contratoId], references: [id])
+  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// CRM — Funil Kanban (Avoce)
+// ─────────────────────────────────────────────
+
+model CrmPipeline {
+  id          String     @id @default(cuid())
+  nome        String
+  descricao   String?
+  cor         String     @default("#6366f1")
+  ordem       Int        @default(0)
+  tipo        String     @default("comercial") // comercial | processual
+  ativo       Boolean    @default(true)
+  pipedriveId Int?       @unique
+  criadoEm    DateTime   @default(now())
+
+  stages CrmStage[]
+  deals  CrmDeal[]
+}
+
+model CrmStage {
+  id               String   @id @default(cuid())
+  pipelineId       String
+  chave            String
+  nome             String
+  ordem            Int
+  cor              String   @default("#6366f1")
+  ehEntrada        Boolean  @default(false)
+  ehGanho          Boolean  @default(false)
+  ehEncerramento   Boolean  @default(false)
+  requerAcaoHumana Boolean  @default(false)
+  ativo            Boolean  @default(true)
+  pipedriveId      Int?
+
+  pipeline CrmPipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  deals    CrmDeal[]
+
+  @@unique([pipelineId, chave])
+}
+
+model CrmDeal {
+  id               String    @id @default(cuid())
+  titulo           String
+  pipelineId       String
+  stageId          String
+  contatoId        String?
+  responsavelId    String?
+  projetoId        String?
+  valor            Decimal?  @db.Decimal(12, 2)
+  status           String    @default("aberto") // aberto | ganho | perdido
+  urgencia         Boolean   @default(false)
+  fonteLead        String?
+  descricao        String?
+  camposCustom     Json?
+  numeroCnj        String?
+  proximoPrazo     DateTime?
+  dataFechamentoEsperada DateTime?
+  qualificacao     Json?
+  ultimoContatoEm  DateTime?
+  organizacao      String?
+  motivoPerda      String?
+  rotulo           String?
+  probabilidade    Int?
+  moeda            String?
+  pipedriveId      Int?      @unique
+  // IA fields
+  iaAtiva          Boolean   @default(true)
+  iaStageChave     String?
+  iaPersonaChave   String?
+  iaPausadaPor     String?
+  iaPausadaEm      DateTime?
+  closerTentativas Int       @default(0)
+  proximoContatoEm DateTime?
+  docsConfirmados  Boolean   @default(false)
+  // Avaliação jurídica
+  parecer             String?   // Texto do parecer da Dra. Daniela
+  valorEstimado       Decimal?  @db.Decimal(12, 2)  // Estimativa IA do valor da causa
+  valorCausaAjuizada  Decimal?  @db.Decimal(12, 2)  // Valor da causa no processo ajuizado
+  valorCondenacao     Decimal?  @db.Decimal(12, 2)  // Valor da condenação
+  valorAcordo         Decimal?  @db.Decimal(12, 2)  // Valor do acordo homologado
+  criadoEm         DateTime  @default(now())
+  atualizadoEm     DateTime  @updatedAt
+
+  pipeline  CrmPipeline         @relation(fields: [pipelineId], references: [id])
+  stage     CrmStage            @relation(fields: [stageId], references: [id])
+  contato   CrmContato?         @relation(fields: [contatoId], references: [id])
+  projeto   IaProjeto?          @relation(fields: [projetoId], references: [id])
+  stageLog  CrmDealStageLog[]
+  notas     CrmNota[]
+  mensagens CrmMensagemWhatsapp[]
+  vinculos  CrmVinculoEmprego[]
+}
+
+model CrmDealStageLog {
+  id              String   @id @default(cuid())
+  dealId          String
+  stageAnteriorId String?
+  stageNovoId     String
+  usuarioId       String?
+  motivo          String?
+  criadoEm        DateTime @default(now())
+
+  deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+}
+
+model CrmNota {
+  id        String   @id @default(cuid())
+  dealId    String
+  usuarioId String?
+  conteudo  String
+  criadoEm  DateTime @default(now())
+
+  deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+}
+
+model CrmContato {
+  id           String   @id @default(cuid())
+  nome         String
+  whatsapp     String?
+  telefone     String?
+  cpf          String?
+  email        String?
+  cidade       String?
+  empresa      String?
+  profissao    String?
+  pipedriveId  Int?     @unique
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  deals     CrmDeal[]
+  mensagens CrmMensagemWhatsapp[]
+}
+
+// ─────────────────────────────────────────────
+// IA — Agente WhatsApp (Avoce)
+// ─────────────────────────────────────────────
+
+model IaProjeto {
+  id                String   @id @default(cuid())
+  nome              String
+  descricao         String?
+  ativo             Boolean  @default(true)
+  whatsappInstancia String?
+  criadoEm          DateTime @default(now())
+
+  configs      IaProjetoConfig[]
+  personas     IaPersona[]
+  fases        IaFaseFunil[]
+  perguntas    IaPerguntaQualificacao[]
+  templates    IaMensagemTemplate[]
+  regras       IaRegraTransicao[]
+  logs         IaInteracaoLog[]
+  notificacoes IaNotificacaoEvento[]
+  llmProvedores IaLlmProvedor[]
+  deals        CrmDeal[]
+  campanhas    CrmCampanhaReengajamento[]
+  usuarios     IaProjetoUsuario[]
+}
+
+model IaProjetoUsuario {
+  id           String   @id @default(cuid())
+  projetoId    String
+  usuarioId    String
+  funcao       String   @default("atendente") // admin | atendente | closer
+  // How this user appears in WhatsApp when intervening manually:
+  // null = keep current IA persona name | any string = show that name
+  nomeWhatsapp String?
+  criadoEm    DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+  usuario Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, usuarioId])
+}
+
+model IaProjetoConfig {
+  id             String   @id @default(cuid())
+  projetoId      String
+  chave          String   // evolution_api_url | evolution_api_key | anthropic_api_key | etc.
+  valor          String?
+  valorEncrypted Boolean  @default(false)
+  descricao      String?
+  tipo           String   @default("texto") // texto | senha | booleano | numero
+  categoria      String?  // llm | whatsapp | audio | comportamento | pakt
+  editavelPainel Boolean  @default(true)
+  criadoEm       DateTime @default(now())
+  atualizadoEm   DateTime @updatedAt
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+model IaPersona {
+  id             String  @id @default(cuid())
+  projetoId      String
+  chave          String  // assistente | advogado | closer
+  nomeExibicao   String
+  descricaoPapel String?
+  systemPrompt   String
+  tom            String  @default("profissional")
+  ordem          Int     @default(0)
+  ativo          Boolean @default(true)
+  ttsVoiceId     String? // ElevenLabs voice ID para TTS
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+model IaFaseFunil {
+  id               String  @id @default(cuid())
+  projetoId        String
+  pipelineId       String?
+  chave            String
+  nomeExibicao     String
+  descricao        String?
+  ordem            Int
+  cor              String  @default("#6366f1")
+  personaChave     String?
+  pipelineTipo     String  @default("comercial") // comercial | processual
+  ehEntrada        Boolean @default(false)
+  ehGanho          Boolean @default(false)
+  ehEncerramento   Boolean @default(false)
+  requerAcaoHumana Boolean @default(false)
+  ativo            Boolean @default(true)
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+model IaPerguntaQualificacao {
+  id               String  @id @default(cuid())
+  projetoId        String
+  chave            String
+  perguntaContexto String
+  exemploAbordagem String?
+  tipoDado         String  @default("texto") // texto | booleano | numero | data
+  opcoes           Json?
+  obrigatorio      Boolean @default(true)
+  ordem            Int
+  stageColeta      String?
+  ativo            Boolean @default(true)
+  // Conditional activation: question becomes required when `dependeDe` field matches `ativaSeResposta` regex
+  dependeDe        String? // chave of the parent question that controls this one
+  ativaSeResposta  String? // JS regex pattern (case-insensitive) tested against the parent answer
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaMensagemTemplate {
+  id           String  @id @default(cuid())
+  projetoId    String
+  chave        String
+  descricao    String?
+  template     String
+  personaChave String?
+  ativo        Boolean @default(true)
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+model IaRegraTransicao {
+  id                String  @id @default(cuid())
+  projetoId         String
+  stageOrigemChave  String?
+  stageDestinoChave String
+  condicao               String  // primeira_mensagem | sem_resposta_Xhoras | cliente_respondeu | qualificacao_completa | interesse_confirmado | docs_confirmados | contrato_assinado | closer_tentativas_esgotadas | humano_marcou_fase
+  parametros             Json?
+  acaoAdicional          String? // trocar_persona:X | solicitar_documentos | gerar_proposta_automatica | criar_deal_processual
+  ordem                  Int     @default(0)
+  requerPrescricaoAtiva  Boolean @default(false) // if true, qualificacao_completa only fires when prescription check passes
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaLlmProvedor {
+  id        String  @id @default(cuid())
+  projetoId String
+  ordem     Int
+  provider  String  // anthropic | openai | groq
+  modelo    String
+  apiKey    String
+  ativo     Boolean @default(true)
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, ordem])
+}
+
+model IaNotificacaoEvento {
+  id         String   @id @default(cuid())
+  projetoId  String
+  nome       String   // Display name, e.g. "Lead qualificado"
+  evento     String   // Event key: "qualificacao_completa" | "stage_entrada:{chave}" | "proposta_aceita" | etc.
+  destino    String   // WhatsApp number or group JID that receives the notification
+  mensagem   String   // Template: {{nome}}, {{cidade}}, {{stage}}, {{telefone}}
+  ativo      Boolean  @default(true)
+  criadoEm  DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaInteracaoLog {
+  id           String   @id @default(cuid())
+  dealId       String?
+  projetoId    String?
+  personaChave String?
+  stageChave   String?
+  llmUsado     String?
+  tokensEntrada Int?
+  tokensSaida   Int?
+  latenciaMs    Int?
+  erro         String?
+  criadoEm     DateTime @default(now())
+
+  projeto IaProjeto? @relation(fields: [projetoId], references: [id])
+}
+
+model CrmMensagemWhatsapp {
+  id                 String   @id @default(cuid())
+  dealId             String?
+  contatoId          String?
+  direcao            String   // in | out
+  remetente          String?
+  personaChave       String?
+  tipo               String   @default("text") // text | image | audio | document
+  conteudo           String?
+  midiaUrl           String?
+  transcricao        String?
+  evolutionMessageId String?  @unique
+  usuarioId          String?   // set when a human user sends manually
+  nomeRemetente      String?   // display name used when sending (persona or user's chosen name)
+  lida               Boolean  @default(false)
+  enviadaEm          DateTime @default(now())
+
+  deal    CrmDeal?    @relation(fields: [dealId], references: [id])
+  contato CrmContato? @relation(fields: [contatoId], references: [id])
+  usuario Usuario?    @relation(fields: [usuarioId], references: [id])
+}
+
+model CrmVinculoEmprego {
+  id               String    @id @default(cuid())
+  dealId           String
+  ordem            Int       @default(0)
+  funcao           String?
+  vinculo          String?   // CLT | autonomo | avulso | cooperado
+  empresa          String?
+  tempoServico     String?
+  saida            String?
+  frota            String?
+  horasExtras      Boolean?
+  pagamentoPorFora String?
+  injusticas       String?
+  dentroPresricao  Boolean?
+  prazoPresricao   DateTime?
+  acaoRecomendada  String?
+  criadoEm         DateTime  @default(now())
+
+  deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────
+// Configuração geral (chave-valor)
+// ─────────────────────────────────────────────
+
+model Configuracao {
+  chave        String   @id
+  valor        String
+  atualizadoEm DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────
+// Reengajamento automático
+// ─────────────────────────────────────────────
+
+model CrmCampanhaReengajamento {
+  id             String    @id @default(cuid())
+  nome           String
+  projetoId      String?
+  pipelineId     String?
+  stageIds       String[]
+  diasSemContato Int       @default(7)
+  mensagem       String
+  ativa          Boolean   @default(true)
+  totalEnviados  Int       @default(0)
+  ultimoDisparo  DateTime?
+  criadoEm       DateTime  @default(now())
+  atualizadoEm   DateTime  @updatedAt
+
+  projeto IaProjeto? @relation(fields: [projetoId], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// Financeiro
+// ─────────────────────────────────────────────
+
+model Lancamento {
+  id           String   @id @default(cuid())
+  tipo         String   // receita | despesa
+  descricao    String
+  categoria    String?
+  valor        Decimal  @db.Decimal(12, 2)
+  data         DateTime
+  emitenteId   String?
+  dealId       String?
+  pago         Boolean  @default(true)
+  obs          String?
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
+}

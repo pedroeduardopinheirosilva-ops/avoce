@@ -1,0 +1,22 @@
+{
+  "name": "avoce",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently \"pnpm --filter server dev\" \"pnpm --filter web dev\"",
+    "build": "pnpm --filter server build && pnpm --filter web build",
+    "start": "pnpm --filter server start"
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0",
+    "prisma": "5.22.0"
+  },
+  "dependencies": {
+    "@prisma/client": "5.22.0",
+    "undici": "^8.0.2"
+  }
+}

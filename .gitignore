@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+server/dist/
+web/dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+certs/
+
+# Logs
+*.log
+pm2.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Leads / large data files
+leads_*.json
+
+# Generated uploads / contracts (keep structure, not files)
+uploads/
+contratos/
+logos/
+timbrados-empresa/
+
+# Prisma generated client (regenerate via prisma generate)
+server/src/generated/
