@@ -66,6 +66,8 @@ model EmpresaEmitente {
   codigoServicoNacional  String?
   regimeTributacao       String?
   timbradoPath           String?
+  faturamentoAutoAtivo   Boolean             @default(false)
+  diaEmissaoNfse         Int?
 
   cobrancas          Cobranca[]
   contratos          Contrato[]
@@ -375,9 +377,10 @@ model CrmDeal {
   contato   CrmContato?         @relation(fields: [contatoId], references: [id])
   projeto   IaProjeto?          @relation(fields: [projetoId], references: [id])
   stageLog  CrmDealStageLog[]
-  notas     CrmNota[]
-  mensagens CrmMensagemWhatsapp[]
-  vinculos  CrmVinculoEmprego[]
+  notas              CrmNota[]
+  mensagens          CrmMensagemWhatsapp[]
+  vinculos           CrmVinculoEmprego[]
+  eventosIdentidade  IaEventoIdentidade[]
 }
 
 model CrmDealStageLog {
@@ -444,6 +447,25 @@ model IaProjeto {
   deals        CrmDeal[]
   campanhas    CrmCampanhaReengajamento[]
   usuarios     IaProjetoUsuario[]
+  vinculoFlow  IaVinculoFlowPasso[]
+}
+
+model IaVinculoFlowPasso {
+  id           String   @id @default(cuid())
+  projetoId    String
+  chave        String
+  pergunta     String   @db.Text
+  campoColetar String?
+  ordemPadrao  Int      @default(0)
+  ativo        Boolean  @default(true)
+  skipSe       Json?
+  tipoEspecial String?
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
 }
 
 model IaProjetoUsuario {
@@ -702,4 +724,19 @@ model Lancamento {
   atualizadoEm DateTime @updatedAt
 
   emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// IA — Transparência de identidade (P2)
+// ─────────────────────────────────────────────
+
+model IaEventoIdentidade {
+  id              String   @id @default(cuid())
+  dealId          String
+  deal            CrmDeal  @relation(fields: [dealId], references: [id])
+  mensagemCliente String
+  respostaEnviada String
+  criadoEm        DateTime @default(now())
+
+  @@index([dealId])
 }

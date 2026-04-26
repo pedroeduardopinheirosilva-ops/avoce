@@ -6,11 +6,34 @@
 import { prisma } from "../db.js";
 import { callLlm, extractJson } from "./llm.js";
 import { isHumanized } from "./humanizer.js";
-import { sendText, sendTyping, sendWhatsAppAudio, downloadMedia } from "../services/evolution.js";
+import { sendText, sendTyping, sendWhatsAppAudio, downloadMedia, sendDocument } from "../services/evolution.js";
 import { transcribeAudio, downloadAudioFromEvolution } from "../services/whisper.js";
 import { textToSpeech } from "../services/elevenlabs.js";
 import { extractCNHData, type CNHExtractorResult } from "./cnh-extractor.js";
 import Groq from "groq-sdk";
+import { assertSendable, handleBlockedSend, PromptLeakError, type SendableContext } from "./output-guard.js";
+import { detectIdentityQuestion, buildIdentityResponse, registrarEventoIdentidade } from "./identity-handler.js";
+import { detectFrustration, buildFrustrationHandling, type FrustrationHandling } from "./frustration-detector.js";
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Message debounce queue — coalesce rapid messages from the same deal into one LLM call
+// When a message arrives, wait DEBOUNCE_MS before processing.
+// If another message from the same deal arrives before the timer fires, restart the timer.
+// ──────────────────────────────────────────────────────────────────────────────
+const DEBOUNCE_MS = 4000; // 4 seconds
+const _debounceQueue = new Map<string, ReturnType<typeof setTimeout>>();
+
+function debounceProcess(dealId: string, fn: () => Promise<void>): void {
+  const existing = _debounceQueue.get(dealId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    _debounceQueue.delete(dealId);
+    try { await fn(); } catch (err) {
+      console.error(`[Debounce] Erro ao processar deal ${dealId}:`, err);
+    }
+  }, DEBOUNCE_MS);
+  _debounceQueue.set(dealId, timer);
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // LLM failure retry queue
@@ -83,6 +106,53 @@ async function sendHumanized(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Text normalization helper (remove acentos + lowercase)
+// ──────────────────────────────────────────────────────────────────────────────
+
+function normalizarTexto(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// sendHumanizedSafe — sendHumanized com output-guard antes do envio
+// ──────────────────────────────────────────────────────────────────────────────
+
+async function sendHumanizedSafe(
+  evoConfig: EvolutionConfig,
+  phone: string,
+  text: string,
+  readDelayMs = 0,
+  guardCtx: { deal: { id: string }; persona: { chave: string; nomeExibicao: string }; projetoId: string; currentStep?: { stepType: string; pergunta: string; chave: string } | null }
+): Promise<void> {
+  const ctx: SendableContext = {
+    text,
+    currentStep: guardCtx.currentStep ?? null,
+    persona: { chave: guardCtx.persona.chave, nomeExibicao: guardCtx.persona.nomeExibicao },
+    dealId: guardCtx.deal.id,
+    projetoId: guardCtx.projetoId,
+  };
+
+  try {
+    assertSendable(ctx);
+  } catch (err) {
+    if (err instanceof PromptLeakError) {
+      const outcome = await handleBlockedSend(err, ctx);
+      if (outcome.fallbackText) {
+        await sendHumanized(evoConfig, phone, outcome.fallbackText, readDelayMs);
+      }
+      return;
+    }
+    throw err;
+  }
+
+  await sendHumanized(evoConfig, phone, text, readDelayMs);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Response cleanup helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -96,7 +166,7 @@ function limparResposta(text: string, nomePersona: string): string {
   const escaped = nomePersona.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Strip: *Ana*\n | Ana\n | *Ana*: | Ana: | *Ana* | followed by space/newline at start
   const semPrefixo = text
-    .replace(new RegExp(`^\\*?${escaped}\\*?[:\\s]\\s*`, ""), "")
+    .replace(new RegExp(`^\\*?${escaped}[^\\S\\n]*\\*?[:\\n\\s]\\s*`, ""), "")
     .trim();
   // Strip emojis
   return semPrefixo.replace(EMOJI_REGEX, "").replace(/\s{2,}/g, " ").trim();
@@ -807,7 +877,8 @@ export interface EvolutionConfig {
 
 export async function processIncomingMessage(
   projetoId: string,
-  msg: EvolutionWebhookMessage
+  msg: EvolutionWebhookMessage,
+  saveOnly = false   // when true: only save to DB, skip LLM (for intermediate debounce messages)
 ): Promise<void> {
   const phone = msg.key.remoteJid.replace(/@.*/, "");
   if (msg.key.fromMe) return;
@@ -1002,10 +1073,41 @@ export async function processIncomingMessage(
     throw err;
   }
 
-  // 2b. New deal → send first proactive message and stop here
-  // Pass empty name so the AI doesn't use the WhatsApp profile name before asking
+  // 2b. saveOnly mode — just save to DB, no LLM processing (intermediate debounce messages)
+  if (saveOnly) return;
+
+  // 2c. New deal → greet and stop.
+  // Prefer the configured saudação step; fall back to LLM-generated greeting.
   if (isNewDeal) {
-    await enviarMensagemProativa(projetoId, deal.id, phone, "primeira_mensagem", "");
+    // Race condition / duplicate webhook guard: if the deal already has an outgoing message, bail out.
+    const alreadyGreeted = await prisma.crmMensagemWhatsapp.count({ where: { dealId: deal.id, direcao: "out" } });
+    if (alreadyGreeted > 0) return;
+
+    const { getGreetingStep } = await import("./flow-controller.js");
+    const greetingStepText = await getGreetingStep(projetoId).catch(() => null);
+
+    if (greetingStepText) {
+      const horaStr = new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo", hour12: false });
+      const hora = parseInt(horaStr.split(":")[0], 10);
+      const saudacaoWord = hora >= 5 && hora < 12 ? "Bom dia" : hora >= 12 && hora < 18 ? "Boa tarde" : "Boa noite";
+      const saudacaoFull = `${saudacaoWord}! ${greetingStepText}`;
+
+      const qualAtual = (deal.qualificacao as Record<string, unknown>) ?? {};
+      qualAtual._saudacao_enviada = true;
+      await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: qualAtual as any } });
+
+      const evoConf = await getEvolutionConfig(projetoId);
+      if (evoConf) {
+        const delayMs = 1500 + Math.random() * 1500;
+        await sendHumanized(evoConf, phone, saudacaoFull, delayMs);
+        await prisma.crmMensagemWhatsapp.create({
+          data: { dealId: deal.id, contatoId: contato.id, direcao: "out", tipo: "text", conteudo: saudacaoFull },
+        });
+        await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+      }
+    } else {
+      await enviarMensagemProativa(projetoId, deal.id, phone, "primeira_mensagem", "");
+    }
     return;
   }
 
@@ -1050,28 +1152,89 @@ export async function processIncomingMessage(
 
   let merged: Record<string, unknown> = (deal.qualificacao as Record<string, unknown>) ?? {};
 
-  // 7a. Auto-populate nome from WhatsApp pushName if not yet in qualificacao
-  if (!merged.nome && contato.nome && !contato.nome.startsWith("Lead ")) {
-    const primeiroNome = contato.nome.trim().split(" ")[0];
-    merged.nome = primeiroNome;
-    await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
+  // ── Early returns: identidade e frustração (antes de qualquer LLM) ──────────
+
+  const mensagemNormalizada = normalizarTexto(text ?? "");
+
+  // Sprint 1.1 — P2: pergunta de identidade tem precedência absoluta
+  if (text && detectIdentityQuestion(mensagemNormalizada)) {
+    const respostaIdentidade = await buildIdentityResponse({ id: projetoId }, persona);
+    const evoConf = await getEvolutionConfig(projetoId);
+    if (evoConf) {
+      await sendHumanizedSafe(evoConf, phone, respostaIdentidade, 2000, { deal, persona, projetoId });
+      await prisma.crmMensagemWhatsapp.create({
+        data: { dealId: deal.id, contatoId: contato.id, direcao: "out", personaChave, remetente: persona.nomeExibicao, tipo: "text", conteudo: respostaIdentidade },
+      });
+    }
+    await registrarEventoIdentidade(deal.id, text, respostaIdentidade);
+    await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+    return;
   }
 
-  // 7a. Extract basic qualification fields from recent history (last 8 client messages)
-  //     Using history instead of just current message catches answers given in earlier turns.
-  const todosOsPendentes = perguntas.filter((p) => !merged[p.chave]);
+  // Sprint 1.2 — P6: frustração categorizada
+  let frustrationHandling: FrustrationHandling | null = null;
+  if (text) {
+    const frustration = detectFrustration(mensagemNormalizada, history);
+    if (frustration) {
+      // Para duvida_legitimidade precisamos do texto de identidade
+      let identityText: string | undefined;
+      if (frustration.type === "duvida_legitimidade") {
+        identityText = await buildIdentityResponse({ id: projetoId }, persona);
+      }
+
+      // Para abandono_iminente busca texto de retenção do DB
+      let retencaoText: string | undefined;
+      if (frustration.type === "abandono_iminente") {
+        const retencaoConfig = await prisma.iaProjetoConfig.findFirst({
+          where: { projetoId, chave: "comportamento.mensagem_retencao" },
+        });
+        retencaoText = retencaoConfig?.valor ?? undefined;
+      }
+
+      frustrationHandling = buildFrustrationHandling(frustration, deal, merged, persona, identityText, retencaoText);
+
+      if (frustrationHandling.escalateToHuman) {
+        dispararNotificacoes(projetoId, `frustracao_${frustration.type}`, {
+          dealId: deal.id,
+          mensagem: text,
+          triggerPhrase: frustration.triggerPhrase,
+          nome: String(merged.nome ?? contato.nome ?? ""),
+          telefone: phone,
+        }).catch(() => {});
+      }
+
+      if (frustrationHandling.forceResponseText) {
+        const evoConf = await getEvolutionConfig(projetoId);
+        if (evoConf) {
+          await sendHumanizedSafe(evoConf, phone, frustrationHandling.forceResponseText, 2000, { deal, persona, projetoId });
+          await prisma.crmMensagemWhatsapp.create({
+            data: { dealId: deal.id, contatoId: contato.id, direcao: "out", personaChave, remetente: persona.nomeExibicao, tipo: "text", conteudo: frustrationHandling.forceResponseText },
+          });
+          await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+        }
+        return;
+      }
+      // Se só tem injectIntoSystemPrompt: continua o flow com a injeção (frustrationHandling está set)
+    }
+  }
+
+  // ── Fim dos early returns ────────────────────────────────────────────────────
+
+  // 7a. Extract basic qualification fields from recent history (last 8 exchanges).
+  //     Pass full conversation (bot + client) so the LLM can attribute short answers
+  //     like "não tenho" to the correct field based on the preceding question.
+  const todosOsPendentes = perguntas.filter((p) => merged[p.chave] === undefined || merged[p.chave] === null);
   if (todosOsPendentes.length > 0) {
     const textoParaExtrair = history
-      .filter((m) => m.direcao === "in")
-      .slice(-8)
-      .map((m) => m.conteudo ?? "")
-      .filter(Boolean)
+      .slice(-16)
+      .map((m) => `${m.direcao === "out" ? "Bot" : "Cliente"}: ${m.conteudo ?? ""}`)
+      .filter((l) => l.length > 6)
       .join("\n");
-    const extracted = await extractQualificacaoData(projetoId, textoParaExtrair || text || "", todosOsPendentes, merged).catch(() => null);
+    const extracted = await extractQualificacaoData(projetoId, textoParaExtrair || `Cliente: ${text ?? ""}`, todosOsPendentes, merged).catch(() => null);
     if (extracted) {
       const novos: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(extracted)) {
-        if (v !== null && v !== undefined && !merged[k]) {
+        if (v !== null && v !== undefined && (merged[k] === undefined || merged[k] === null)) {
           merged[k] = v;
           novos[k] = v;
         }
@@ -1086,6 +1249,17 @@ export async function processIncomingMessage(
           await prisma.crmContato.update({ where: { id: contato.id }, data: { nome: nomeCapturado } });
           await prisma.crmDeal.update({ where: { id: deal.id }, data: { titulo: nomeCapturado } });
           contato = { ...contato, nome: nomeCapturado };
+        }
+        // Sync redundant field pairs: empresa_recente → empresa_principal, frota_recente → frota
+        const syncMap: Array<[string, string]> = [
+          ["empresa_recente", "empresa_principal"],
+          ["frota_recente", "frota"],
+        ];
+        for (const [src, dst] of syncMap) {
+          if (merged[src] && !merged[dst]) {
+            merged[dst] = merged[src];
+            await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
+          }
         }
       }
     }
@@ -1131,6 +1305,10 @@ export async function processIncomingMessage(
           ? new Set(["rg", "orgao_emissor_rg", "uf_emissor_rg", "nome", "data_nascimento", "local_nascimento", "filiacao_pai", "filiacao_mae"])
           : new Set<string>();
 
+        // Campos de endereço do comprovante sempre sobrescrevem (mais confiável que o auto-declarado)
+        const isComprovante = docJsonDireto.tipo_documento === "COMPROVANTE_ENDERECO";
+        const camposEndereco = new Set(["endereco", "bairro", "cidade", "uf", "cep"]);
+
         const novosDocFields: Record<string, unknown> = {};
         const todosCampos = [
           "rg", "orgao_emissor_rg", "uf_emissor_rg", "cpf", "nome",
@@ -1138,6 +1316,7 @@ export async function processIncomingMessage(
           "filiacao_pai", "filiacao_mae",
           "pis", "numero_ctps", "serie_ctps",
           "endereco", "bairro", "cidade", "uf", "cep",
+          "estado_civil", "regime_bens",
         ] as const;
 
         for (const campo of todosCampos) {
@@ -1149,8 +1328,9 @@ export async function processIncomingMessage(
                 merged.cpf = val;
                 novosDocFields.cpf = val;
               }
-            } else if (camposSempre.has(campo)) {
-              // Campos confiáveis de CNH_E/CNH_FOTO: sempre sobrescrever para corrigir dados antigos
+            } else if (camposSempre.has(campo) || (isComprovante && camposEndereco.has(campo))) {
+              // CNH_E: campos de identidade sempre sobrescrevem
+              // COMPROVANTE_ENDERECO: campos de endereço sempre sobrescrevem (corrige cidade auto-declarada errada)
               if (merged[campo] !== val) {
                 merged[campo] = val;
                 novosDocFields[campo] = val;
@@ -1193,20 +1373,61 @@ export async function processIncomingMessage(
   //    _vinculos_ok            — true when the loop is finished (all within 2y collected)
   //    _vinculos_todos_prescritos — true when even the most recent job is prescribed
 
-  const vinculos: VinculoEmprego[] = Array.isArray(merged.vinculos)
+  let vinculos: VinculoEmprego[] = Array.isArray(merged.vinculos)
     ? (merged.vinculos as VinculoEmprego[])
     : [];
-  const vinculosOk              = merged._vinculos_ok === true;
-  const vinculosTodosPrescritos = merged._vinculos_todos_prescritos === true;
+  let vinculosOk              = merged._vinculos_ok === true;
+  let vinculosTodosPrescritos = merged._vinculos_todos_prescritos === true;
+
+  // If vinculos is empty but flat fields already have empresa info (collected via pre-vinculos
+  // extractQualificacaoData), seed vinculos[0] so the loop doesn't re-ask for the company.
+  if (vinculos.length === 0 && !vinculosOk && !vinculosTodosPrescritos) {
+    const empresaSeed = (merged.empresa_principal ?? merged.empresa_recente) as string | undefined;
+    if (empresaSeed) {
+      const seeded: VinculoEmprego = {
+        ordem: 1,
+        empresa: empresaSeed,
+        funcao:         (merged.funcao_recente as string | undefined)   ?? undefined,
+        vinculo:        (merged.vinculo_recente as string | undefined)  ?? undefined,
+        saida:          (merged.saida_recente as string | undefined)    ?? undefined,
+        tempo:          (merged.tempo_recente as string | undefined)    ?? undefined,
+        data_saida:     (merged.data_saida_recente as string | undefined) ?? undefined,
+        horas_extras:   undefined,
+        pagamento_fora: undefined,
+        injustica:      undefined,
+        frota:          merged.frota_recente != null
+          ? String(merged.frota_recente)
+          : merged.frota != null ? String(merged.frota) : undefined,
+      };
+      merged.vinculos = [seeded];
+      vinculos = [seeded];
+      prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } }).catch(() => {});
+      console.log(`[VinculosSeed] dealId=${deal.id} semeou vinculos[0] a partir dos campos planos: empresa=${empresaSeed}`);
+    }
+  }
+
+  // Sync flat merged fields → vinculos entries to avoid re-asking already-answered questions.
+  // Runs on every turn so incremental flat-field updates are always reflected.
+  if (vinculos.length > 0 && !vinculosOk) {
+    const sync = syncVinculosFromFlat(vinculos, merged);
+    if (sync.changed) {
+      vinculos = sync.vinculos;
+      merged.vinculos = vinculos;
+      prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } }).catch(() => {});
+      console.log(`[VinculosSync] dealId=${deal.id} campos planos → vinculos sincronizados`);
+    }
+  }
 
   if (!vinculosOk && text) {
     try {
       const historiaTexto = history
-        .slice(-12)
+        .slice(-20)
         .map((m) => `${m.direcao === "out" ? "Ana" : "Cliente"}: ${m.conteudo ?? ""}`)
         .join("\n");
 
-      const extraido = await tryExtractVinculo(projetoId, text, vinculos, historiaTexto);
+      const extraido = await tryExtractVinculo(projetoId, text, vinculos, historiaTexto, merged._mais_empregos_confirmado === true);
+
+      console.log(`[VinculosLoop] dealId=${deal.id} result: semMaisEmpregos=${extraido.semMaisEmpregos} novoVinculo=${extraido.vinculo?.empresa ?? "null"} updatedCount=${extraido.updatedVinculos.length} vinculosBefore=${vinculos.length} vinculos=${JSON.stringify(extraido.updatedVinculos.map(v => ({ empresa: v.empresa, faltando: ["empresa","funcao","vinculo","saida","horas_extras","pagamento_fora","injustica"].filter(k => !v[k as keyof typeof v]) })))}`);
 
       // 1. Apply enrichments to existing vinculos (fields filled in by LLM from history)
       const vinculosEnriquecidos = extraido.updatedVinculos;
@@ -1224,9 +1445,17 @@ export async function processIncomingMessage(
       // Use the enriched array going forward
       const vinculosAtuais = vinculosEnriquecidos;
 
+      // Helper: check if all required fields are filled for all collected vinculos
+      const CAMPOS_REQ: Array<keyof VinculoEmprego> = ["empresa", "funcao", "vinculo", "saida", "horas_extras", "pagamento_fora", "injustica"];
+      const todosVinculosCompletos = (arr: VinculoEmprego[]) =>
+        arr.length > 0 && arr.every(v => CAMPOS_REQ.every(k => v[k] !== undefined && v[k] !== null && v[k] !== ""));
+
       if (extraido.semMaisEmpregos) {
-        // Person confirmed no more jobs within 2 years — close the loop
-        merged._vinculos_ok = true;
+        // Person confirmed no more jobs — only close loop if all fields are complete
+        if (todosVinculosCompletos(vinculosAtuais)) {
+          merged._vinculos_ok = true;
+        }
+        // If fields are missing, keep _vinculos_ok false so Ana keeps collecting
         merged.vinculos = vinculosAtuais;
         await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
       } else if (extraido.vinculo) {
@@ -1238,14 +1467,18 @@ export async function processIncomingMessage(
             merged._vinculos_ok = true;
             merged._vinculos_todos_prescritos = true;
           } else {
-            // A subsequent job is outside the window → 2-year boundary reached → end
-            merged._vinculos_ok = true;
+            // A subsequent job is outside the window → 2-year boundary reached
+            // Only close if all collected vinculos are complete
+            if (todosVinculosCompletos(vinculosAtuais)) {
+              merged._vinculos_ok = true;
+            }
           }
           merged.vinculos = vinculosAtuais;
         } else {
           // Within 2 years — add to array and keep asking
           vinculosAtuais.push({ ...extraido.vinculo, ordem: vinculosAtuais.length + 1 });
           merged.vinculos = vinculosAtuais;
+          delete merged._mais_empregos_confirmado; // new vínculo added — clear "waiting for empresa" flag
           prisma.crmNota.create({
             data: {
               dealId: deal.id,
@@ -1254,6 +1487,12 @@ export async function processIncomingMessage(
           }).catch(() => {});
         }
         await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
+      } else if (extraido.confirmouMaisEmpregos && !extraido.semMaisEmpregos) {
+        // User confirmed there are more employers but didn't name the company yet
+        merged._mais_empregos_confirmado = true;
+        merged.vinculos = vinculosAtuais;
+        await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
+        console.log(`[VinculosLoop] dealId=${deal.id} confirmou mais empregos — aguardando nome da empresa`);
       } else if (foiEnriquecido) {
         // No new vínculo and no semMaisEmpregos signal, but existing vinculos were enriched
         await prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } });
@@ -1262,6 +1501,11 @@ export async function processIncomingMessage(
       console.warn("[VinculosLoop] Erro na extração de vínculos — Ana responde normalmente sem atualizar vínculos:", err?.message ?? err);
       // Non-blocking: extraction failure does not abort the response
     }
+
+    // Refresh local vars from merged (extraction may have updated merged.vinculos / flags)
+    vinculos = Array.isArray(merged.vinculos) ? (merged.vinculos as VinculoEmprego[]) : vinculos;
+    vinculosOk = merged._vinculos_ok === true;
+    vinculosTodosPrescritos = merged._vinculos_todos_prescritos === true;
   }
 
   // 7c. Sync vinculos[] → flat fields once the vinculos loop is done.
@@ -1281,19 +1525,21 @@ export async function processIncomingMessage(
       if (!merged.tempo_recente   && v0.tempo)           syncFlat.tempo_recente           = v0.tempo;
       if (!merged.saida_recente   && (v0.saida ?? v0.data_saida)) syncFlat.saida_recente  = v0.saida ?? v0.data_saida;
       if (!merged.frota_recente   && v0.frota)           syncFlat.frota_recente           = v0.frota;
-      if (!merged.horas_extras_recentes   && v0.horas_extras)     syncFlat.horas_extras_recentes   = v0.horas_extras;
-      if (!merged.pagamento_fora_recente  && v0.pagamento_fora)   syncFlat.pagamento_fora_recente  = v0.pagamento_fora;
-      if (!merged.injustica_recente       && v0.injustica)         syncFlat.injustica_recente       = v0.injustica;
+      const isNull = (x: unknown) => x === undefined || x === null;
+      if (isNull(merged.horas_extras_recentes)   && !isNull(v0.horas_extras))     syncFlat.horas_extras_recentes   = v0.horas_extras;
+      if (isNull(merged.pagamento_fora_recente)  && !isNull(v0.pagamento_fora))   syncFlat.pagamento_fora_recente  = v0.pagamento_fora;
+      if (isNull(merged.injustica_recente)       && !isNull(v0.injustica))        syncFlat.injustica_recente       = v0.injustica;
     }
     if (v1) {
-      if (!merged.emprego_anterior_empresa  && v1.empresa)  syncFlat.emprego_anterior_empresa  = v1.empresa;
-      if (!merged.emprego_anterior_funcao   && v1.funcao)   syncFlat.emprego_anterior_funcao   = v1.funcao;
-      if (!merged.emprego_anterior_vinculo  && v1.vinculo)  syncFlat.emprego_anterior_vinculo  = v1.vinculo;
-      if (!merged.emprego_anterior_tempo    && v1.tempo)    syncFlat.emprego_anterior_tempo    = v1.tempo;
-      if (!merged.emprego_anterior_saida    && (v1.saida ?? v1.data_saida)) syncFlat.emprego_anterior_saida = v1.saida ?? v1.data_saida;
-      if (!merged.emprego_anterior_horas_extras   && v1.horas_extras)   syncFlat.emprego_anterior_horas_extras   = v1.horas_extras;
-      if (!merged.emprego_anterior_pagamento_fora && v1.pagamento_fora) syncFlat.emprego_anterior_pagamento_fora = v1.pagamento_fora;
-      if (!merged.emprego_anterior_injustica      && v1.injustica)      syncFlat.emprego_anterior_injustica      = v1.injustica;
+      const isNull = (x: unknown) => x === undefined || x === null;
+      if (isNull(merged.emprego_anterior_empresa)        && v1.empresa)              syncFlat.emprego_anterior_empresa        = v1.empresa;
+      if (isNull(merged.emprego_anterior_funcao)         && v1.funcao)               syncFlat.emprego_anterior_funcao         = v1.funcao;
+      if (isNull(merged.emprego_anterior_vinculo)        && v1.vinculo)              syncFlat.emprego_anterior_vinculo        = v1.vinculo;
+      if (isNull(merged.emprego_anterior_tempo)          && v1.tempo)                syncFlat.emprego_anterior_tempo          = v1.tempo;
+      if (isNull(merged.emprego_anterior_saida)          && (v1.saida ?? v1.data_saida)) syncFlat.emprego_anterior_saida      = v1.saida ?? v1.data_saida;
+      if (isNull(merged.emprego_anterior_horas_extras)   && !isNull(v1.horas_extras))   syncFlat.emprego_anterior_horas_extras   = v1.horas_extras;
+      if (isNull(merged.emprego_anterior_pagamento_fora) && !isNull(v1.pagamento_fora)) syncFlat.emprego_anterior_pagamento_fora = v1.pagamento_fora;
+      if (isNull(merged.emprego_anterior_injustica)      && v1.injustica)               syncFlat.emprego_anterior_injustica      = v1.injustica;
     }
 
     if (Object.keys(syncFlat).length > 0) {
@@ -1310,11 +1556,42 @@ export async function processIncomingMessage(
     where: { projetoId, stageOrigemChave: stageChave, condicao: "qualificacao_completa" },
   });
 
-  // 7d. allAnswered: all required DB questions answered + vinculos loop finished
-  const perguntasPendentes = perguntas.filter((p) => !merged[p.chave]);
+  // 7d2. Load empresas bloqueadas and compute deterministic next question (must be before allAnswered)
+  const empresasBloqueadasConfig = await prisma.iaProjetoConfig.findFirst({
+    where: { projetoId, chave: "empresas_bloqueadas" },
+  });
+  const empresasBloqueadas: string[] = empresasBloqueadasConfig?.valor
+    ? empresasBloqueadasConfig.valor.split(",").map(s => s.trim()).filter(Boolean)
+    : [];
+
+  const outgoingCount = history.filter(m => m.direcao === "out").length;
+  let nextQDeterministico: string | null = null;
+  let advFlowStepType: string | null = null;
+  let advFlowNextStepChave: string | null = null;
+  if (personaChave === "assistente") {
+    nextQDeterministico = await getNextDeterministicQuestion(projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount);
+  } else if (personaChave === "advogado" && deal.iaAtiva) {
+    const { handleAdvogadoFlow } = await import("./flow-controller.js");
+    const advFlow = await handleAdvogadoFlow(
+      projetoId,
+      { id: deal.id, iaFlowStepChave: (deal as any).iaFlowStepChave ?? null, iaFlowStepData: (deal as any).iaFlowStepData ?? null, qualificacao: deal.qualificacao },
+      text ?? "",
+      outgoingCount,
+    );
+    nextQDeterministico = advFlow.nextQuestion;
+    advFlowStepType = advFlow.stepType ?? null;
+    advFlowNextStepChave = advFlow.nextStepChave ?? null;
+  }
+
+  // 7d3. allAnswered: flow controller is authoritative — if it has no more questions,
+  //      qualification is done regardless of which DB fields were populated.
+  //      basicAnswered is a secondary check to catch edge cases where the flow controller
+  //      was bypassed.
+  const perguntasPendentes = perguntas.filter((p) => merged[p.chave] === undefined || merged[p.chave] === null);
   const requiredChaves = new Set(perguntas.filter((p) => p.obrigatorio).map((p) => p.chave));
   const basicAnswered = [...requiredChaves].every((chave) => merged[chave] !== undefined);
-  const allAnswered = basicAnswered && (merged._vinculos_ok === true);
+  const flowCompletedByController = personaChave === "assistente" && nextQDeterministico === null && (merged._vinculos_ok === true);
+  const allAnswered = (basicAnswered && (merged._vinculos_ok === true)) || flowCompletedByController;
 
   // 7e. Detect client insisting on a phone call → notify SDR/Closer via WhatsApp
   //     Keywords come from IaProjetoConfig (categoria: "comportamento", chave: "solicita_ligacao_palavras")
@@ -1379,6 +1656,33 @@ export async function processIncomingMessage(
   let userSystem = persona.systemPrompt
     .replace("{INSTRUÇÃO BASE}", INSTRUCAO_BASE)
     .replace(/\{nome_persona\}/g, persona.nomeExibicao);
+  // Garante injeção mesmo quando o placeholder não existe na persona do DB
+  if (!userSystem.includes("DATA E HORA ATUAL")) {
+    userSystem = INSTRUCAO_BASE + "\n\n" + userSystem;
+  }
+
+  // REGRA GLOBAL — nunca incluir nome no início da mensagem
+  userSystem +=
+    `\n\nREGRA — IDENTIDADE: Você é ${persona.nomeExibicao}. NUNCA escreva seu nome no início da resposta.` +
+    ` Escreva APENAS o conteúdo da mensagem, sem nenhum cabeçalho, sem nome, sem asteriscos.`;
+
+  // Ana-specific: perguntar mais, responder menos, não pular fases
+  if (personaChave === "assistente") {
+    userSystem +=
+      `\n\nINSTRUÇÕES CRÍTICAS PARA ANA — SIGA RIGOROSAMENTE:` +
+      `\n- MENSAGEM = 1 PERGUNTA APENAS. Nada mais.` +
+      `\n- TAMANHO MÁXIMO: 1 frase curta de no máximo 15 palavras.` +
+      `\n- PROIBIDO resumir, repetir ou comentar o que o cliente disse. Vá direto à próxima pergunta.` +
+      `\n- PROIBIDO usar "Entendi", "Certo", "Ok", "Que situação difícil", "Isso é importante" ou qualquer frase de validação. Só a pergunta.` +
+      `\n- PROIBIDO explicar por que está perguntando ou dar contexto jurídico.` +
+      `\n- EXEMPLO CORRETO: "Recebia algum valor fora do holerite, como Pamcard ou dinheiro?"` +
+      `\n- EXEMPLO ERRADO: "Entendi. Isso significa que você trabalhava muitas horas. Recebia algum valor fora do holerite?"` +
+      `\n- Siga RIGOROSAMENTE a ordem das perguntas de qualificação. NUNCA pule etapas.` +
+      `\n- REGRA DO CAMINHÃO: A pergunta "O caminhão era seu ou da empresa?" SÓ pode ser feita se o cliente disse ser autônomo, agregado ou TAC. Se o cliente mencionou CLT, carteira assinada, ou sem registro formal — PROIBIDO perguntar sobre caminhão. Para CLT, pule direto para horas extras.` +
+      `\n- REGRA DE ENCERRAMENTO: PROIBIDO dizer "Anotei tudo" ou "Vou passar pro time" enquanto houver uma PERGUNTA OBRIGATÓRIA neste prompt. Só encerre quando não houver mais PERGUNTA OBRIGATÓRIA A FAZER AGORA.` +
+      `\n- EMPREGOS ANTERIORES: Se o emprego mais recente durou MENOS de 2 anos OU se o cliente saiu há menos de 2 anos, OBRIGATÓRIO perguntar sobre empregos anteriores antes de encerrar.` +
+      `\n- EXCEÇÃO DE FRUSTRAÇÃO: Se o cliente reclamar especificamente de PERGUNTAS REPETIDAS ou idiota (ex: "pergunta idiota", "você já me perguntou isso", "por que fica repetindo", "já disse isso"), faça APENAS: 1 frase curta pedindo desculpas + a pergunta obrigatória pendente. Ex: "Peço desculpas! [pergunta]". ATENÇÃO: Se o cliente perguntar sobre outra pessoa (ex: "cadê a Daniela?", "quem vai me atender?") ou sobre o processo em geral — responda a pergunta dele normalmente, NÃO trate como frustração.`;
+  }
 
   // REGRA GLOBAL — links nunca devem aparecer nas respostas do LLM.
   // Links de proposta, contrato e procuração são enviados automaticamente
@@ -1514,16 +1818,34 @@ export async function processIncomingMessage(
   }
 
   // Vinculos collection state context — drives what Ana asks next
-  if (!vinculosOk && !vinculosTodosPrescritos) {
-    const listaColetados = vinculos.length > 0
-      ? vinculos.map((v) => `  • ${v.empresa ?? "?"} (${v.funcao ?? "?"}) — saída: ${v.saida ?? "?"}`).join("\n")
-      : "  (nenhum ainda)";
+  if (!vinculosOk && !vinculosTodosPrescritos && vinculos.length > 0) {
+    // Build a detailed view of each vínculo showing which fields are still missing
+    const CAMPOS_OBRIGATORIOS: Array<{ key: keyof typeof vinculos[0]; label: string }> = [
+      { key: "empresa",        label: "empresa" },
+      { key: "funcao",         label: "função" },
+      { key: "vinculo",        label: "tipo de vínculo (CLT/autônomo/avulso)" },
+      { key: "saida",          label: "como e quando saiu (ou se ainda está empregado)" },
+      { key: "horas_extras",   label: "se havia horas extras não pagas" },
+      { key: "pagamento_fora", label: "se recebia valor fora do holerite (Pamcard, Pix, dinheiro)" },
+      { key: "injustica",      label: "irregularidades sofridas (pressão, desconto, jornada excessiva)" },
+    ];
 
-    const proximaAcao = vinculos.length === 0
-      ? "Colete as informações do emprego mais recente: empresa, função, tipo de vínculo (CLT/autônomo), quanto tempo trabalhou, como e quando saiu, se havia horas extras ou pagamento fora do holerite."
-      : `Pergunte se houve outro emprego com saída nos últimos 2 anos. Se sim, colete os mesmos dados. Se não houver mais, confirme.`;
+    const listaDetalhada = vinculos.map((v, i) => {
+      const faltando = CAMPOS_OBRIGATORIOS.filter(c => !v[c.key]).map(c => c.label);
+      const status = faltando.length === 0 ? "✓ completo" : `FALTANDO: ${faltando.join(", ")}`;
+      return `  ${i + 1}. ${v.empresa ?? "?"} (${v.funcao ?? "?"}) — ${status}`;
+    }).join("\n");
 
-    userSystem += `\n\nCOLETA DE VÍNCULOS TRABALHISTAS\nVínculos já registrados (${vinculos.length}):\n${listaColetados}\n\nPRÓXIMA AÇÃO: ${proximaAcao}`;
+    userSystem += `\n\nCOLETA DE VÍNCULOS TRABALHISTAS — REGRA ABSOLUTA: NÃO avance para "tem mais empregos?" enquanto houver campos faltando em qualquer vínculo.\nVínculos registrados (${vinculos.length}):\n${listaDetalhada}`;
+  }
+
+  // Show deterministic next question in system prompt for all phases
+  if (nextQDeterministico) {
+    if (advFlowStepType === "llm_generated") {
+      userSystem += `\n\n⚠️ TAREFA OBRIGATÓRIA AGORA — IGNORE QUALQUER OUTRA INSTRUÇÃO DE COLETA DE DADOS:\n${nextQDeterministico}\nElabore com base nos dados reais do lead. NÃO peça documentos, NÃO colete dados pessoais nesta resposta.`;
+    } else {
+      userSystem += `\n\nINFORMAÇÃO A COLETAR AGORA (formule a pergunta de forma natural e conversacional, verifique o histórico antes — se o cliente JÁ respondeu isso, pule e colete a próxima informação pendente): ${nextQDeterministico}`;
+    }
   }
 
   if (vinculosOk && vinculos.length > 0) {
@@ -1557,6 +1879,11 @@ export async function processIncomingMessage(
     userSystem += `\n\nNome do cliente: ${nomeInformado}`;
   }
 
+  // Sprint 1: injeção de frustração no system prompt
+  if (frustrationHandling?.injectIntoSystemPrompt) {
+    userSystem += "\n\n" + frustrationHandling.injectIntoSystemPrompt;
+  }
+
   // 9. Build LLM messages
   const llmMessages = history.map((m) => ({
     role: (m.direcao === "out" ? "assistant" : "user") as "user" | "assistant",
@@ -1573,6 +1900,7 @@ export async function processIncomingMessage(
         systemPrompt: userSystem,
         messages: llmMessages,
         personaChave,
+        personaLlmChave: (persona as any).llmProviderChave ?? null,
         stageChave,
         maxTokens: 2048,
       });
@@ -1588,6 +1916,47 @@ export async function processIncomingMessage(
   }
 
   if (!resposta) return;
+
+  // 10b. Deterministic question override (assistente + advogado with flow controller)
+  // Replaces LLM response with the exact next question from the deterministic flow.
+  // Skipped for llm_generated steps — LLM elaborates the content, no hard override.
+  // Skipped when frustration handling requests skipDeterministicOverride (ex: repeticao, demora).
+  const shouldOverrideDeterministic =
+    (personaChave === "assistente" || personaChave === "advogado") &&
+    nextQDeterministico &&
+    advFlowStepType !== "llm_generated" &&
+    !frustrationHandling?.skipDeterministicOverride;
+
+  if (shouldOverrideDeterministic) {
+    // Greeting exchange: saudacao step not yet sent — prepend time-based word and mark as sent
+    if (!merged._saudacao_enviada) {
+      const horaStr = new Date().toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo", hour12: false });
+      const hora = parseInt(horaStr.split(":")[0], 10);
+      const saudacaoWord = hora >= 5 && hora < 12 ? "Bom dia" : hora >= 12 && hora < 18 ? "Boa tarde" : "Boa noite";
+      resposta = `${saudacaoWord}! ${nextQDeterministico}`;
+      merged._saudacao_enviada = true;
+      prisma.crmDeal.update({ where: { id: deal.id }, data: { qualificacao: merged as any } }).catch(() => {});
+      console.log(`[DeterministicQ] dealId=${deal.id} greeting="${resposta.slice(0, 60)}"`);
+    } else {
+      // Never override disqualification/closure messages (blocked company, prescribed, ethical conflict)
+      const isDisqualification = /não vamos conseguir|ética profissional|finalizar o atendimento|prazo já passou|prazo expirou|não podemos assumir|infelizmente.*prazo|obrigad.*contato/i.test(resposta ?? "");
+
+      if (!isDisqualification) {
+        // Keep LLM answer when client asked something that deserves a real reply,
+        // then append the flow question. Otherwise replace entirely with the flow question.
+        const clienteIsLegal = /\?/.test(text ?? "") && /quanto|direito|valor|prazo|receber|pagar|calculo|cálculo|estimativa|ação|processo|processual|advogad/i.test(text ?? "");
+        const clienteAsksMeta = /que (dia|horas?|hora)|hoje[^\w]|que horas|qual (a data|o dia|a hora)|agora (s[aã]o|é)|quantos anos|sou eu|quem é você|quem és|é robo|é ia|é bot|é humano|é pessoa/i.test(text ?? "");
+        if (clienteIsLegal || clienteAsksMeta) {
+          resposta = `${resposta.trim()}\n\n${nextQDeterministico}`;
+        } else {
+          resposta = nextQDeterministico!;
+        }
+        console.log(`[DeterministicQ] dealId=${deal.id} nextQ="${nextQDeterministico}" isLegal=${clienteIsLegal}`);
+      } else {
+        console.log(`[DeterministicQ] dealId=${deal.id} override skipped — disqualification/closure detected`);
+      }
+    }
+  }
 
   // 11. Transition logic
   //   allAnswered = basic required questions done + vinculos loop finished
@@ -1636,23 +2005,80 @@ export async function processIncomingMessage(
   const delayMax = getComport("resposta_delay_max", 40) * 1000;
   const readDelay = delayMin + Math.random() * (delayMax - delayMin);
 
-  const respostaFinal = `*${persona.nomeExibicao}*\n${limparResposta(resposta, persona.nomeExibicao)}`;
+  // 13b. Intercept descarte signal BEFORE sending — replace with hold message, notify SDR
+  const DESCARTE_REGEX = /infelizmente.{0,40}não.{0,30}(vamos conseguir|conseguimos|podemos).{0,30}atender/i;
+  let isDescarte = false;
+  if (DESCARTE_REGEX.test(resposta) && stageChave !== "descartado") {
+    isDescarte = true;
+    // Replace rejection message with neutral hold so lead doesn't get discouraged yet
+    resposta = "Aguarda um momento aqui, vou verificar com a equipe e já retorno pra você, tá?";
+  }
 
-  await sendHumanized(evoConfig, phone, respostaFinal, readDelay);
+  const textoLimpo = limparResposta(resposta, persona.nomeExibicao);
+  const respostaWA = `*${persona.nomeExibicao}*\n${textoLimpo}`;
+  await sendHumanizedSafe(evoConfig, phone, respostaWA, readDelay, { deal, persona, projetoId });
 
-  // 14. Save outgoing message
+  // 14. Save outgoing message — store clean text (no asterisks); frontend shows sender name separately
   await prisma.crmMensagemWhatsapp.create({
     data: {
       dealId: deal.id,
       contatoId: contato.id,
       direcao: "out",
       personaChave,
+      remetente: persona.nomeExibicao,
       tipo: "text",
-      conteudo: respostaFinal,
+      conteudo: textoLimpo,
     },
   });
 
-  // 14b. If Daniela sent a parecer with a value estimate, persist it on the deal + send TTS audio.
+  // 14b. Post-send descarte handling — move deal + notify SDR
+  if (isDescarte) {
+    const [faseFunil, crmStageDescartado] = await Promise.all([
+      prisma.iaFaseFunil.findUnique({ where: { projetoId_chave: { projetoId, chave: "descartado" } } }),
+      prisma.crmStage.findFirst({ where: { chave: "descartado" } }),
+    ]);
+
+    if (faseFunil) {
+      // 1. Move deal to descartado — SDR will review
+      await prisma.crmDeal.update({
+        where: { id: deal.id },
+        data: {
+          iaStageChave: "descartado",
+          ...(crmStageDescartado ? { stageId: crmStageDescartado.id } : {}),
+        },
+      });
+
+      // 2. Record justification as note
+      const justificativa = vinculosTodosPrescritos
+        ? "Prescrição trabalhista: vínculo mais recente encerrado há mais de 2 anos."
+        : "Empresa/caso fora do perfil de atuação do escritório (filtro silencioso ativado).";
+      await prisma.crmNota.create({
+        data: {
+          dealId: deal.id,
+          conteudo: `[IA] Descarte pendente revisão humana — ${justificativa}`,
+        },
+      });
+
+      // 3. Notify human SDR for review
+      const nomeContato = String(merged.nome ?? contato.nome ?? "");
+      const empresa = String(
+        merged.empresa_recente ??
+        (Array.isArray(merged.vinculos) && (merged.vinculos as any[])[0]?.empresa) ?? ""
+      );
+      dispararNotificacoes(projetoId, "descarte_revisao_humana", {
+        nome:          nomeContato,
+        telefone:      phone,
+        cidade:        String(merged.cidade ?? ""),
+        empresa,
+        justificativa,
+      }).catch(() => {});
+
+      console.log(`[StageEngine] Deal ${deal.id} → descartado (revisão SDR) — ${justificativa}`);
+    }
+    return; // skip parecer/proposal logic for discarded leads
+  }
+
+  // 14c. If Daniela sent a parecer with a value estimate, persist it on the deal + send TTS audio.
   //      Detect: response contains a BRL value (R$ X.XXX,XX) and keywords indicating an assessment.
   if (personaChave === "daniela" || personaChave?.includes("closer")) {
     const PARECER_KEYWORDS = /\b(parecer|estima(tiva)?|calcul(ei|amos)|valor.*recup|recup.*valor|pleite|pode recup|você pode receb|a[çc][ãa]o trabalhista|ajuiz|indeniza[çc][ãa]o)\b/i;
@@ -1691,9 +2117,29 @@ export async function processIncomingMessage(
     }
   }
 
-  // 14c. Auto-proposal trigger for documentos_pessoais moment
+  // 14c. Auto-proposal + SDR notification for documentos_pessoais moment
   if (documentosEnviados) {
     criarPropostaAutomatica(projetoId, evoConfig, phone, deal.id, "documentos_pessoais").catch(() => {});
+    dispararNotificacoes(projetoId, "documentos_pessoais", {
+      nome:     String(merged.nome ?? contato.nome ?? ""),
+      telefone: phone,
+      cidade:   String(merged.cidade ?? ""),
+    }).catch(() => {});
+  }
+
+  // 14d. Auto-proposal trigger when Daniela's flow advances to envio_contrato (all personal data collected)
+  if (advFlowNextStepChave === "envio_contrato") {
+    criarPropostaAutomatica(projetoId, evoConfig, phone, deal.id, "dados_coletados").catch(() => {});
+  }
+
+  // 14e. SDR notification when Daniela's flow completes (reunião agendada / lead pronto)
+  if (advFlowNextStepChave === "__done__") {
+    dispararNotificacoes(projetoId, "fluxo_concluido", {
+      nome:     String(merged.nome ?? contato.nome ?? ""),
+      telefone: phone,
+      cidade:   String(merged.cidade ?? ""),
+      cpf:      String(merged.cpf ?? contato.cpf ?? ""),
+    }).catch(() => {});
   }
 
   // 15. Update last contact time
@@ -1753,6 +2199,9 @@ export async function enviarMensagemProativa(
     let systemPrompt = persona.systemPrompt
       .replace("{INSTRUÇÃO BASE}", INSTRUCAO_BASE)
       .replace(/\{nome_persona\}/g, persona.nomeExibicao);
+    if (!systemPrompt.includes("DATA E HORA ATUAL")) {
+      systemPrompt = INSTRUCAO_BASE + "\n\n" + systemPrompt;
+    }
     if (nomeCliente) {
       systemPrompt += `\n\nNome do cliente: ${nomeCliente}`;
     }
@@ -1763,7 +2212,23 @@ export async function enviarMensagemProativa(
     const tipoAbordagem = temHistorico ? "reengajamento com histórico" : "novo";
 
     let instrucao = "";
-    if (motivoCron === "primeira_mensagem") {
+    if (motivoCron === "primeira_mensagem" && personaChave === "advogado") {
+      // Use the flow's step 1 directly — avoids double intro when user replies and handleAdvogadoFlow runs
+      const firstStep = await prisma.iaFlowStep.findFirst({
+        where: { projetoId, personaChave: "advogado", fase: "advogado", ativo: true },
+        orderBy: { ordem: "asc" },
+      });
+      if (firstStep?.pergunta) {
+        mensagem = String(firstStep.pergunta);
+        // Mark step 1 as current so the flow starts at step 2 on user's reply
+        await prisma.crmDeal.update({
+          where: { id: dealId },
+          data: { iaFlowStepChave: firstStep.chave, iaFlowStepData: {} },
+        });
+      } else {
+        instrucao = `TIPO DE ABORDAGEM: ${tipoAbordagem}\n\nEscreva APENAS a primeira mensagem para ${nomeCliente}. Siga exatamente as instruções de PRIMEIRA MENSAGEM do seu system prompt para o cenário correspondente. Uma mensagem curta e natural de WhatsApp.`;
+      }
+    } else if (motivoCron === "primeira_mensagem") {
       instrucao = `TIPO DE ABORDAGEM: ${tipoAbordagem}\n\nEscreva APENAS a primeira mensagem para ${nomeCliente}. Siga exatamente as instruções de PRIMEIRA MENSAGEM do seu system prompt para o cenário correspondente. Uma mensagem curta e natural de WhatsApp.`;
     } else if (motivoCron === "timeout_sem_resposta") {
       instrucao = `O cliente ${nomeCliente} não respondeu há algum tempo. Envie uma mensagem de seguimento natural, sem pressão.`;
@@ -1775,6 +2240,7 @@ export async function enviarMensagemProativa(
       instrucao = `O cliente ${nomeCliente} confirmou interesse. Solicite a CNH frente de forma natural e humana para dar início ao processo.`;
     }
 
+    if (!mensagem && instrucao) {
     const llmMessages = [
       ...history.map((m) => ({
         role: (m.direcao === "out" ? "assistant" : "user") as "user" | "assistant",
@@ -1790,17 +2256,19 @@ export async function enviarMensagemProativa(
         systemPrompt,
         messages: llmMessages,
         personaChave,
+        personaLlmChave: (persona as any).llmProviderChave ?? null,
         stageChave,
         maxTokens: 2048,
       });
       mensagem = result.content.trim();
       if (isHumanized(mensagem)) break;
     }
+    } // end if (!mensagem && instrucao)
   }
 
   if (!mensagem) return;
 
-  const mensagemFinal = `*${persona.nomeExibicao}*\n${limparResposta(mensagem, persona.nomeExibicao)}`;
+  const proativaTextoLimpo = limparResposta(mensagem, persona.nomeExibicao);
 
   // Proactive: use same configurable delay
   const proativaConfigs = await prisma.iaProjetoConfig.findMany({
@@ -1814,7 +2282,7 @@ export async function enviarMensagemProativa(
   const pDelayMin = getPComport("resposta_delay_min", 20) * 1000;
   const pDelayMax = getPComport("resposta_delay_max", 40) * 1000;
   const proativaReadDelay = pDelayMin + Math.random() * (pDelayMax - pDelayMin);
-  await sendHumanized(evoConfig, phone, mensagemFinal, proativaReadDelay);
+  await sendHumanized(evoConfig, phone, `*${persona.nomeExibicao}*\n${proativaTextoLimpo}`, proativaReadDelay);
 
   // Send TTS audio for configured moments (non-blocking)
   sendAudioIfConfigured(projetoId, evoConfig, phone, mensagem, personaChave, motivoCron, dealId).catch(() => {});
@@ -1826,8 +2294,9 @@ export async function enviarMensagemProativa(
       contatoId: contato?.id,
       direcao: "out",
       personaChave,
+      remetente: persona.nomeExibicao,
       tipo: "text",
-      conteudo: mensagemFinal,
+      conteudo: proativaTextoLimpo,
     },
   });
 
@@ -1917,14 +2386,21 @@ export async function transitionDeal(
   // Execute additional action
   if (!regra.acaoAdicional) return false;
 
-  // trocar_persona: persona already updated above; send new persona's intro + return true
+  // trocar_persona: persona already updated above; schedule new persona's intro with 5-min delay
   // so the caller does NOT send the old persona's stale LLM response
   if (regra.acaoAdicional.startsWith("trocar_persona:")) {
     if (phone) {
       const contatoTroca = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
       const nomeTroca = contatoTroca?.nome ?? "cliente";
-      // Use "primeira_mensagem" motivo so the new persona generates a natural intro
-      await enviarMensagemProativa(projetoId, dealId, phone, "primeira_mensagem", nomeTroca);
+      const DELAY_PERSONA_MS = 5 * 60 * 1000; // 5 minutos
+      console.log(`[StageEngine] Deal ${dealId}: intro da nova persona agendada em 5 min`);
+      setTimeout(async () => {
+        try {
+          await enviarMensagemProativa(projetoId, dealId, phone, "primeira_mensagem", nomeTroca);
+        } catch (err) {
+          console.warn(`[StageEngine] Falha ao enviar intro de persona (será recuperada pelo cron): ${err instanceof Error ? err.message : err}`);
+        }
+      }, DELAY_PERSONA_MS);
       return true;
     }
     return false;
@@ -1947,18 +2423,19 @@ export async function transitionDeal(
   if (acao === "criar_deal_processual") {
     await criarDealProcessual(projetoId, dealId);
     // Send welcome message
-    const boas_vindas = `*Dra. Daniela Pires*\n${nomeCliente}, ótimo! Seu caso foi registrado e vamos agendar uma reunião com o advogado responsável. Em breve entraremos em contato.`;
+    const boasVindasTexto = `${nomeCliente}, ótimo! Seu caso foi registrado e vamos agendar uma reunião com o advogado responsável. Em breve entraremos em contato.`;
     const evoConfig = await getEvolutionConfig(projetoId);
     if (evoConfig) {
-      await sendHumanized(evoConfig, phone, boas_vindas, 1500);
+      await sendHumanized(evoConfig, phone, `*Dra. Daniela Pires*\n${boasVindasTexto}`, 1500);
       await prisma.crmMensagemWhatsapp.create({
         data: {
           dealId,
           contatoId: contato?.id,
           direcao: "out",
           personaChave: "advogado",
+          remetente: "Dra. Daniela Pires",
           tipo: "text",
-          conteudo: boas_vindas,
+          conteudo: boasVindasTexto,
         },
       });
     }
@@ -2120,14 +2597,16 @@ async function extractQualificacaoData(
   perguntas: { chave: string; perguntaContexto: string; tipoDado: string }[],
   existing: Record<string, unknown>
 ): Promise<Record<string, unknown> | null> {
-  const pending = perguntas
-    .filter((p) => !existing[p.chave])
-    .map((p) => `"${p.chave}": ${p.tipoDado === "booleano" ? "true/false/null" : '"valor ou null"'}`)
+  const pendingFields = perguntas
+    .filter((p) => existing[p.chave] === undefined || existing[p.chave] === null);
+
+  const pendingStr = pendingFields
+    .map((p) => `"${p.chave}" /* ${p.perguntaContexto} */: ${p.tipoDado === "booleano" ? "true/false/null" : '"valor ou null"'}`)
     .join(", ");
 
   return extractJson({
     projetoId,
-    instruction: `Extraia os seguintes campos do texto do cliente. Use null se não mencionado.\nCampos: {${pending}}`,
+    instruction: `Analise a conversa abaixo e extraia os campos solicitados com base no que o CLIENTE respondeu. Use null quando não mencionado ou resposta ambígua.\nCampos: {${pendingStr}}`,
     text,
   });
 }
@@ -2136,7 +2615,7 @@ async function extractQualificacaoData(
  * Re-generate and send a response using the current DB state of the deal.
  * Called by the retry queue when all LLMs were temporarily unavailable.
  */
-async function respondFromDealState(projetoId: string, dealId: string, phone: string): Promise<void> {
+export async function respondFromDealState(projetoId: string, dealId: string, phone: string): Promise<void> {
   const deal = await prisma.crmDeal.findUnique({ where: { id: dealId } });
   if (!deal || !deal.iaAtiva) return;
 
@@ -2165,9 +2644,12 @@ async function respondFromDealState(projetoId: string, dealId: string, phone: st
   }));
 
   const INSTRUCAO_BASE = buildInstrucaoBase();
-  const userSystem = persona.systemPrompt
+  let userSystem = persona.systemPrompt
     .replace("{INSTRUÇÃO BASE}", INSTRUCAO_BASE)
     .replace(/\{nome_persona\}/g, persona.nomeExibicao);
+  if (!userSystem.includes("DATA E HORA ATUAL")) {
+    userSystem = INSTRUCAO_BASE + "\n\n" + userSystem;
+  }
 
   const result = await callLlm({
     projetoId,
@@ -2175,6 +2657,7 @@ async function respondFromDealState(projetoId: string, dealId: string, phone: st
     systemPrompt: userSystem,
     messages: llmMessages,
     personaChave,
+    personaLlmChave: (persona as any).llmProviderChave ?? null,
     stageChave,
     maxTokens: 2048,
   });
@@ -2184,8 +2667,9 @@ async function respondFromDealState(projetoId: string, dealId: string, phone: st
   const evoConfig = await getEvolutionConfig(projetoId);
   if (!evoConfig) return;
 
-  const respostaFinal = `*${persona.nomeExibicao}*\n${limparResposta(resposta, persona.nomeExibicao)}`;
-  await sendHumanized(evoConfig, phone, respostaFinal, 3000);
+  const textoLimpo = limparResposta(resposta, persona.nomeExibicao);
+  const respostaWA2 = `*${persona.nomeExibicao}*\n${textoLimpo}`;
+  await sendHumanized(evoConfig, phone, respostaWA2, 3000);
 
   const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
   if (contato) {
@@ -2196,7 +2680,7 @@ async function respondFromDealState(projetoId: string, dealId: string, phone: st
         direcao: "out",
         remetente: persona.nomeExibicao,
         tipo: "text",
-        conteudo: respostaFinal,
+        conteudo: textoLimpo,
       },
     });
   }
@@ -2260,6 +2744,19 @@ async function criarPropostaAutomatica(
 
     if (!cpfCliente) {
       console.warn(`[Proposta] CPF não disponível para deal ${dealId} — proposta não gerada`);
+      return;
+    }
+
+    // Trava: campos obrigatórios para geração do contrato
+    const rgCliente2          = String(merged.rg ?? "").trim();
+    const enderecoCliente     = String(merged.endereco ?? "").trim();
+    const estadoCivilCliente  = String(merged.estado_civil ?? "").trim();
+    const camposFaltando: string[] = [];
+    if (!rgCliente2)         camposFaltando.push("RG (enviar CNH)");
+    if (!enderecoCliente)    camposFaltando.push("comprovante de endereço");
+    if (!estadoCivilCliente) camposFaltando.push("estado civil");
+    if (camposFaltando.length > 0) {
+      console.warn(`[Proposta] Qualificação incompleta para deal ${dealId} — faltam: ${camposFaltando.join(", ")} — proposta não gerada`);
       return;
     }
 
@@ -2354,11 +2851,11 @@ async function criarPropostaAutomatica(
         textoHtml,
         valorEstimado: valorEstimado ? Math.round(valorEstimado) : null,
         validadeAte,
-        status:        "ENVIADA",
+        status:        "ACEITA",
         contratoDiaVencimento:     parseInt(getProp("proposta_dia_vencimento") || "5", 10),
         contratoMetodoCobr:        (getProp("proposta_metodo_cobr") as any) || "PIX_BOLETO",
         contratoTipoContrato:      (getProp("proposta_tipo_contrato") as any) || "RECORRENTE",
-        contratoEmitirNfseAuto:    true,
+        contratoEmitirNfseAuto:    false,
         contratoGerarCobrancaAuto: true,
         contratoIssRetido:         false,
         contratoDescricao:         descricaoServico,
@@ -2383,6 +2880,15 @@ async function criarPropostaAutomatica(
       }
     }
 
+    // 9b. Converter proposta em contrato imediatamente (sem precisar do aceite do cliente)
+    try {
+      const { autoConverterEmContrato } = await import("../routers/propostas.js");
+      await autoConverterEmContrato(proposta.id);
+      console.log(`[Proposta] Contrato criado automaticamente para proposta ${proposta.id}`);
+    } catch (e) {
+      console.error("[Proposta] Falha ao criar contrato automaticamente:", e);
+    }
+
     // 10. Upload docs to PAKT and collect sign URLs
     const baseUrl    = process.env.APP_BASE_URL ?? "https://avoce.capium.com.br";
     const paktApiKey = process.env.PAKT_API_KEY;
@@ -2393,12 +2899,17 @@ async function criarPropostaAutomatica(
     type PaktDoc = { titulo: string; signUrl: string; documentId: string };
     const paktDocs: PaktDoc[] = [];
 
-    if (paktApiKey && templatesGerar.length > 0 && emailCliente) {
+    // PAKT: upload sempre que houver documentos, independente de ter e-mail do cliente
+    // Link de assinatura é enviado via WhatsApp — nunca por e-mail
+    if (paktApiKey && templatesGerar.length > 0) {
       try {
         const docs = await (prisma as any).documentoGerado.findMany({
           where: { propostaId: proposta.id },
           orderBy: [{ tipo: "asc" }, { criadoEm: "asc" }],
         });
+
+        // Usar e-mail do cliente ou placeholder — PAKT exige o campo mas não enviamos e-mail
+        const signerEmail = emailCliente || "assinar@avoce.com.br";
 
         for (const doc of docs) {
           if (!doc.pdfPath || !existsSync(doc.pdfPath)) continue;
@@ -2411,7 +2922,7 @@ async function criarPropostaAutomatica(
               nome:      doc.titulo,
               mensagem:  `Documento de ${emitente.nomeFantasia || emitente.nome} para assinatura.`,
               expiresAt: validadeAte.toISOString(),
-              signers:   [{ nome: nomeCliente, email: emailCliente, countryCode: "BR" }],
+              signers:   [{ nome: nomeCliente, email: signerEmail, countryCode: "BR" }],
             }));
 
             const createRes = await fetch(`${paktBaseUrl}/api/v1/documents`, {
@@ -2424,9 +2935,7 @@ async function criarPropostaAutomatica(
               const signUrl = paktDoc.signers[0]?.signUrl;
               if (signUrl) {
                 paktDocs.push({ titulo: doc.titulo, signUrl, documentId: paktDoc.id });
-                fetch(`${paktBaseUrl}/api/v1/documents/${paktDoc.id}/send`, {
-                  method: "POST", headers: { Authorization: `Bearer ${paktApiKey}` },
-                }).catch(() => {});
+                // NÃO chamar /send — notificação é feita via WhatsApp, nunca por e-mail
               }
             }
           } catch (e) {
@@ -2448,9 +2957,7 @@ async function criarPropostaAutomatica(
       }
     }
 
-    // 11. Send WhatsApp messages with proposal text + links
-    const linkProposta = `${baseUrl}/api/proposta/${(proposta as any).tokenAceite}`;
-
+    // 11. Send WhatsApp messages with proposal text + signing links
     // Convert HTML body to readable plain text for WhatsApp
     const textoPlano = textoHtml
       .replace(/<h[1-6][^>]*>/gi, "\n*")
@@ -2484,14 +2991,35 @@ async function criarPropostaAutomatica(
       const linhasAssinatura = paktDocs
         .map((d, i) => `${i + 1}. ${d.titulo}:\n${d.signUrl}`)
         .join("\n\n");
-      const msgAssinatura =
-        `Para assinar digitalmente, acesse os links abaixo:\n\n${linhasAssinatura}\n\n` +
-        `Ou revise a proposta completa: ${linkProposta}`;
+      const msgAssinatura = `Para assinar digitalmente, acesse os links abaixo:\n\n${linhasAssinatura}`;
       await sendText(evoConfig, phone, msgAssinatura);
     } else {
-      // No PAKT or no docs — send proposal link only
-      const msgProposta = `Para revisar e confirmar sua proposta, acesse:\n${linkProposta}`;
-      await sendText(evoConfig, phone, msgProposta);
+      // No PAKT — send contract/procuração PDFs directly via WhatsApp
+      if (templatesGerar.length > 0) {
+        try {
+          const docs = await (prisma as any).documentoGerado.findMany({
+            where: { propostaId: proposta.id },
+            orderBy: [{ tipo: "asc" }, { criadoEm: "asc" }],
+          });
+          const { readFile } = await import("node:fs/promises");
+          const { existsSync }  = await import("node:fs");
+          for (const doc of docs) {
+            if (!doc.pdfPath || !existsSync(doc.pdfPath)) continue;
+            try {
+              const pdfBuf = await readFile(doc.pdfPath);
+              const pdfBase64 = pdfBuf.toString("base64");
+              const fileName  = `${doc.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`;
+              await sendDocument(evoConfig, phone, pdfBase64, fileName, doc.titulo);
+              console.log(`[Proposta] PDF enviado via WhatsApp: ${doc.titulo}`);
+              await new Promise(r => setTimeout(r, 1500));
+            } catch (e) {
+              console.error(`[Proposta] Falha ao enviar PDF ${doc.id}:`, e);
+            }
+          }
+        } catch (e) {
+          console.error("[Proposta] Falha ao enviar PDFs via WhatsApp:", e);
+        }
+      }
     }
 
     // Log outgoing message
@@ -2501,7 +3029,7 @@ async function criarPropostaAutomatica(
         direcao: "out",
         personaChave: "sistema",
         tipo: "text",
-        conteudo: `[Proposta automática] ${linkProposta}`,
+        conteudo: `[Proposta automática] ${proposta.id} | Contrato gerado e enviado para assinatura`,
       },
     }).catch(() => {});
 
@@ -2610,6 +3138,384 @@ interface VinculoEmprego {
   frota?: string;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Vínculo Flow — DB-driven deterministic question selector
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface FlowPasso {
+  chave: string;
+  pergunta: string;
+  campoColetar: string | null;
+  ordemPadrao: number;
+  ativo: boolean;
+  skipSe: Record<string, any> | null;
+  tipoEspecial: string | null;
+}
+
+// Default steps used when project has no DB rows (auto-seeded on first call)
+const DEFAULT_FLOW_PASSOS: Omit<FlowPasso, "ativo">[] = [
+  { chave: "empresa",        campoColetar: "empresa",        ordemPadrao: 1,  pergunta: "Em qual empresa você trabalhou (ou trabalha)?",                                            skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "funcao",         campoColetar: "funcao",         ordemPadrao: 2,  pergunta: "Qual era sua função lá?",                                                                  skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "vinculo",        campoColetar: "vinculo",        ordemPadrao: 3,  pergunta: "Você tinha carteira assinada (CLT) ou era autônomo?",                                       skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "saida",          campoColetar: "saida",          ordemPadrao: 4,  pergunta: "Como foi o desligamento — foi demitido, pediu demissão ou ainda está lá?",                  skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "horas_extras",   campoColetar: "horas_extras",   ordemPadrao: 5,  pergunta: "Trabalhava além da jornada normal? Recebia por essas horas?",                               skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "pagamento_fora", campoColetar: "pagamento_fora", ordemPadrao: 6,  pergunta: "Recebia algum valor fora do holerite, como Pix, Pamcard ou dinheiro?",                     skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "injustica",      campoColetar: "injustica",      ordemPadrao: 7,  pergunta: "Teve alguma pressão, desconto indevido ou jornada sem registro?",                           skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "frota",          campoColetar: "frota",          ordemPadrao: 8,  pergunta: "Quantos caminhões a empresa tinha na frota?",                                              skipSe: { campo: "vinculo", contem_qualquer: ["clt", "carteira assinada", "carteira"] }, tipoEspecial: null },
+  { chave: "mais_empregos",  campoColetar: null,             ordemPadrao: 9,  pergunta: "Antes de trabalhar lá, você trabalhou em outro lugar nos últimos 2 anos?",                  skipSe: null,                                                                   tipoEspecial: "mais_empregos" },
+];
+
+// In-memory cache: projetoId → { passos, ts }
+const _flowPassosCache: Record<string, { passos: FlowPasso[]; ts: number }> = {};
+const FLOW_CACHE_TTL = 2 * 60 * 1000; // 2 min
+
+export function invalidateFlowCache(projetoId: string) {
+  delete _flowPassosCache[projetoId];
+}
+
+async function getFlowPassos(projetoId: string): Promise<FlowPasso[]> {
+  const cached = _flowPassosCache[projetoId];
+  if (cached && Date.now() - cached.ts < FLOW_CACHE_TTL) return cached.passos;
+
+  let rows = await prisma.iaVinculoFlowPasso.findMany({
+    where: { projetoId, ativo: true },
+    orderBy: { ordemPadrao: "asc" },
+  });
+
+  // Auto-seed defaults if project has no steps configured
+  if (rows.length === 0) {
+    const seedData = DEFAULT_FLOW_PASSOS.map(p => ({
+      projetoId,
+      ativo: true,
+      chave: p.chave,
+      pergunta: p.pergunta,
+      campoColetar: p.campoColetar,
+      ordemPadrao: p.ordemPadrao,
+      skipSe: p.skipSe as any,
+      tipoEspecial: p.tipoEspecial,
+    }));
+    await prisma.iaVinculoFlowPasso.createMany({ data: seedData, skipDuplicates: true });
+    rows = await prisma.iaVinculoFlowPasso.findMany({
+      where: { projetoId, ativo: true },
+      orderBy: { ordemPadrao: "asc" },
+    });
+  }
+
+  const passos: FlowPasso[] = rows.map(r => ({
+    chave: r.chave,
+    pergunta: r.pergunta,
+    campoColetar: r.campoColetar,
+    ordemPadrao: r.ordemPadrao,
+    ativo: r.ativo,
+    skipSe: r.skipSe as Record<string, any> | null,
+    tipoEspecial: r.tipoEspecial,
+  }));
+
+  _flowPassosCache[projetoId] = { passos, ts: Date.now() };
+  return passos;
+}
+
+/** Evaluate whether a step should be skipped based on the current vínculo's collected data. */
+function shouldSkipPasso(passo: FlowPasso, vinculo: VinculoEmprego): boolean {
+  if (!passo.skipSe) return false;
+  const { campo, contem_qualquer } = passo.skipSe as { campo?: string; contem_qualquer?: string[] };
+  if (!campo || !Array.isArray(contem_qualquer) || contem_qualquer.length === 0) return false;
+  const valorCampo = String((vinculo as any)[campo] ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return contem_qualquer.some(v =>
+    valorCampo.includes(v.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""))
+  );
+}
+
+/**
+ * Parses a Portuguese-language employment duration string into total months.
+ * Returns 999 when the duration is unknown/unparseable (treated as long).
+ */
+function parseTempToMeses(tempo: string): number {
+  if (!tempo) return 999;
+  const t = tempo.toLowerCase();
+  let meses = 0;
+  const anosMatch = t.match(/(\d+)\s*ano/);
+  const mesesMatch = t.match(/(\d+)\s*m[eê]s/);
+  if (anosMatch)  meses += parseInt(anosMatch[1]) * 12;
+  if (mesesMatch) meses += parseInt(mesesMatch[1]);
+  if (!anosMatch && !mesesMatch) {
+    // "menos de 1 ano", "alguns meses" → assume curto
+    if (t.includes("menos") || t.includes("pouco") || t.includes("alguns")) return 6;
+    return 999; // desconhecido → assume longo
+  }
+  return meses;
+}
+
+/**
+ * Propagates flat merged qualification fields into vinculos[] entries so the vinculos loop
+ * doesn't re-ask questions already answered via pre-vinculos extraction or extractQualificacaoData.
+ *
+ * vinculos[0] = most recent employer → maps to *_recente flat fields
+ * vinculos[1] = previous employer   → maps to emprego_anterior_* / *_anterior flat fields
+ */
+function syncVinculosFromFlat(
+  vinculos: VinculoEmprego[],
+  merged: Record<string, unknown>,
+): { vinculos: VinculoEmprego[]; changed: boolean } {
+  if (vinculos.length === 0) return { vinculos, changed: false };
+
+  const str = (v: unknown) => (v !== undefined && v !== null && v !== "" ? String(v) : undefined);
+
+  let changed = false;
+  const updated = vinculos.map((v, i) => {
+    const patch: Partial<VinculoEmprego> = {};
+
+    if (i === 0) {
+      // Most recent employer — sync only structural fields, never horas_extras/pagamento_fora/injustica
+      // (those must be explicitly asked and answered, not inferred from flat fields)
+      if (!v.empresa)    patch.empresa    = str(merged.empresa_principal ?? merged.empresa_recente);
+      if (!v.funcao)     patch.funcao     = str(merged.funcao_recente);
+      if (!v.vinculo)    patch.vinculo    = str(merged.vinculo_recente)
+                                          ?? (merged.e_clt === true ? "carteira assinada" : undefined);
+      if (!v.saida)      patch.saida      = str(merged.saida_recente);
+      if (!v.tempo)      patch.tempo      = str(merged.tempo_recente);
+      if (!v.data_saida) patch.data_saida = str(merged.data_saida_recente);
+      if (!v.frota)      patch.frota      = str(merged.frota_recente ?? merged.frota);
+    } else if (i === 1) {
+      // Previous employer — only sync if emprego_anterior_empresa matches this vínculo's empresa
+      // to avoid contaminating ABCD SA data with Trombini SA flat fields.
+      const flatEmpresa = str(merged.emprego_anterior_empresa ?? merged.empresa_anterior);
+      const normalize = (s: string) =>
+        s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, "");
+      const empresaMatch = flatEmpresa && v.empresa &&
+        (normalize(flatEmpresa).includes(normalize(v.empresa)) ||
+         normalize(v.empresa).includes(normalize(flatEmpresa)));
+
+      if (empresaMatch) {
+        if (!v.funcao)     patch.funcao     = str(merged.emprego_anterior_funcao  ?? merged.funcao_anterior);
+        if (!v.vinculo)    patch.vinculo    = str(merged.emprego_anterior_vinculo ?? merged.clt_anterior);
+        if (!v.saida)      patch.saida      = str(merged.emprego_anterior_saida   ?? merged.saida_anterior);
+        if (!v.tempo)      patch.tempo      = str(merged.emprego_anterior_tempo   ?? merged.tempo_anterior);
+        if (!v.frota)      patch.frota      = str(merged.frota_anterior);
+        // horas_extras, pagamento_fora, injustica: never synced — must be explicitly asked
+      }
+    }
+
+    const effectivePatch = Object.fromEntries(
+      Object.entries(patch).filter(([, val]) => val !== undefined),
+    ) as Partial<VinculoEmprego>;
+
+    if (Object.keys(effectivePatch).length === 0) return v;
+    changed = true;
+    return { ...v, ...effectivePatch };
+  });
+
+  return { vinculos: updated, changed };
+}
+
+/**
+ * Comprehensive deterministic question selector — chains ALL qualification phases in strict order:
+ *   Phase 1: Pre-vinculos basic info (nome → cidade → plataforma_anuncio)
+ *   Phase 2: Vinculos collection (empresa → funcao → vinculo → saida → horas_extras → pagamento_fora → injustica → frota → mais_empregos loop)
+ *   Phase 3: Post-vinculos (acao_em_andamento → interesse → melhor_hora_contato)
+ *
+ * Returns null when:
+ *   - outgoingCount === 0 (first exchange — let LLM handle greeting)
+ *   - All phases complete
+ *   - LLM should handle disqualification or closure
+ */
+async function getNextDeterministicQuestion(
+  projetoId: string,
+  merged: Record<string, unknown>,
+  vinculos: VinculoEmprego[],
+  vinculosOk: boolean,
+  vinculosTodosPrescritos: boolean,
+  empresasBloqueadas: string[],
+  outgoingCount: number,
+): Promise<string | null> {
+  // First exchange: use greeting step if not yet sent (tracked via merged flag, not outgoingCount)
+  if (!merged._saudacao_enviada) {
+    const { getGreetingStep } = await import("./flow-controller.js");
+    const greeting = await getGreetingStep(projetoId);
+    if (greeting) return greeting;
+    // No saudacao step configured → mark as sent so LLM handles freely on this turn
+  }
+
+  const { getNextPreVinculosQuestion, getNextPosVinculosQuestion } = await import("./flow-controller.js");
+
+  // ── Phase 1: Pre-vinculos (DB-driven, hardcoded fallback) ───────────────────
+  const preQ = await getNextPreVinculosQuestion(projetoId, merged);
+  if (preQ === undefined) {
+    // No DB steps configured → hardcoded fallback
+    const nomeConhecido = typeof merged.nome === "string" && merged.nome.trim().length > 1;
+    if (!nomeConhecido) return "Qual é o seu nome?";
+    if (!merged.cidade) return "De qual cidade você é?";
+    if (!merged.plataforma_anuncio) return "Você viu nosso anúncio onde? Instagram, Facebook, TikTok ou indicação?";
+  } else if (preQ) {
+    return preQ;
+  }
+  // preQ === null: all pre-vinculos done → fall through to vinculos
+
+  // ── Phase 2: Vinculos collection ────────────────────────────────────────────
+  if (!vinculosTodosPrescritos) {
+    const nextVinculo = await getNextVinculoQuestion(
+      projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas,
+    );
+    if (nextVinculo) return nextVinculo;
+  }
+
+  // ── Phase 3: Post-vinculos (DB-driven, hardcoded fallback) ──────────────────
+  if (!vinculosTodosPrescritos) {
+    // Determinar qual fase pos_vinculos usar (longo = Ag2, curto = Ag3)
+    if (!merged._pos_vinculos_fase) {
+      const mainVinculo = vinculos.find((v: VinculoEmprego) => v.ordem === 1);
+      if (mainVinculo?.tempo) {
+        const meses = parseTempToMeses(String(mainVinculo.tempo));
+        merged._pos_vinculos_fase = meses <= 18 ? "pos_vinculos_curto" : "pos_vinculos";
+      }
+    }
+    const posFase = (merged._pos_vinculos_fase as string) || "pos_vinculos";
+
+    // Auto-populate flat merged fields from vinculos[0] so pos_vinculos steps
+    // don't re-ask data already collected in the vinculos loop.
+    const mainV = vinculos.find((v: VinculoEmprego) => v.ordem === 1);
+    if (mainV) {
+      if (merged.horas_extras === undefined || merged.horas_extras === null)
+        merged.horas_extras = mainV.horas_extras ?? null;
+      if (merged.pagamento_fora === undefined || merged.pagamento_fora === null)
+        merged.pagamento_fora = mainV.pagamento_fora ?? null;
+    }
+    // For curto flow: pre-satisfy derivable steps so we don't re-ask what's already known
+    if (posFase === "pos_vinculos_curto") {
+      // prazo_ok_curto: routing here already means ≤18 months — no need to ask
+      if (!merged.prazo_ok_curto) merged.prazo_ok_curto = "curto";
+
+      // Sync vinculos[1] into *_anterior flat keys so those steps are pre-satisfied
+      // if the vinculos loop already collected the previous employer.
+      const antV = vinculos.find((v: VinculoEmprego) => v.ordem === 2);
+      if (antV) {
+        if (merged.tem_emprego_anterior === undefined || merged.tem_emprego_anterior === null)
+          merged.tem_emprego_anterior = true;
+        // vinculos loop only adds within-2yr employers → anterior is not prescribed
+        if (merged.prazo_anterior_ok === undefined || merged.prazo_anterior_ok === null)
+          merged.prazo_anterior_ok = true;
+        if (!merged.empresa_anterior) merged.empresa_anterior = antV.empresa ?? null;
+        if (!merged.tempo_anterior) merged.tempo_anterior = antV.tempo ?? null;
+        if (!merged.clt_anterior) merged.clt_anterior = antV.vinculo ?? null;
+        if (merged.frota_anterior === undefined || merged.frota_anterior === null)
+          merged.frota_anterior = antV.frota ?? null;
+        if (merged.horas_extras_anterior === undefined || merged.horas_extras_anterior === null)
+          merged.horas_extras_anterior = antV.horas_extras ?? null;
+        if (merged.pagamento_anterior === undefined || merged.pagamento_anterior === null)
+          merged.pagamento_anterior = antV.pagamento_fora ?? null;
+        if (!merged.injustica_anterior) merged.injustica_anterior = antV.injustica ?? null;
+      }
+    }
+    const posQ = await getNextPosVinculosQuestion(projetoId, merged, posFase);
+    if (posQ === undefined) {
+      // No DB steps configured → hardcoded fallback
+      if (merged.acao_em_andamento === undefined || merged.acao_em_andamento === null) {
+        return "Você já tem alguma ação trabalhista aberta contra alguma dessas empresas, ou já tem advogado cuidando disso?";
+      }
+      if (!merged.interesse) {
+        return "Você gostaria de entender o que seria possível recuperar no seu caso?";
+      }
+      if (!merged.melhor_hora_contato) {
+        return "Qual o melhor horário pra gente te ligar? Manhã, tarde ou noite?";
+      }
+    } else if (posQ) {
+      return posQ;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * DB-driven deterministic next-question selector for vinculos collection.
+ * Respects skipSe conditions (e.g., skip "frota" for CLT workers) and blocked companies.
+ * Returns null when vinculosOk or all prescribed.
+ */
+async function getNextVinculoQuestion(
+  projetoId: string,
+  merged: Record<string, unknown>,
+  vinculos: VinculoEmprego[],
+  vinculosOk: boolean,
+  vinculosTodosPrescritos: boolean,
+  empresasBloqueadas: string[],
+): Promise<string | null> {
+  if (vinculosOk || vinculosTodosPrescritos) return null;
+
+  const passos = await getFlowPassos(projetoId);
+
+  // Separate "mais_empregos" step from regular field steps
+  const passosNormais = passos.filter(p => p.tipoEspecial !== "mais_empregos" && p.campoColetar);
+  const passoMaisEmpregos = passos.find(p => p.tipoEspecial === "mais_empregos");
+
+  if (vinculos.length === 0) {
+    // No vínculo yet — ask for the first field (empresa)
+    const primeiro = passosNormais[0];
+    return primeiro?.pergunta ?? "Em qual empresa você trabalhou?";
+  }
+
+  // Find FIRST incomplete vínculo (not just the last).
+  // Prevents skipping missing fields on earlier vinculos when a second was prematurely created.
+  const isEmpresaBloqueada = (empresa: string | null | undefined): boolean => {
+    if (!empresa || empresasBloqueadas.length === 0) return false;
+    const norm = empresa.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    return empresasBloqueadas.some(b =>
+      norm.includes(b.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, ""))
+    );
+  };
+
+  const primeiroIncompleto = vinculos.find(v => {
+    if (isEmpresaBloqueada(v.empresa)) return false; // blocked → skip entirely
+    return passosNormais.some(p => {
+      const campo = p.campoColetar as keyof VinculoEmprego;
+      const val = v[campo];
+      return (val === undefined || val === null || val === "") && !shouldSkipPasso(p, v);
+    });
+  });
+  const alvoVinculo = primeiroIncompleto ?? vinculos[vinculos.length - 1];
+
+  // Check if this company is in the blocked list → skip to "mais_empregos"
+  if (isEmpresaBloqueada(alvoVinculo.empresa)) {
+    console.log(`[VinculoFlow] Empresa bloqueada: "${alvoVinculo.empresa}" — pulando para mais_empregos`);
+    return passoMaisEmpregos?.pergunta?.replace("lá", `na ${alvoVinculo.empresa}`)
+      ?? `A ${alvoVinculo.empresa} infelizmente não é uma empresa que atendemos no momento. Antes disso, você trabalhou em outro lugar nos últimos 2 anos?`;
+  }
+
+  // Find next missing field in the target vínculo
+  for (const passo of passosNormais) {
+    const campo = passo.campoColetar as keyof VinculoEmprego;
+    const val = alvoVinculo[campo];
+    const faltando = val === undefined || val === null || val === "";
+    if (!faltando) continue; // already collected
+
+    // Check skip condition
+    if (shouldSkipPasso(passo, alvoVinculo)) continue;
+
+    // Smart saida question: for previous employers (ordem > 1) the person obviously already left —
+    // skip "ainda está lá?" and ask only about how/when they were dismissed.
+    if (campo === "saida" && alvoVinculo.ordem > 1) {
+      const empresa = alvoVinculo.empresa ?? "essa empresa";
+      return `Como foi o desligamento da ${empresa} — foi demitido ou pediu demissão? E quando foi isso?`;
+    }
+
+    return passo.pergunta;
+  }
+
+  // All fields complete on all vinculos — ask about more employers (use last vínculo's name)
+  const nomeEmpresa = vinculos[vinculos.length - 1]?.empresa ?? "empresa anterior";
+
+  // If user already confirmed mais_empregos but hasn't named the new company yet,
+  // ask specifically for the PREVIOUS employer (not the generic "Em qual empresa?").
+  if (merged._mais_empregos_confirmado === true) {
+    return `Em qual empresa você trabalhou antes da ${nomeEmpresa}?`;
+  }
+
+  const perguntaMaisEmpregos = passoMaisEmpregos?.pergunta
+    ?.replace("lá", `na ${nomeEmpresa}`)
+    ?? `Antes de trabalhar na ${nomeEmpresa}, você trabalhou em outro lugar nos últimos 2 anos?`;
+
+  return perguntaMaisEmpregos;
+}
+
 /**
  * Tries to extract ONE employment link from the current client message.
  * Returns the extracted link OR a signal that the person has no more jobs within 2 years.
@@ -2628,7 +3534,8 @@ async function tryExtractVinculo(
   text: string,
   vinculos: VinculoEmprego[],
   historiaTexto: string,
-): Promise<{ vinculo: VinculoEmprego | null; semMaisEmpregos: boolean; updatedVinculos: VinculoEmprego[] }> {
+  maisEmpregosConfirmado = false,
+): Promise<{ vinculo: VinculoEmprego | null; semMaisEmpregos: boolean; updatedVinculos: VinculoEmprego[]; confirmouMaisEmpregos: boolean }> {
   const hoje = new Date().toLocaleDateString("pt-BR", {
     day: "2-digit", month: "long", year: "numeric", timeZone: "America/Sao_Paulo",
   });
@@ -2652,6 +3559,7 @@ async function tryExtractVinculo(
 
   const result = await extractJson<{
     sem_mais_empregos?: boolean;
+    confirmou_mais_empregos?: boolean;
     vinculos_atualizados?: Array<{
       ordem: number;
       empresa?: string | null;
@@ -2687,9 +3595,25 @@ VÍNCULOS JÁ COLETADOS (array atual):
 ${vinculosJson}
 
 TAREFA:
-1. Preencha campos null dos vínculos existentes se o texto mencionar essa informação.
-2. Se o cliente mencionou um emprego DIFERENTE dos já listados, inclua em "novo_vinculo".
-3. Se o cliente confirmou que não tem mais empregos nos últimos 2 anos, marque "sem_mais_empregos": true.
+1. Preencha campos null dos vínculos existentes com informações mencionadas no texto.
+2. Se o cliente mencionou um emprego DIFERENTE dos já listados, inclua em "novo_vinculo". SE O ARRAY ESTÁ VAZIO ([]) e o cliente mencionou qualquer empresa/empregador, coloque OBRIGATORIAMENTE em "novo_vinculo".
+3. Marque "sem_mais_empregos": true se o cliente indicou que não tem mais empregos além dos já listados. REGRAS:
+   - Se o cliente começar com "não", "nao", "não trabalhei", "só esses", "foi só" → SEMPRE marque true, mesmo que a frase continue com mais contexto.
+   - Se o cliente mencionar uma empresa que JÁ ESTÁ na lista de vínculos como destino seguinte (ex: "saí e fui pra Trombini SA" onde Trombini SA já está listada) → marque true (ele está descrevendo a trajetória já coletada, não um novo emprego).
+   - NUNCA marque false quando a mensagem começa com negação explícita ("não", "nao", "não tive", "nunca").
+4. Marque "confirmou_mais_empregos": true quando o cliente confirmou que teve outro emprego mas NÃO deu o nome ainda (ex: "sim", "sim trabalhei", "tive mais", "trabalhei sim", "tinha outro"). Só marque true se NÃO colocou o nome em novo_vinculo.
+${maisEmpregosConfirmado ? `
+MODO MAIS EMPREGOS ATIVO: o cliente já confirmou que trabalhou em outra empresa ANTES das já listadas. A mensagem atual é a resposta dele dando o nome desse emprego anterior. REGRA ABSOLUTA:
+- Qualquer nome de empresa que o cliente mencionar DEVE ir para "novo_vinculo", MESMO que seja igual ou parecido com um já listado (a pessoa pode ter trabalhado na mesma empresa em períodos diferentes).
+- NÃO tente deduplicar pelo nome — crie novo_vinculo com o nome que o cliente disse.
+- Se o cliente não der um nome claro, marque confirmou_mais_empregos: true para continuar pedindo.` : ""}
+
+REGRAS CRÍTICAS DE PREENCHIMENTO:
+- NUNCA deixe um campo como null se o cliente respondeu sobre ele, mesmo que com "não", "nenhum", "sim", "normal".
+- "não" é uma resposta válida. Ex: cliente disse "não tinha horas extras" → horas_extras = "não tinha horas extras".
+- "sim" genérico = capture o contexto. Ex: "sim, recebia por Pix" → pagamento_fora = "sim, recebia por Pix".
+- Capture o máximo possível do que o cliente disse, mesmo que incompleto.
+- Para "saida": se o cliente ainda está empregado → saida = "ainda empregado". Se foi demitido → saida = "demitido em [data/período]". Se pediu demissão → saida = "pediu demissão".
 
 CAMPOS A EXTRAIR (para cada vínculo):
 - empresa: nome da empresa
@@ -2697,15 +3621,16 @@ CAMPOS A EXTRAIR (para cada vínculo):
 - vinculo: "CLT" | "autônomo" | "avulso" | "cooperado"
 - tempo: tempo total de trabalho lá
 - data_saida: data de rescisão/demissão no formato DD/MM/AAAA ou MM/AAAA — CRÍTICO para prescrição
-- saida: como e quando saiu (demitido, pediu demissão, etc)
-- horas_extras: horas extras e comissão — descreva quantas horas, valores, como era pago
-- pagamento_fora: pagamentos fora do holerite (PIX, Pamcard, dinheiro) — valores e frequência
-- injustica: irregularidades sofridas (desconto indevido, jornada não paga, pressão, etc)
-- frota: tamanho da frota da empresa
+- saida: como e quando saiu (demitido, pediu demissão, ainda empregado, etc)
+- horas_extras: horas extras além da jornada normal. Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
+- pagamento_fora: pagamentos fora do holerite (PIX, Pamcard, dinheiro). Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
+- injustica: irregularidades sofridas. Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
+- frota: tamanho da frota da empresa (se mencionado)
 
 Responda APENAS JSON no formato:
 {
   "sem_mais_empregos": false,
+  "confirmou_mais_empregos": false,
   "vinculos_atualizados": [
     { "ordem": 1, "empresa": "...", "funcao": null, ... }
   ],
@@ -2714,8 +3639,10 @@ Responda APENAS JSON no formato:
     text: historiaTexto + "\n\nMensagem atual: " + text,
   });
 
-  if (!result) return { vinculo: null, semMaisEmpregos: false, updatedVinculos: vinculos };
-  if (result.sem_mais_empregos) return { vinculo: null, semMaisEmpregos: true, updatedVinculos: vinculos };
+  if (!result) {
+    console.warn(`[tryExtractVinculo] extractJson retornou null — mantendo vinculos anteriores`);
+    return { vinculo: null, semMaisEmpregos: false, updatedVinculos: vinculos, confirmouMaisEmpregos: false };
+  }
 
   // Apply updates to existing vinculos
   let updatedVinculos = [...vinculos];
@@ -2742,6 +3669,11 @@ Responda APENAS JSON no formato:
     }
   }
 
+  // semMaisEmpregos — return AFTER applying updates (not before)
+  if (result.sem_mais_empregos) {
+    return { vinculo: null, semMaisEmpregos: true, updatedVinculos, confirmouMaisEmpregos: false };
+  }
+
   // New vínculo
   if (result.novo_vinculo?.empresa) {
     const novoVinculo: VinculoEmprego = {
@@ -2757,10 +3689,10 @@ Responda APENAS JSON no formato:
       injustica:      result.novo_vinculo.injustica     ?? undefined,
       frota:          result.novo_vinculo.frota         ?? undefined,
     };
-    return { vinculo: novoVinculo, semMaisEmpregos: false, updatedVinculos };
+    return { vinculo: novoVinculo, semMaisEmpregos: false, updatedVinculos, confirmouMaisEmpregos: false };
   }
 
-  return { vinculo: null, semMaisEmpregos: false, updatedVinculos };
+  return { vinculo: null, semMaisEmpregos: false, updatedVinculos, confirmouMaisEmpregos: result.confirmou_mais_empregos === true };
 }
 
 /**
@@ -2847,10 +3779,18 @@ Seja conservador: só responda "prescrita" quando a data for claramente anterior
 }
 
 function buildInstrucaoBase(): string {
-  const hoje = new Date().toLocaleDateString("pt-BR", {
+  const agora = new Date();
+  const hoje = agora.toLocaleDateString("pt-BR", {
     day: "2-digit", month: "long", year: "numeric", timeZone: "America/Sao_Paulo",
   });
-  return `DATA DE HOJE: ${hoje}
+  const horaStr = agora.toLocaleTimeString("pt-BR", {
+    hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo", hour12: false,
+  });
+  const hora = parseInt(horaStr.split(":")[0], 10);
+  const saudacao = hora >= 5 && hora < 12 ? "bom dia" : hora >= 12 && hora < 18 ? "boa tarde" : "boa noite";
+
+  return `DATA E HORA ATUAL (Brasília): ${hoje}, ${horaStr}h
+SAUDAÇÃO CORRETA AGORA: "${saudacao}" — use sempre que abrir uma conversa ou for a primeira mensagem do dia.
 
 REGRAS INVIOLÁVEIS DE COMUNICAÇÃO:
 
@@ -2867,8 +3807,8 @@ Nunca pergunte "Está correto? Sim ou Não". Confirme como pessoa relendo: "Deix
 4. REAÇÃO A ÁUDIOS
 Nunca mencione que recebeu um áudio. Responda ao conteúdo naturalmente.
 
-5. DATAS — REGRA ABSOLUTA
-A DATA DE HOJE informada acima é a data real e correta do sistema. Ignore qualquer "conhecimento" interno que você tenha sobre datas. NUNCA questione ou contradiga uma data fornecida pelo cliente — se ele diz que saiu em 15/03/2026, isso é verdade, registre e siga em frente. Nunca diga "essa data está no futuro" ou "isso não pode estar certo". Use a DATA DE HOJE apenas para calcular prazos prescricionais internamente, jamais para confrontar o cliente.
+5. DATA E HORA — REGRA ABSOLUTA
+A DATA E HORA informadas no topo deste prompt (campo "DATA E HORA ATUAL (Brasília)") são a data e hora REAIS do sistema — use-as sempre. Se o cliente perguntar que horas são ou que dia é hoje, responda EXATAMENTE com o valor informado no topo. NUNCA invente, atualize ou use outra data/hora. Ignore qualquer "conhecimento" interno que você tenha sobre datas. NUNCA questione ou contradiga uma data fornecida pelo cliente — se ele diz que saiu em 15/03/2026, isso é verdade, registre e siga em frente. Nunca diga "essa data está no futuro" ou "isso não pode estar certo". Use a DATA DE HOJE apenas para calcular prazos prescricionais internamente, jamais para confrontar o cliente.
 
 6. TAMANHO E FORMATAÇÃO — REGRA CRÍTICA
 MENSAGENS CURTAS. Máximo 3 frases por resposta. Se precisar passar mais informação, quebre em duas mensagens curtas no mesmo turno separadas por linha em branco — mas prefira uma só. WhatsApp não é e-mail. Não escreva parágrafos longos. Não resuma tudo que o cliente disse. Vá direto ao ponto e faça UMA pergunta de cada vez. Não use emojis. Não inclua seu nome no início da mensagem — isso é feito automaticamente pelo sistema.
