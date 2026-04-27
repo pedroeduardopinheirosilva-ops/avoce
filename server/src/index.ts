@@ -11,6 +11,9 @@ import { createReadStream, existsSync, readFileSync, unlinkSync, mkdirSync } fro
 import { writeFile }                               from "node:fs/promises";
 import { join, resolve }                           from "node:path";
 import { iniciarCron, emitirContratosDoDia, gerarCobrancasDoDia } from "./cron.js";
+import { getCronHealthSnapshot } from "./agent/cron-tracker.js";
+import { initBankingCron } from "./modules/banking/cron/banking.cron.js";
+import { ofxImportService } from "./modules/banking/services/ofx-import.service.js";
 import { gerarCartaCobrancaHtml }            from "./lib/cobranca-html.js";
 import { getCobrancaConfig }                from "./lib/cobranca-config.js";
 import { propostaHtmlPage, autoConverterEmContrato, logoPathToBase64, enviarEmailAceite } from "./routers/propostas.js";
@@ -319,7 +322,7 @@ app.get("/api/cobranca/:id/boleto.pdf", async (req, reply) => {
   return reply.send(html);
 });
 
-// ── Carta de cobrança HTML ────────────────────────────────────────────────────
+// ── Nota de Honorários HTML ───────────────────────────────────────────────────
 
 app.get("/api/cobranca/:id/html", async (req, reply) => {
   const auth  = (req.headers.authorization ?? "");
@@ -339,6 +342,16 @@ app.get("/api/cobranca/:id/html", async (req, reply) => {
     },
   });
   if (!cobranca) return reply.status(404).send({ error: "Não encontrada" });
+
+  // Buscar NFS-e emitida para o mesmo contrato e competência
+  const notaFiscal = await prisma.notaFiscal.findFirst({
+    where: {
+      contratoId:  cobranca.contratoId,
+      competencia: cobranca.competencia,
+      status:      "EMITIDA",
+    },
+    orderBy: { emitidoEm: "desc" },
+  });
 
   // Carregar logo da empresa como base64
   let logoBase64: string | undefined;
@@ -400,6 +413,12 @@ app.get("/api/cobranca/:id/html", async (req, reply) => {
     boletoPdfEndpoint: cobranca.boletoUrlPdf
       ? `/api/cobranca/${cobranca.id}/boleto.pdf?token=${token}`
       : undefined,
+    nfse: notaFiscal ? {
+      numero:      notaFiscal.numero!,
+      emitidoEm:   notaFiscal.emitidoEm,
+      codigoVerif: notaFiscal.codigoVerif,
+      linkNfse:    notaFiscal.linkNfse,
+    } : undefined,
   });
 
   reply.header("Content-Type", "text/html; charset=utf-8");
@@ -577,6 +596,29 @@ app.post("/api/pakt-webhook", {
         ;(async () => {
           try { await autoConverterEmContrato(proposta.id); } catch (e) { app.log.error({ err: e }, "[PAKT-Webhook] Falha na auto-conversão"); }
           try { await enviarEmailAceite(proposta.id);       } catch (e) { app.log.error({ err: e }, "[PAKT-Webhook] Falha ao enviar e-mail de aceite"); }
+        })();
+
+        // Notificar SDR via WhatsApp
+        ;(async () => {
+          try {
+            const projetoConfig = await prisma.iaProjetoConfig.findFirst({
+              where: { chave: "proposta_emitente_id", valor: proposta.emitenteId, categoria: "proposta" },
+            });
+            if (!projetoConfig) return;
+            const tomador = await prisma.tomador.findUnique({ where: { id: proposta.tomadorId } });
+            const contato = tomador?.cpfCnpj
+              ? await prisma.crmContato.findFirst({ where: { cpf: tomador.cpfCnpj } })
+              : null;
+            const { dispararNotificacoes } = await import("./agent/stage-engine.js");
+            await dispararNotificacoes(projetoConfig.projetoId, "proposta_aceita", {
+              nome:     tomador?.nome ?? "",
+              telefone: contato?.whatsapp ?? tomador?.telefone ?? "",
+              valor:    proposta.valorEstimado
+                ? `R$ ${(proposta.valorEstimado / 100).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}`
+                : "",
+              cpf: tomador?.cpfCnpj ?? "",
+            });
+          } catch (e) { app.log.error({ err: e }, "[PAKT-Webhook] Falha na notificação SDR"); }
         })();
       }
     }
@@ -894,37 +936,82 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
-// Per-phone debounce: collects rapid-fire messages from the same contact and processes only
-// the last one after a quiet window. This means if a client sends 3 messages in 4 seconds,
-// Ana responds once (with the last message as trigger) instead of three times.
-// Single messages are delayed by DEBOUNCE_MS before processing — acceptable cost.
-const DEBOUNCE_MS = 4000; // 4-second quiet window
-const _phoneDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; msg: any; projetoId: string }>();
+// Per-phone debounce: accumulates rapid-fire messages and processes them after a quiet window.
+// All messages in the window are saved to DB; only the LAST triggers the LLM response.
+// This prevents double responses when the lead breaks a message into two parts.
+//
+// Processing mutex (_phoneProcessingPromise): if new messages arrive while an LLM call is in
+// flight for this phone, they wait for the current call to finish before firing. This prevents
+// concurrent LLM calls for the same conversation when Evolution API delivers webhooks with delay.
+const DEBOUNCE_MS = 15000; // 15-second quiet window — carreteiros type slowly on mobile
+const _phoneDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; msgs: any[]; projetoId: string }>();
+const _phoneProcessingPromise = new Map<string, Promise<void>>();
 
 function debounceForPhone(
   phone: string,
   msg: any,
   projetoId: string,
-  processIncomingMessage: (pid: string, m: any) => Promise<void>,
+  processIncomingMessage: (pid: string, m: any, saveOnly?: boolean) => Promise<void>,
   app: any
 ): void {
   const existing = _phoneDebounce.get(phone);
   if (existing) {
     clearTimeout(existing.timer);
-    existing.msg = msg;          // keep the latest message
+    existing.msgs.push(msg);   // accumulate ALL messages
     existing.projetoId = projetoId;
   } else {
-    _phoneDebounce.set(phone, { msg, projetoId, timer: null! });
+    _phoneDebounce.set(phone, { msgs: [msg], projetoId, timer: null! });
   }
 
   const entry = _phoneDebounce.get(phone)!;
   entry.timer = setTimeout(async () => {
+    const { msgs, projetoId: pid } = entry;
     _phoneDebounce.delete(phone);
-    try {
-      await processIncomingMessage(entry.projetoId, entry.msg);
-    } catch (err) {
-      app.log.error({ err }, `[WA-Webhook] Erro ao processar mensagem de ${phone}`);
+
+    // Wait for any ongoing LLM processing for this phone before sending a new response.
+    // This handles the case where Evolution API delivers webhooks with delays — messages
+    // that arrive while the LLM is running will correctly wait and then re-check for new batches.
+    const ongoingProcessing = _phoneProcessingPromise.get(phone);
+    if (ongoingProcessing) {
+      try { await ongoingProcessing; } catch { /* ignore — errors are handled inside */ }
     }
+
+    // After waiting for ongoing processing, check if newer messages arrived in the meantime.
+    // If so, save this batch to DB only and let the pending batch send the response — this
+    // avoids a response for a "stale" batch after a more recent one has already queued up.
+    const hasPendingBatch = _phoneDebounce.has(phone);
+
+    const p: Promise<void> = (async () => {
+      if (hasPendingBatch) {
+        // Save all messages to DB so the pending batch sees full history
+        for (const m of msgs) {
+          try { await processIncomingMessage(pid, m, true); } catch (err) {
+            app.log.warn({ err }, `[WA-Webhook] Erro ao salvar msg de ${phone}`);
+          }
+        }
+        app.log.info(`[WA-Webhook] Lote de ${msgs.length} msg(s) de ${phone} salvo sem resposta — lote mais recente pendente`);
+        return;
+      }
+
+      // Save intermediate messages to DB (no LLM call) so the final processing sees full history
+      for (let i = 0; i < msgs.length - 1; i++) {
+        try {
+          await processIncomingMessage(pid, msgs[i], true /* saveOnly */);
+        } catch (err) {
+          app.log.warn({ err }, `[WA-Webhook] Erro ao salvar msg intermediária de ${phone}`);
+        }
+      }
+
+      // Process only the last message (triggers LLM with full accumulated history)
+      try {
+        await processIncomingMessage(pid, msgs[msgs.length - 1]);
+      } catch (err) {
+        app.log.error({ err }, `[WA-Webhook] Erro ao processar mensagem de ${phone}`);
+      }
+    })();
+
+    _phoneProcessingPromise.set(phone, p);
+    try { await p; } finally { _phoneProcessingPromise.delete(phone); }
   }, DEBOUNCE_MS);
 }
 
@@ -956,17 +1043,23 @@ async function processMessages(body: any, projetoId: string, app: any) {
     // Skip status broadcasts
     if (msg.key.remoteJid === "status@broadcast") continue;
 
-    // Dedup: skip if this message ID was already processed recently
-    const msgId = msg.key?.id as string | undefined;
-    if (msgId) {
-      if (_processedMsgIds.has(msgId)) {
-        app.log.warn(`[WA-Webhook] Dedup: mensagem ${msgId} já processada, ignorando`);
-        continue;
-      }
-      _processedMsgIds.set(msgId, Date.now());
-    }
-
+    // Dedup: skip if this message ID was already processed recently.
+    // When key.id is missing, synthesize a stable ID from phone + content hash
+    // so that two identical webhook fires in different workers still deduplicate.
     const phone = (msg.key.remoteJid as string).replace(/@.*/, "");
+    let msgId = msg.key?.id as string | undefined;
+    if (!msgId) {
+      const content = JSON.stringify(msg.message ?? msg.body ?? "");
+      const crypto = await import("node:crypto");
+      msgId = `syn_${phone}_${crypto.createHash("md5").update(content).digest("hex").slice(0, 12)}`;
+      msg.key.id = msgId;
+    }
+    if (_processedMsgIds.has(msgId)) {
+      app.log.warn(`[WA-Webhook] Dedup: mensagem ${msgId} já processada, ignorando`);
+      continue;
+    }
+    _processedMsgIds.set(msgId, Date.now());
+
     debounceForPhone(phone, msg, projetoId, processIncomingMessage, app);
   }
 }
@@ -985,6 +1078,371 @@ app.post("/api/cron/executar", async (req, reply) => {
   emitirContratosDoDia().catch(console.error);
   gerarCobrancasDoDia().catch(console.error);
   return reply.send({ ok: true, message: "Execução iniciada em background" });
+});
+
+// ── Agent health check (Sprint 4) ────────────────────────────────────────────
+
+app.get("/api/agent/health", async (_req, reply) => {
+  const now = new Date();
+  const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const since30m = new Date(now.getTime() - 30 * 60 * 1000);
+  const since5m  = new Date(now.getTime() -  5 * 60 * 1000);
+
+  // ── LLM health ────────────────────────────────────────────────────────────
+  const [totalCalls24h, errCalls24h, logsByProvider] = await Promise.all([
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h } } }),
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h }, erro: { not: null } } }),
+    prisma.iaInteracaoLog.groupBy({
+      by: ["llmUsado"],
+      where: { criadoEm: { gte: since24h }, llmUsado: { not: null } },
+      _count: { _all: true },
+      _sum: { tokensSaida: true },
+    }),
+  ]);
+
+  const errRate = totalCalls24h > 0 ? errCalls24h / totalCalls24h : 0;
+  const providers_status = logsByProvider.map((row: any) => ({
+    provider: row.llmUsado as string,
+    calls: row._count._all,
+    status: "ok" as const,
+  }));
+
+  // ── Deals anômalos ────────────────────────────────────────────────────────
+  // handoff_atrasado_30min: iaPersonaChave=advogado, last out msg é da assistente, >30min
+  const dealsAdvogado = await prisma.crmDeal.findMany({
+    where: { iaPersonaChave: "advogado", iaAtiva: true, status: "aberto" },
+    select: { id: true },
+  });
+  let handoffAtrasado30m = 0;
+  if (dealsAdvogado.length > 0) {
+    const dealIds = dealsAdvogado.map((d: any) => d.id);
+    const ultimasMsgs = await prisma.crmMensagemWhatsapp.findMany({
+      where: { dealId: { in: dealIds }, direcao: "out" },
+      orderBy: { enviadaEm: "desc" },
+      distinct: ["dealId"],
+      select: { dealId: true, enviadaEm: true, personaChave: true },
+    });
+    handoffAtrasado30m = ultimasMsgs.filter(
+      (m: any) => m.personaChave === "assistente" && m.enviadaEm < since30m
+    ).length;
+  }
+
+  // cliente_sem_resposta_5min: last msg = "in", older than 5 min
+  const STAGES_HUMANOS = ["com_advogado", "reuniao_agendada", "fechado", "sem_resposta_closer", "lead_sem_resposta"];
+  const dealsAtivosIds = await prisma.crmDeal.findMany({
+    where: { iaAtiva: true, status: "aberto", iaStageChave: { notIn: STAGES_HUMANOS } },
+    select: { id: true },
+  });
+  let clienteSemResposta5m = 0;
+  if (dealsAtivosIds.length > 0) {
+    const ids = dealsAtivosIds.map((d: any) => d.id);
+    const ultimas = await prisma.crmMensagemWhatsapp.findMany({
+      where: { dealId: { in: ids } },
+      orderBy: { enviadaEm: "desc" },
+      distinct: ["dealId"],
+      select: { dealId: true, enviadaEm: true, direcao: true },
+    });
+    clienteSemResposta5m = ultimas.filter(
+      (m: any) => m.direcao === "in" && m.enviadaEm < since5m && m.enviadaEm > since24h
+    ).length;
+  }
+
+  // bloqueados_intervencao_humana
+  const bloqueados = await prisma.crmDeal.count({
+    where: {
+      iaAtiva: true,
+      status: "aberto",
+      qualificacao: { path: ["_requer_intervencao_humana"], equals: true },
+    },
+  }).catch(() => 0);
+
+  // em_loop_repeticao: 3+ blocked sends no mesmo deal nas últimas 24h
+  const loopGroups = await prisma.iaInteracaoLog.groupBy({
+    by: ["dealId"],
+    where: { criadoEm: { gte: since24h }, erro: { contains: "BLOCKED" }, dealId: { not: null } },
+    _count: { _all: true },
+  }).catch(() => [] as any[]);
+  const loopCandidates = (loopGroups as any[]).filter((r: any) => r._count._all >= 3);
+
+  // prompt leaks e identity questions
+  const [promptLeaks24h, identityQuestions24h] = await Promise.all([
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h }, erro: { contains: "BLOCKED" } } }),
+    (prisma as any).iaEventoIdentidade?.count({ where: { criadoEm: { gte: since24h } } }).catch(() => 0) ?? 0,
+  ]);
+
+  return reply.send({
+    timestamp: now.toISOString(),
+    llm_health: {
+      last_24h_calls: totalCalls24h,
+      last_24h_errors: errCalls24h,
+      error_rate: Math.round(errRate * 1000) / 1000,
+      providers_status,
+    },
+    cron_health: getCronHealthSnapshot(),
+    deals_anomalos: {
+      handoff_atrasado_30min: handoffAtrasado30m,
+      cliente_sem_resposta_5min: clienteSemResposta5m,
+      bloqueados_intervencao_humana: bloqueados,
+      em_loop_repeticao: loopCandidates.length,
+    },
+    prompt_leaks_24h: promptLeaks24h,
+    identity_questions_24h: identityQuestions24h,
+  });
+});
+
+// ── Admin agent dashboard (Sprint 4) ─────────────────────────────────────────
+
+app.get("/admin/agent-dashboard", async (_req, reply) => {
+  const now = new Date();
+  const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+  // Fetch health data
+  const [totalCalls24h, errCalls24h, promptLeaks24h] = await Promise.all([
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h } } }),
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h }, erro: { not: null } } }),
+    prisma.iaInteracaoLog.count({ where: { criadoEm: { gte: since24h }, erro: { contains: "BLOCKED" } } }),
+  ]);
+
+  const cronHealth = getCronHealthSnapshot();
+
+  // Deals anomalos
+  const dealsAdvogado = await prisma.crmDeal.findMany({
+    where: { iaPersonaChave: "advogado", iaAtiva: true, status: "aberto" },
+    include: { contato: { select: { nome: true, whatsapp: true } } },
+  });
+  const since30m = new Date(now.getTime() - 30 * 60 * 1000);
+  const handoffAtrasados: typeof dealsAdvogado = [];
+  for (const d of dealsAdvogado) {
+    const lastOut = await prisma.crmMensagemWhatsapp.findFirst({
+      where: { dealId: d.id, direcao: "out" },
+      orderBy: { enviadaEm: "desc" },
+      select: { enviadaEm: true, personaChave: true },
+    });
+    if (lastOut?.personaChave === "assistente" && lastOut.enviadaEm < since30m) {
+      handoffAtrasados.push(d);
+    }
+  }
+
+  // Últimas 10 entradas prompt_leak_blocked
+  const leakLogs = await prisma.iaInteracaoLog.findMany({
+    where: { criadoEm: { gte: since24h }, erro: { contains: "BLOCKED" } },
+    orderBy: { criadoEm: "desc" },
+    take: 10,
+    select: { id: true, dealId: true, criadoEm: true, erro: true, personaChave: true, stageChave: true },
+  });
+
+  const fmt = (d: Date | null) => d ? d.toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" }) : "—";
+  const errRate = totalCalls24h > 0 ? ((errCalls24h / totalCalls24h) * 100).toFixed(1) : "0.0";
+
+  const card = (title: string, value: string | number, color = "#333") =>
+    `<div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:16px 20px;min-width:160px;text-align:center">
+      <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:.5px">${title}</div>
+      <div style="font-size:28px;font-weight:700;color:${color};margin-top:6px">${value}</div>
+    </div>`;
+
+  const cronRow = (label: string, val: string | null) =>
+    `<tr><td style="padding:6px 12px;color:#555">${label}</td><td style="padding:6px 12px;font-family:monospace;font-size:12px">${val ?? '<span style="color:#aaa">aguardando 1º run</span>'}</td></tr>`;
+
+  const html = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Avoce — Agent Dashboard</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#f5f5f5;margin:0;padding:24px;color:#222}
+  h1{margin:0 0 4px;font-size:22px}
+  .subtitle{color:#888;font-size:13px;margin-bottom:24px}
+  .section{background:#fff;border:1px solid #ddd;border-radius:8px;margin-bottom:20px;overflow:hidden}
+  .section-header{background:#f0f0f0;padding:12px 16px;font-weight:600;font-size:14px;border-bottom:1px solid #ddd}
+  .cards{display:flex;gap:12px;flex-wrap:wrap;padding:16px}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;padding:8px 12px;font-size:12px;color:#888;border-bottom:1px solid #eee;font-weight:500;text-transform:uppercase}
+  td{border-bottom:1px solid #f0f0f0;font-size:13px}
+  tr:last-child td{border-bottom:none}
+  .badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+  .ok{background:#d4edda;color:#155724}
+  .warn{background:#fff3cd;color:#856404}
+  .crit{background:#f8d7da;color:#721c24}
+</style>
+</head>
+<body>
+<h1>🤖 Avoce — Agent Dashboard</h1>
+<div class="subtitle">Atualizado em ${fmt(now)}</div>
+
+<div class="section">
+  <div class="section-header">LLM — Últimas 24h</div>
+  <div class="cards">
+    ${card("Chamadas", totalCalls24h)}
+    ${card("Erros", errCalls24h, errCalls24h > 0 ? "#c0392b" : "#27ae60")}
+    ${card("Taxa de erro", errRate + "%", parseFloat(errRate) > 5 ? "#c0392b" : "#27ae60")}
+    ${card("Prompt leaks bloqueados", promptLeaks24h, promptLeaks24h > 0 ? "#c0392b" : "#27ae60")}
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">Cron — Última execução</div>
+  <table>
+    <thead><tr><th>Job</th><th>Última execução</th></tr></thead>
+    <tbody>
+      ${cronRow("processarTimeoutsAgente (15min)", cronHealth.last_run_processarTimeoutsAgente)}
+      ${cronRow("recuperarMensagensPerdidas (15min)", cronHealth.last_run_recuperarMensagensPerdidas)}
+      ${cronRow("processarHandoffsAtrasados (5min)", cronHealth.last_run_processarHandoffsAtrasados)}
+    </tbody>
+  </table>
+  <div style="padding:10px 16px;font-size:12px;color:${cronHealth.any_overdue ? "#c0392b" : "#888"}">
+    ${cronHealth.any_overdue ? "⚠️ Algum cron está atrasado (>30min sem rodar)" : "✓ Todos os crons rodando normalmente"}
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">Handoffs atrasados — persona Daniela sem intro (>30min)</div>
+  ${handoffAtrasados.length === 0
+    ? '<div style="padding:16px;color:#888;font-size:13px">Nenhum handoff atrasado detectado ✓</div>'
+    : `<table>
+        <thead><tr><th>Deal ID</th><th>Contato</th><th>WhatsApp</th><th>Stage</th></tr></thead>
+        <tbody>
+          ${handoffAtrasados.map((d: any) => `
+            <tr>
+              <td style="padding:8px 12px;font-family:monospace;font-size:11px">${d.id}</td>
+              <td style="padding:8px 12px">${d.contato?.nome ?? "—"}</td>
+              <td style="padding:8px 12px">${d.contato?.whatsapp ?? "—"}</td>
+              <td style="padding:8px 12px"><span class="badge warn">${d.iaStageChave ?? "?"}</span></td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`
+  }
+</div>
+
+<div class="section">
+  <div class="section-header">Últimas 10 entradas de prompt_leak_blocked</div>
+  ${leakLogs.length === 0
+    ? '<div style="padding:16px;color:#888;font-size:13px">Nenhum vazamento nas últimas 24h ✓</div>'
+    : `<table>
+        <thead><tr><th>Quando</th><th>Deal</th><th>Persona</th><th>Stage</th><th>Motivo</th></tr></thead>
+        <tbody>
+          ${leakLogs.map((l: any) => `
+            <tr>
+              <td style="padding:8px 12px;font-size:11px">${fmt(l.criadoEm)}</td>
+              <td style="padding:8px 12px;font-family:monospace;font-size:10px">${l.dealId ?? "—"}</td>
+              <td style="padding:8px 12px">${l.personaChave ?? "—"}</td>
+              <td style="padding:8px 12px">${l.stageChave ?? "—"}</td>
+              <td style="padding:8px 12px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:#c0392b">${l.erro ?? "—"}</td>
+            </tr>`).join("")}
+        </tbody>
+      </table>`
+  }
+</div>
+
+<div style="font-size:11px;color:#aaa;text-align:center;margin-top:12px">
+  <a href="/api/agent/health" style="color:#aaa">JSON bruto</a> · Refresh: <a href="" style="color:#aaa">F5</a>
+</div>
+</body>
+</html>`;
+
+  return reply.type("text/html").send(html);
+});
+
+// ── Banking — OFX / CSV import (multipart) ────────────────────────────────────
+
+function verifyJwt(req: FastifyRequest): boolean {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  try {
+    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+app.post("/banking/import/ofx", async (req, reply) => {
+  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+
+  let emitenteId    = "";
+  let bankAccountId = "";
+  let fileContent   = "";
+
+  for await (const part of req.parts()) {
+    if (part.type === "field" && part.fieldname === "emitenteId")    emitenteId    = part.value as string;
+    if (part.type === "field" && part.fieldname === "bankAccountId") bankAccountId = part.value as string;
+    if (part.type === "file"  && part.fieldname === "file") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileContent = Buffer.concat(chunks).toString("utf-8");
+    }
+  }
+
+  if (!emitenteId || !bankAccountId || !fileContent) {
+    return reply.status(400).send({ error: "Campos obrigatórios: emitenteId, bankAccountId, file" });
+  }
+
+  try {
+    const result = await ofxImportService.importOfx(emitenteId, bankAccountId, fileContent);
+    return reply.send({ ok: true, ...result });
+  } catch (err) {
+    return reply.status(500).send({ error: err instanceof Error ? err.message : "Erro ao importar OFX" });
+  }
+});
+
+app.post("/banking/import/csv/preview", async (req, reply) => {
+  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+
+  let fileContent = "";
+  for await (const part of req.parts()) {
+    if (part.type === "file" && part.fieldname === "file") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileContent = Buffer.concat(chunks).toString("utf-8");
+    }
+  }
+
+  if (!fileContent) return reply.status(400).send({ error: "Arquivo CSV não enviado" });
+
+  try {
+    const result = await ofxImportService.previewCsv(fileContent);
+    return reply.send(result);
+  } catch (err) {
+    return reply.status(500).send({ error: err instanceof Error ? err.message : "Erro ao ler CSV" });
+  }
+});
+
+app.post("/banking/import/csv", async (req, reply) => {
+  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+
+  let emitenteId    = "";
+  let bankAccountId = "";
+  let fileContent   = "";
+  let mappingRaw    = "";
+
+  for await (const part of req.parts()) {
+    if (part.type === "field" && part.fieldname === "emitenteId")    emitenteId    = part.value as string;
+    if (part.type === "field" && part.fieldname === "bankAccountId") bankAccountId = part.value as string;
+    if (part.type === "field" && part.fieldname === "mapping")       mappingRaw    = part.value as string;
+    if (part.type === "file"  && part.fieldname === "file") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileContent = Buffer.concat(chunks).toString("utf-8");
+    }
+  }
+
+  if (!emitenteId || !bankAccountId || !fileContent || !mappingRaw) {
+    return reply.status(400).send({ error: "Campos obrigatórios: emitenteId, bankAccountId, mapping, file" });
+  }
+
+  let mapping: import("./modules/banking/services/ofx-import.service.js").CsvMapping;
+  try {
+    mapping = JSON.parse(mappingRaw);
+  } catch {
+    return reply.status(400).send({ error: "Campo mapping deve ser JSON válido" });
+  }
+
+  try {
+    const result = await ofxImportService.importCsv(emitenteId, bankAccountId, fileContent, mapping);
+    return reply.send({ ok: true, ...result });
+  } catch (err) {
+    return reply.status(500).send({ error: err instanceof Error ? err.message : "Erro ao importar CSV" });
+  }
 });
 
 // ── Setup inicial (seed do admin se não existir) ──────────────────────────────
@@ -1008,6 +1466,7 @@ async function start() {
   await prisma.$connect();
   await ensureAdmin();
   iniciarCron();
+  initBankingCron();
 
   await app.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`[API] Rodando na porta ${PORT}`);

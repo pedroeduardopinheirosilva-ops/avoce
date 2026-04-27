@@ -24,7 +24,7 @@ type Mensagem = {
   tipo: string;
   conteudo: string | null;
   personaChave: string | null;
-  nomeRemetente: string | null;
+  remetente: string | null;
   enviadaEm: string;
 };
 
@@ -51,9 +51,14 @@ function formatDate(iso: string | null) {
   return d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 
-function formatWhatsApp(text: string) {
+// Strip legacy "*Name *\n" prefix from messages stored before the backend fix.
+// Only matches known persona names so it never strips real message content.
+const PERSONA_PREFIX_RE = /^\*?(?:Ana|Dra\.?\s+Daniela(?:\s+\(Closer\))?)\s*\*?\s*[\n:]\s*/;
+
+function formatWhatsApp(text: string, stripPrefix = false) {
+  const cleaned = stripPrefix ? text.replace(PERSONA_PREFIX_RE, "") : text;
   // Convert *bold* to <strong>
-  return text
+  return cleaned
     .replace(/\*([^*]+)\*/g, "<strong>$1</strong>")
     .replace(/\n/g, "<br/>");
 }
@@ -232,8 +237,8 @@ export default function WhatsappPage() {
               // Resolve sender label
               let senderLabel: string | null = null;
               if (msg.direcao === "out") {
-                if (msg.nomeRemetente) {
-                  senderLabel = msg.nomeRemetente;
+                if (msg.remetente) {
+                  senderLabel = msg.remetente;
                 } else if (msg.personaChave) {
                   senderLabel = PERSONA_NAMES[msg.personaChave] ?? msg.personaChave;
                 }
@@ -260,7 +265,7 @@ export default function WhatsappPage() {
                   )}
                   <div
                     className="text-sm whitespace-pre-wrap"
-                    dangerouslySetInnerHTML={{ __html: formatWhatsApp(msg.conteudo ?? "") }}
+                    dangerouslySetInnerHTML={{ __html: formatWhatsApp(msg.conteudo ?? "", msg.direcao === "out" && !!senderLabel) }}
                   />
                   <p className={`text-xs mt-1 ${msg.direcao === "out" ? "text-indigo-200" : "text-gray-400"}`}>
                     {formatTime(msg.enviadaEm)}

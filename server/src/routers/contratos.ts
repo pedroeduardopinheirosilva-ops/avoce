@@ -51,7 +51,7 @@ export const contratoRouter = router({
       retirPis:         z.boolean().default(false),
       retirCofins:      z.boolean().default(false),
       metodoCobr:        z.enum(["PIX_BOLETO", "PIX", "BOLETO", "NENHUM", "ALVARA"]).default("PIX_BOLETO"),
-      emitirNfseAuto:    z.boolean().default(true),
+      emitirNfseAuto:    z.boolean().default(false),
       gerarCobrancaAuto: z.boolean().default(true),
       tipoContrato:      z.enum(["RECORRENTE", "PARCELADO", "EVENTUAL"]).default("RECORRENTE"),
       totalParcelas:     z.number().int().positive().optional().nullable(),

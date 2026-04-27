@@ -17,6 +17,11 @@ import Pipedrive           from "./pages/Pipedrive";
 import Reengajamento       from "./pages/Reengajamento";
 import Financeiro          from "./pages/Financeiro";
 import Usuarios           from "./pages/Usuarios";
+import ContasBancarias    from "./pages/Financeiro/ContasBancarias";
+import ContaBancariaForm  from "./pages/Financeiro/ContaBancariaForm";
+import Extrato            from "./pages/Financeiro/Extrato";
+import Conciliacao        from "./pages/Financeiro/Conciliacao";
+import FluxoCaixa         from "./pages/Financeiro/FluxoCaixa";
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("avoce_token");
@@ -46,6 +51,12 @@ export default function App() {
           <Route path="pipedrive"           element={<Pipedrive />} />
           <Route path="reengajamento"       element={<Reengajamento />} />
           <Route path="financeiro"          element={<Financeiro />} />
+          <Route path="financeiro/contas"   element={<ContasBancarias />} />
+          <Route path="financeiro/contas/nova" element={<ContaBancariaForm />} />
+          <Route path="financeiro/contas/:id"  element={<ContaBancariaForm />} />
+          <Route path="financeiro/extrato"     element={<Extrato />} />
+          <Route path="financeiro/conciliacao" element={<Conciliacao />} />
+          <Route path="financeiro/fluxo-caixa" element={<FluxoCaixa />} />
           <Route path="usuarios"            element={<Usuarios />} />
         </Route>
       </Routes>

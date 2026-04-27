@@ -45,6 +45,10 @@ export default function Faturamento() {
     { competencia, pageSize: 500 },
     { enabled: !!competencia }
   );
+  const { data: emitentes, refetch: refetchEmitentes } = trpc.empresa.listar.useQuery();
+  const atualizarEmpresa = trpc.empresa.atualizar.useMutation({
+    onSuccess: () => refetchEmitentes(),
+  });
 
   const faturarLote = trpc.nota.faturarLote.useMutation();
 
@@ -109,6 +113,66 @@ export default function Faturamento() {
           <p className="text-sm text-gray-500 mt-1">Emita NFS-e de vários contratos de uma só vez para qualquer competência</p>
         </div>
       </div>
+
+      {/* Configuração de faturamento automático por empresa */}
+      {emitentes && emitentes.length > 0 && (
+        <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
+          <h2 className="text-sm font-semibold text-gray-800 mb-4">Faturamento Automático</h2>
+          <p className="text-xs text-gray-500 mb-4">
+            Quando ativo, o sistema emite NFS-e automaticamente no dia configurado para todos os contratos
+            com "Faturamento automático" marcado.
+          </p>
+          <div className="space-y-3">
+            {emitentes.filter(e => e.ativo).map((emp) => {
+              const autoAtivo   = (emp as any).faturamentoAutoAtivo ?? false;
+              const diaEmissao  = (emp as any).diaEmissaoNfse ?? "";
+              return (
+                <div key={emp.id} className="flex items-center gap-4 p-3 rounded-lg border border-gray-100 bg-gray-50">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-900 truncate">{emp.nomeFantasia || emp.nome}</p>
+                    <p className="text-xs text-gray-400">{emp.cnpj}</p>
+                  </div>
+                  <div className="flex items-center gap-3 flex-shrink-0">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={autoAtivo}
+                        onChange={(e) =>
+                          atualizarEmpresa.mutate({ id: emp.id, faturamentoAutoAtivo: e.target.checked })
+                        }
+                        className="w-4 h-4 rounded accent-brand-600"
+                      />
+                      <span className={`text-xs font-medium ${autoAtivo ? "text-green-700" : "text-gray-400"}`}>
+                        {autoAtivo ? "Ativo" : "Inativo"}
+                      </span>
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs text-gray-500">Emitir no dia</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={28}
+                        value={diaEmissao}
+                        placeholder="—"
+                        disabled={!autoAtivo}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          atualizarEmpresa.mutate({
+                            id: emp.id,
+                            diaEmissaoNfse: isNaN(v) ? null : Math.min(28, Math.max(1, v)),
+                          });
+                        }}
+                        className="w-16 border rounded-lg px-2 py-1 text-sm text-center disabled:opacity-40 disabled:bg-gray-100"
+                      />
+                      <span className="text-xs text-gray-500">de cada mês</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Seletor de competência */}
       <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6 flex items-center gap-6">

@@ -48,10 +48,12 @@ export interface NfseEmitida {
 }
 
 export interface NfseStatus {
-  numero:      string;
-  situacao:    string;
-  dataEmissao: string;
-  valor:       string;
+  numero:           string;
+  situacao:         string;
+  dataEmissao:      string;
+  valor:            string;
+  cancelada:        boolean;
+  dataCancelamento: string;
 }
 
 // ── Cache de certificados por path ───────────────────────────────────────────
@@ -378,16 +380,36 @@ export async function consultarNfse(cfg: EmpresaConfig, numeroNfse: string): Pro
     <InscricaoMunicipal>${cfg.inscricaoMunicipal}</InscricaoMunicipal>
   </Prestador>
   <NumeroNfse>${numeroNfse}</NumeroNfse>
+  <Pagina>1</Pagina>
 </ConsultarNfseServicoPrestadoEnvio>`;
 
   const soapResp = await chamaSoap("ConsultarNfseServicoPrestado", consultaXml);
   const retorno  = extrairRetorno(soapResp) || soapResp;
 
+  // Log completo para diagnóstico de cancelamentos (remover após calibrar)
+  console.log(`[NFS-e Consulta] Nº ${numeroNfse} — XML retorno:\n${retorno.slice(0, 2000)}`);
+
+  // Detecção de cancelamento — E&L ABRASF 2.04 pode usar várias tags
+  const dataCancelamento         = extrairTag(retorno, "DataCancelamento") ||
+                                   extrairTag(retorno, "DataHoraCancelamento");
+  const temBlocoNfseCancelamento = retorno.includes("<NfseCancelamento") ||
+                                   retorno.includes("<Cancelamento");
+  const temErroNaoEncontrada     = retorno.includes("E10") ||          // E&L: nota não encontrada
+                                   retorno.includes("E4") ||            // E&L: nota cancelada
+                                   retorno.toLowerCase().includes("não encontrada") ||
+                                   retorno.toLowerCase().includes("cancelad");
+
+  const cancelada = !!(dataCancelamento || temBlocoNfseCancelamento || temErroNaoEncontrada);
+
+  console.log(`[NFS-e Consulta] Nº ${numeroNfse} — cancelada=${cancelada} dataCancelamento="${dataCancelamento}" temBloco=${temBlocoNfseCancelamento} temErro=${temErroNaoEncontrada}`);
+
   return {
-    numero:      extrairTag(retorno, "Numero")           || numeroNfse,
-    situacao:    extrairTag(retorno, "NaturezaOperacao") || "1",
-    dataEmissao: extrairTag(retorno, "DataEmissaoNfse")  || "",
-    valor:       extrairTag(retorno, "ValorServicos")    || "0",
+    numero:           extrairTag(retorno, "Numero")           || numeroNfse,
+    situacao:         extrairTag(retorno, "NaturezaOperacao") || "1",
+    dataEmissao:      extrairTag(retorno, "DataEmissaoNfse")  || "",
+    valor:            extrairTag(retorno, "ValorServicos")    || "0",
+    cancelada,
+    dataCancelamento: dataCancelamento || "",
   };
 }
 

@@ -322,10 +322,24 @@ export const notaRouter = router({
       const cfg = await getCfg(nota.emitenteId);
       await cancelarNfse(cfg, nota.numero);
 
-      return prisma.notaFiscal.update({
+      await prisma.notaFiscal.update({
         where: { id: input.id },
         data:  { status: "CANCELADA" },
       });
+
+      // Cancelar cobranças vinculadas (mesma competência/contrato) que não estejam pagas
+      if (nota.contratoId) {
+        await prisma.cobranca.updateMany({
+          where: { contratoId: nota.contratoId, competencia: nota.competencia, pixStatus: { not: "PAGO" } },
+          data:  { pixStatus: "CANCELADO" },
+        });
+        await prisma.cobranca.updateMany({
+          where: { contratoId: nota.contratoId, competencia: nota.competencia, boletoStatus: { not: "PAGO" } },
+          data:  { boletoStatus: "CANCELADO" },
+        });
+      }
+
+      return { ok: true };
     }),
 
   consultar: authProc
@@ -336,6 +350,70 @@ export const notaRouter = router({
       const cfg = await getCfg(nota.emitenteId);
       return consultarNfse(cfg, nota.numero);
     }),
+
+  // Verifica todas as notas EMITIDAS no E&L e marca como CANCELADA as que foram canceladas na prefeitura.
+  // Cancela também as cobranças (PIX/boleto) vinculadas ao mesmo contrato e competência.
+  sincronizarCanceladas: authProc.mutation(async () => {
+    const notas = await prisma.notaFiscal.findMany({
+      where:   { status: "EMITIDA", numero: { not: null } },
+      include: { emitente: true },
+    });
+
+    const resultados: { id: string; numero: string; resultado: "CANCELADA" | "ATIVA" | "ERRO"; erroMsg?: string }[] = [];
+
+    for (const nota of notas) {
+      if (!nota.numero) continue;
+      try {
+        const cfg    = await getCfg(nota.emitenteId);
+        const status = await consultarNfse(cfg, nota.numero);
+
+        if (status.cancelada) {
+          // Marcar nota como cancelada
+          await prisma.notaFiscal.update({
+            where: { id: nota.id },
+            data:  { status: "CANCELADA" },
+          });
+
+          // Cancelar cobranças da mesma competência e contrato (se existirem)
+          if (nota.contratoId) {
+            await prisma.cobranca.updateMany({
+              where: {
+                contratoId:  nota.contratoId,
+                competencia: nota.competencia,
+                pixStatus:   { not: "PAGO" },
+              },
+              data: { pixStatus: "CANCELADO" },
+            });
+            await prisma.cobranca.updateMany({
+              where: {
+                contratoId:   nota.contratoId,
+                competencia:  nota.competencia,
+                boletoStatus: { not: "PAGO" },
+              },
+              data: { boletoStatus: "CANCELADO" },
+            });
+          }
+
+          console.log(`[Sync] Nota ${nota.numero} (${nota.id}) marcada como CANCELADA`);
+          resultados.push({ id: nota.id, numero: nota.numero, resultado: "CANCELADA" });
+        } else {
+          resultados.push({ id: nota.id, numero: nota.numero, resultado: "ATIVA" });
+        }
+      } catch (err: any) {
+        const erroMsg = (err?.message ?? String(err)).slice(0, 200);
+        console.error(`[Sync] Erro ao verificar nota ${nota.numero}: ${erroMsg}`);
+        resultados.push({ id: nota.id, numero: nota.numero ?? "", resultado: "ERRO", erroMsg });
+      }
+
+      // Pequena pausa para não sobrecarregar o webservice da prefeitura
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    const canceladas = resultados.filter(r => r.resultado === "CANCELADA").length;
+    const erros      = resultados.filter(r => r.resultado === "ERRO").length;
+    console.log(`[Sync] Sincronização concluída: ${canceladas} canceladas, ${erros} erros, ${notas.length} verificadas`);
+    return { total: notas.length, canceladas, erros, resultados };
+  }),
 
   dashboard: authProc.query(async () => {
     const [total, emitidas, erros, valorAgg] = await Promise.all([

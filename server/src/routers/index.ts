@@ -12,6 +12,7 @@ import { iaRouter }                     from "./ia.js";
 import { pipedriveRouter }              from "./pipedrive.js";
 import { reengajamentoRouter }          from "./reengajamento.js";
 import { financeiroRouter }             from "./financeiro.js";
+import { bankingRouter }               from "../modules/banking/banking.router.js";
 
 export type { Context } from "./trpc.js";
 
@@ -29,6 +30,7 @@ export const appRouter = router({
   pipedrive:         pipedriveRouter,
   reengajamento:     reengajamentoRouter,
   financeiro:        financeiroRouter,
+  banking:           bankingRouter,
 });
 
 export type AppRouter = typeof appRouter;

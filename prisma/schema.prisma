@@ -7,6 +7,44 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum BankProvider {
+  SICOOB
+  BRADESCO
+  INTER
+  BTG
+}
+
+enum CredentialType {
+  MTLS_CERT
+  MTLS_KEYPAIR
+  OAUTH2
+}
+
+enum StatementSource {
+  API_SYNC
+  OFX_IMPORT
+  MANUAL
+}
+
+enum ReconciliationStatus {
+  UNMATCHED
+  MATCHED
+  MANUAL
+  IGNORED
+}
+
+enum EntryType {
+  DEBIT
+  CREDIT
+}
+
+enum SyncStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  ERROR
+}
+
 model Usuario {
   id       String   @id @default(cuid())
   email    String   @unique
@@ -14,6 +52,8 @@ model Usuario {
   nome     String
   ativo    Boolean  @default(true)
   criadoEm DateTime @default(now())
+
+  projetoUsuarios IaProjetoUsuario[]
 }
 
 model EmpresaEmitente {
@@ -63,12 +103,15 @@ model EmpresaEmitente {
   codigoServicoNacional  String?
   regimeTributacao       String?
   timbradoPath           String?
+  faturamentoAutoAtivo   Boolean             @default(false)
+  diaEmissaoNfse         Int?
 
   cobrancas          Cobranca[]
   contratos          Contrato[]
   notas              NotaFiscal[]
   propostas          Proposta[]
   templateDocumentos TemplateDocumento[]
+  bankAccounts       BankAccount[]
 }
 
 model Tomador {
@@ -76,6 +119,9 @@ model Tomador {
   nome              String
   cpfCnpj           String          @unique
   email             String?
+  emailFinanceiro   String?
+  emailGeral        String?
+  emailDiretoria    String?
   telefone          String?
   endereco          String?
   numero            String?
@@ -197,6 +243,7 @@ model Proposta {
   contratoDescricao         String?
   paktSignedPdfPath         String?
   templatesGerar            String?
+  honorariosExitoPerc       Int?
 
   documentosGerados DocumentoGerado[]
   contrato          Contrato?         @relation(fields: [contratoId], references: [id])
@@ -259,8 +306,12 @@ model Cobranca {
   pixPagadorNome       String?
   pixPagoEm            DateTime?
 
-  contrato Contrato        @relation(fields: [contratoId], references: [id])
-  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  contrato      Contrato        @relation(fields: [contratoId], references: [id])
+  emitente      EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  bankStatement BankStatement?
+
+  reconciledAt    DateTime?
+  reconciledBy    String?
 }
 
 model NotaFiscal {
@@ -353,6 +404,9 @@ model CrmDeal {
   closerTentativas Int       @default(0)
   proximoContatoEm DateTime?
   docsConfirmados  Boolean   @default(false)
+  iaFlowStepChave  String?   // current step in flow controller (advogado phase)
+  iaFlowStepData   Json?     // data collected by flow controller (advogado phase)
+  iaFlags          Json?     // internal AI operational flags (keys prefixed with _)
   criadoEm         DateTime  @default(now())
   atualizadoEm     DateTime  @updatedAt
 
@@ -422,7 +476,83 @@ model IaProjeto {
   templates  IaMensagemTemplate[]
   regras     IaRegraTransicao[]
   logs       IaInteracaoLog[]
-  deals      CrmDeal[]
+  deals           CrmDeal[]
+  provedores      IaLlmProvedor[]
+  notificacoes    IaNotificacaoEvento[]
+  projetoUsuarios IaProjetoUsuario[]
+  vinculoFlow     IaVinculoFlowPasso[]
+  flowSteps       IaFlowStep[]
+}
+
+model IaVinculoFlowPasso {
+  id           String   @id @default(cuid())
+  projetoId    String
+  chave        String   // "empresa" | "funcao" | "vinculo" | "saida" | "horas_extras" | "pagamento_fora" | "injustica" | "frota" | "mais_empregos" | custom
+  pergunta     String   @db.Text
+  campoColetar String?  // field key in VinculoEmprego; null for tipoEspecial steps
+  ordemPadrao  Int      @default(0)
+  ativo        Boolean  @default(true)
+  skipSe       Json?    // { "campo": "vinculo", "contem_qualquer": ["clt", "carteira"] }
+  tipoEspecial String?  // "mais_empregos" | null
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+// ─────────────────────────────────────────────
+// Flow Controller — steps & gates por persona
+// ─────────────────────────────────────────────
+
+model IaFlowStep {
+  id           String       @id @default(cuid())
+  projetoId    String
+  personaChave String       // "assistente" | "advogado"
+  fase         String       // "pre_vinculos" | "pos_vinculos" | "advogado"
+  chave        String
+  ordem        Int
+  label        String
+  pergunta     String       @db.Text
+  stepType     String       @default("question") // "question" | "gate" | "document" | "end" | "saudacao" | "llm_generated"
+  subFase      String?      // "advogado_valor" | "advogado_dados" | "advogado_documentos"
+  campoColetar String?      // key in qualificacao JSON or iaFlowStepData JSON
+  skipSe       Json?
+  ativo        Boolean      @default(true)
+  criadoEm     DateTime     @default(now())
+  atualizadoEm DateTime     @updatedAt
+  gates        IaFlowGate[]
+  projeto      IaProjeto    @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, personaChave, chave])
+}
+
+model IaFlowGate {
+  id          String     @id @default(cuid())
+  stepId      String
+  condicao    String     @db.Text
+  actionType  String     // "continue" | "goto_step" | "end" | "discard" | "repeat" | "notify" | "wait"
+  actionValue String?    // target step chave, end message, etc.
+  label       String?
+  cor         String?
+  ordem       Int        @default(0)
+  criadoEm    DateTime   @default(now())
+  step        IaFlowStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+}
+
+model IaLlmProvedor {
+  id        String  @id @default(cuid())
+  projetoId String
+  ordem     Int
+  provider  String  // anthropic | openai | groq | gemini
+  modelo    String
+  apiKey    String
+  ativo     Boolean @default(true)
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, ordem])
 }
 
 model IaProjetoConfig {
@@ -450,9 +580,11 @@ model IaPersona {
   nomeExibicao   String
   descricaoPapel String?
   systemPrompt   String
-  tom            String  @default("profissional")
-  ordem          Int     @default(0)
-  ativo          Boolean @default(true)
+  tom              String  @default("profissional")
+  ordem            Int     @default(0)
+  ativo            Boolean @default(true)
+  ttsVoiceId       String?
+  llmProviderChave String? // se definido, usa o provedor com este nome (ex: "gemini", "anthropic") em vez do padrão do projeto
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 
@@ -512,14 +644,15 @@ model IaMensagemTemplate {
 }
 
 model IaRegraTransicao {
-  id                String  @id @default(cuid())
-  projetoId         String
-  stageOrigemChave  String?
-  stageDestinoChave String
-  condicao          String  // primeira_mensagem | sem_resposta_Xhoras | cliente_respondeu | qualificacao_completa | interesse_confirmado | docs_confirmados | contrato_assinado | closer_tentativas_esgotadas | humano_marcou_fase
-  parametros        Json?
-  acaoAdicional     String? // trocar_persona:X | solicitar_documentos | gerar_proposta_automatica | criar_deal_processual
-  ordem             Int     @default(0)
+  id                    String  @id @default(cuid())
+  projetoId             String
+  stageOrigemChave      String?
+  stageDestinoChave     String
+  condicao              String
+  parametros            Json?
+  acaoAdicional         String?
+  ordem                 Int     @default(0)
+  requerPrescricaoAtiva Boolean @default(false)
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 }
@@ -578,4 +711,145 @@ model CrmVinculoEmprego {
   criadoEm         DateTime  @default(now())
 
   deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+}
+
+// ─────────────────────────────────────────────
+// Banking Module
+// ─────────────────────────────────────────────
+
+model BankAccount {
+  id                String       @id @default(cuid())
+  emitenteId        String
+  provider          BankProvider
+  name              String       @db.VarChar(100)
+  bankCode          String       @db.VarChar(10)
+  agency            String       @db.VarChar(10)
+  agencyDigit       String?      @db.VarChar(2)
+  account           String       @db.VarChar(20)
+  accountDigit      String?      @db.VarChar(2)
+  accountType       String       @db.VarChar(10)
+  pixKey            String?      @db.VarChar(100)
+  isDefault         Boolean      @default(false)
+  isActive          Boolean      @default(true)
+  currentBalance    Decimal      @default(0) @db.Decimal(15, 2)
+  balanceDate       DateTime?
+  externalAccountId String?      @db.VarChar(100)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  emitente          EmpresaEmitente  @relation(fields: [emitenteId], references: [id])
+  credential        BankCredential?
+  statements        BankStatement[]
+  syncLogs          StatementSyncLog[]
+  @@unique([emitenteId, provider, account])
+  @@index([emitenteId])
+  @@map("bank_accounts")
+}
+
+model BankCredential {
+  id             String         @id @default(cuid())
+  emitenteId     String
+  bankAccountId  String         @unique
+  credentialType CredentialType
+  certData       String?        @db.Text
+  certPassword   String?        @db.Text
+  certPem        String?        @db.Text
+  keyPem         String?        @db.Text
+  clientId       String?        @db.Text
+  clientSecret   String?        @db.Text
+  expiresAt      DateTime?
+  isActive       Boolean        @default(true)
+  lastTestedAt   DateTime?
+  lastTestOk     Boolean?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  bankAccount    BankAccount    @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  @@index([emitenteId])
+  @@map("bank_credentials")
+}
+
+model BankStatement {
+  id                   String               @id @default(cuid())
+  emitenteId           String
+  bankAccountId        String
+  externalId           String?              @db.VarChar(100)
+  entryDate            DateTime
+  valueDate            DateTime?
+  amount               Decimal              @db.Decimal(15, 2)
+  entryType            EntryType
+  balance              Decimal?             @db.Decimal(15, 2)
+  description          String               @db.VarChar(500)
+  documentNumber       String?              @db.VarChar(100)
+  counterpartyName     String?              @db.VarChar(200)
+  counterpartyDocument String?              @db.VarChar(20)
+  category             String?              @db.VarChar(100)
+  source               StatementSource      @default(API_SYNC)
+  rawData              Json?
+  reconciliationStatus ReconciliationStatus @default(UNMATCHED)
+  reconciledAt         DateTime?
+  reconciledBy         String?
+  cobrancaId           String?              @unique
+  createdByUserId      String?
+  updatedByUserId      String?
+  attachmentUrl        String?              @db.VarChar(500)
+  attachmentName       String?              @db.VarChar(200)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  bankAccount          BankAccount          @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  cobranca             Cobranca?            @relation(fields: [cobrancaId], references: [id])
+  @@unique([bankAccountId, externalId])
+  @@index([emitenteId, bankAccountId, entryDate])
+  @@index([emitenteId, reconciliationStatus])
+  @@map("bank_statements")
+}
+
+model StatementSyncLog {
+  id             String      @id @default(cuid())
+  emitenteId     String
+  bankAccountId  String
+  startDate      DateTime
+  endDate        DateTime
+  status         SyncStatus  @default(PENDING)
+  recordsFetched Int         @default(0)
+  recordsNew     Int         @default(0)
+  errorMessage   String?     @db.Text
+  durationMs     Int?
+  triggeredBy    String      @db.VarChar(20)
+  createdAt      DateTime    @default(now())
+  finishedAt     DateTime?
+  bankAccount    BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  @@index([emitenteId, bankAccountId, createdAt])
+  @@map("statement_sync_logs")
+}
+
+model IaNotificacaoEvento {
+  id        String   @id @default(cuid())
+  projetoId String
+  nome      String
+  evento    String
+  destino   String
+  mensagem  String
+  ativo     Boolean  @default(true)
+  criadoEm  DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaProjetoUsuario {
+  id           String   @id @default(cuid())
+  projetoId    String
+  usuarioId    String
+  funcao       String   @default("atendente")
+  nomeWhatsapp String?
+  criadoEm     DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+  usuario Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, usuarioId])
+}
+
+model Configuracao {
+  chave        String   @id
+  valor        String
+  atualizadoEm DateTime @updatedAt
 }

@@ -16,11 +16,7 @@ export async function autoConverterEmContrato(propostaId: string): Promise<void>
   if (!p) return;
   if (p.contratoId) return;  // já convertida
 
-  // Precisa de valor e dia de vencimento para criar o contrato
-  if (!p.valorEstimado || !p.contratoDiaVencimento) {
-    console.log(`[Proposta] ${propostaId}: sem valor/diaVencimento — contrato não criado automaticamente`);
-    return;
-  }
+  // Para contratos de êxito, valor pode ser 0 e não há dia de vencimento fixo
 
   const descricao = p.contratoDescricao || p.titulo;
 
@@ -35,7 +31,7 @@ export async function autoConverterEmContrato(propostaId: string): Promise<void>
       valor:             p.valorEstimado,
       diaVencimento:     p.contratoDiaVencimento,
       metodoCobr:        p.contratoMetodoCobr ?? "PIX_BOLETO",
-      emitirNfseAuto:    isEventual ? false : (p.contratoEmitirNfseAuto ?? true),
+      emitirNfseAuto:    isEventual ? false : (p.contratoEmitirNfseAuto ?? false),
       gerarCobrancaAuto: isEventual ? false : (p.contratoGerarCobrancaAuto ?? true),
       tipoContrato:      p.contratoTipoContrato ?? "RECORRENTE",
       totalParcelas:     p.contratoTotalParcelas ?? null,
@@ -414,7 +410,7 @@ export const propostaRouter = router({
           where,
           include: {
             emitente: { select: { id: true, nome: true, nomeFantasia: true, cnpj: true, cidade: true } },
-            tomador:  { select: { id: true, nome: true, email: true } },
+            tomador:  { select: { id: true, nome: true, email: true, telefone: true } },
             contrato: { select: { id: true } },
           },
           orderBy: { criadoEm: "desc" },
@@ -481,7 +477,7 @@ export const propostaRouter = router({
           contratoMetodoCobr:        input.contratoMetodoCobr ?? "PIX_BOLETO",
           contratoTipoContrato:      input.contratoTipoContrato ?? "RECORRENTE",
           contratoTotalParcelas:     input.contratoTotalParcelas ?? null,
-          contratoEmitirNfseAuto:    input.contratoEmitirNfseAuto ?? true,
+          contratoEmitirNfseAuto:    input.contratoEmitirNfseAuto ?? false,
           contratoGerarCobrancaAuto: input.contratoGerarCobrancaAuto ?? true,
           contratoIssRetido:         input.contratoIssRetido ?? false,
           contratoDescricao:         input.contratoDescricao ?? null,
@@ -807,7 +803,7 @@ export const propostaRouter = router({
       valor:            z.number().int().positive(),
       diaVencimento:    z.number().int().min(1).max(28),
       metodoCobr:       z.enum(["PIX_BOLETO", "PIX", "BOLETO", "NENHUM", "ALVARA"]).default("PIX_BOLETO"),
-      emitirNfseAuto:   z.boolean().default(true),
+      emitirNfseAuto:   z.boolean().default(false),
       gerarCobrancaAuto:z.boolean().default(true),
       tipoContrato:     z.enum(["RECORRENTE", "PARCELADO", "EVENTUAL"]).default("RECORRENTE"),
       totalParcelas:    z.number().int().positive().optional().nullable(),

@@ -586,7 +586,7 @@ export default function Empresas() {
             {formTab === "dados" && form.id && (
               <div className="mt-4 bg-gray-50 border border-gray-200 rounded-xl p-4">
                 <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">🖼️ Logo da Empresa</p>
-                <p className="text-xs text-gray-500 mb-3">Usada na carta de cobrança. Formatos: PNG, JPG, SVG. Máx. 5 MB.</p>
+                <p className="text-xs text-gray-500 mb-3">Usada na Nota de Honorários. Formatos: PNG, JPG, SVG. Máx. 5 MB.</p>
                 {(form as any).logoPath && (
                   <div className="mb-3 flex items-center gap-2">
                     <img

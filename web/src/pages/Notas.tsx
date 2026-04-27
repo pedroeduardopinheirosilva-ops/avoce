@@ -34,9 +34,17 @@ export default function Notas() {
     competencia: filtroCompetencia || undefined,
   });
 
+  const [syncResultado, setSyncResultado] = useState<{ total: number; canceladas: number; erros: number } | null>(null);
+
   const cancelar = trpc.nota.cancelar.useMutation({
     onSuccess: () => { utils.nota.listar.invalidate(); setCancelModal(null); setCancelErro(null); },
     onError:   (err) => setCancelErro(err.message),
+  });
+  const sincronizar = trpc.nota.sincronizarCanceladas.useMutation({
+    onSuccess: (res) => {
+      setSyncResultado(res);
+      utils.nota.listar.invalidate();
+    },
   });
   const consultar = trpc.nota.consultar.useQuery;
 
@@ -56,10 +64,34 @@ export default function Notas() {
     <div className="p-8">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">NFS-e Emitidas</h1>
-        <button onClick={executarCron} className="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-medium">
-          ⚡ Emitir do Dia
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => {
+              if (!confirm("Verificar todas as notas emitidas no sistema da prefeitura e marcar as canceladas?\n\nIsso pode demorar alguns minutos dependendo da quantidade de notas.")) return;
+              setSyncResultado(null);
+              sincronizar.mutate();
+            }}
+            disabled={sincronizar.isPending}
+            className="bg-gray-600 hover:bg-gray-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2"
+          >
+            {sincronizar.isPending ? <><span className="animate-spin inline-block">⟳</span> Verificando...</> : "🔄 Sincronizar cancelamentos"}
+          </button>
+          <button onClick={executarCron} className="bg-amber-500 hover:bg-amber-600 text-white px-4 py-2 rounded-lg text-sm font-medium">
+            ⚡ Emitir do Dia
+          </button>
+        </div>
       </div>
+
+      {syncResultado && (
+        <div className="bg-blue-50 border border-blue-200 rounded-xl px-5 py-3 mb-4 text-sm flex items-center justify-between">
+          <span className="text-blue-800">
+            Sincronização concluída — <strong>{syncResultado.total}</strong> verificadas,{" "}
+            <strong className="text-red-700">{syncResultado.canceladas}</strong> marcadas como canceladas
+            {syncResultado.erros > 0 && <>, <strong className="text-orange-600">{syncResultado.erros}</strong> com erro</>}
+          </span>
+          <button onClick={() => setSyncResultado(null)} className="text-blue-400 hover:text-blue-600 ml-4">✕</button>
+        </div>
+      )}
 
       {/* Filtros */}
       <div className="flex gap-3 mb-4">

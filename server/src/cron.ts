@@ -5,7 +5,8 @@
 
 import cron                 from "node-cron";
 import { prisma }           from "./db.js";
-import { processarTimeoutsAgente } from "./agent/cron-agent.js";
+import { processarTimeoutsAgente, recuperarMensagensPerdidas, processarHandoffsAtrasados } from "./agent/cron-agent.js";
+import { recordCronRun } from "./agent/cron-tracker.js";
 import { emitirNfse, type EmpresaConfig } from "./lib/nfse.js";
 import { certPathForEmpresa } from "./upload.js";
 import { consultarPix }     from "./lib/sicoob-pix.js";
@@ -43,13 +44,30 @@ async function getCfg(emp: {
 }
 
 export async function emitirContratosDoDia(): Promise<void> {
-  const hoje         = new Date().getDate();
-  const competencia  = competenciaAtual();
+  const hoje        = new Date().getDate();
+  const competencia = competenciaAtual();
 
-  console.log(`[CRON] Processando contratos dia=${hoje} competencia=${competencia}`);
+  console.log(`[CRON] Verificando faturamento automático — dia=${hoje} competencia=${competencia}`);
+
+  // Emitentes com faturamento automático ativo e dia de emissão = hoje
+  const emitentes = await prisma.empresaEmitente.findMany({
+    where: { faturamentoAutoAtivo: true, diaEmissaoNfse: hoje },
+    select: { id: true, nome: true },
+  });
+
+  if (!emitentes.length) {
+    console.log("[CRON] Nenhum emitente com faturamento automático configurado para hoje");
+    return;
+  }
+
+  console.log(`[CRON] ${emitentes.length} emitente(s) com faturamento automático hoje`);
 
   const contratos = await prisma.contrato.findMany({
-    where: { ativo: true, diaVencimento: hoje, emitirNfseAuto: true },
+    where: {
+      ativo: true,
+      emitirNfseAuto: true,
+      emitenteId: { in: emitentes.map((e) => e.id) },
+    },
     include: { emitente: true, tomador: true },
   });
 
@@ -168,7 +186,7 @@ export async function emitirContratosDoDia(): Promise<void> {
     }
   }
 
-  console.log("[CRON] Processamento concluído");
+  console.log(`[CRON] Faturamento automático concluído — ${contratos.length} contrato(s) processado(s)`);
 }
 
 // ── Geração automática de cobranças (PIX + Boleto) ──────────────────────────
@@ -366,7 +384,7 @@ export async function pollarPixPendentes(): Promise<void> {
 }
 
 export function iniciarCron(): void {
-  // Todo dia às 07:00 — emitir notas fiscais + gerar cobranças dos contratos do dia
+  // Todo dia às 07:00 — emitir NFS-e automáticas + gerar cobranças
   cron.schedule("0 7 * * *", async () => {
     try {
       await emitirContratosDoDia();
@@ -380,6 +398,16 @@ export function iniciarCron(): void {
     }
   });
 
+  // A cada 5 minutos — handoffs atrasados (Ana→Daniela sem intro)
+  cron.schedule("*/5 * * * *", async () => {
+    try {
+      await processarHandoffsAtrasados();
+      recordCronRun("processarHandoffsAtrasados");
+    } catch (err) {
+      console.error("[CronAgent] Erro ao processar handoffs:", err);
+    }
+  });
+
   // A cada 15 minutos — consultar PIX pendentes + verificar timeouts do agente IA
   cron.schedule("*/15 * * * *", async () => {
     try {
@@ -389,10 +417,17 @@ export function iniciarCron(): void {
     }
     try {
       await processarTimeoutsAgente();
+      recordCronRun("processarTimeoutsAgente");
     } catch (err) {
       console.error("[CronAgent] Erro crítico:", err);
     }
+    try {
+      await recuperarMensagensPerdidas();
+      recordCronRun("recuperarMensagensPerdidas");
+    } catch (err) {
+      console.error("[CronAgent] Erro ao recuperar mensagens perdidas:", err);
+    }
   });
 
-  console.log("[CRON] Agendado: Notas às 07:00 | PIX poll + Agente IA a cada 15 min");
+  console.log("[CRON] Agendado: Notas às 07:00 | PIX poll + Agente IA a cada 15 min | Handoffs a cada 5 min");
 }

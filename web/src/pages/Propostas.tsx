@@ -5,18 +5,19 @@ import RichEditor from "../components/RichEditor";
 import type { RichEditorHandle } from "../components/RichEditor";
 
 const VARIAVEIS_PROPOSTA = [
-  { v: "{{emitente}}",    desc: "Nome do escritório" },
-  { v: "{{cnpj}}",        desc: "CNPJ do escritório" },
-  { v: "{{cidade}}",      desc: "Cidade do escritório" },
-  { v: "{{endereco}}",    desc: "Endereço do escritório" },
-  { v: "{{tomador}}",     desc: "Nome do cliente" },
-  { v: "{{cpfCnpj}}",     desc: "CPF/CNPJ do cliente" },
-  { v: "{{valor}}",       desc: "Valor em R$" },
-  { v: "{{diaVencimento}}", desc: "Dia de vencimento" },
+  { v: "{{emitente}}",         desc: "Nome do escritório" },
+  { v: "{{cnpj}}",             desc: "CNPJ do escritório" },
+  { v: "{{cidade}}",           desc: "Cidade do escritório" },
+  { v: "{{endereco}}",         desc: "Endereço do escritório" },
+  { v: "{{tomador}}",          desc: "Nome do cliente" },
+  { v: "{{cpfCnpj}}",          desc: "CPF/CNPJ do cliente" },
+  { v: "{{valor}}",            desc: "Valor fixo em R$" },
+  { v: "{{honorariosExito}}",  desc: "Honorários de êxito (% sobre condenação)" },
+  { v: "{{diaVencimento}}",    desc: "Dia de vencimento" },
   { v: "{{metodoPagamento}}", desc: "Método de pagamento" },
-  { v: "{{dataAtual}}",   desc: "Data atual" },
-  { v: "{{validadeAte}}", desc: "Validade da proposta" },
-  { v: "{{servico}}",     desc: "Descrição do serviço" },
+  { v: "{{dataAtual}}",        desc: "Data atual" },
+  { v: "{{validadeAte}}",      desc: "Validade da proposta" },
+  { v: "{{servico}}",          desc: "Descrição do serviço" },
 ];
 
 // Componente que carrega e exibe os documentos gerados de uma proposta
@@ -121,6 +122,7 @@ interface PropostaForm {
   contratoDescricao:         string;
   // templates a gerar ao aceitar
   templatesGerar: string[];
+  honorariosExitoPercStr: string;
 }
 
 function emptyForm(): PropostaForm {
@@ -132,6 +134,7 @@ function emptyForm(): PropostaForm {
     contratoEmitirNfseAuto: true, contratoGerarCobrancaAuto: true,
     contratoIssRetido: false, contratoDescricao: "",
     templatesGerar: [],
+    honorariosExitoPercStr: "",
   };
 }
 
@@ -141,15 +144,12 @@ export default function Propostas() {
   const { data: empresas  } = trpc.empresa.listar.useQuery();
   const { data: tomadores } = trpc.tomador.listar.useQuery({});
   const [emitenteIdParaTemplates, setEmitenteIdParaTemplates] = useState("");
-  const { data: templates, refetch: refetchTemplates } = trpc.proposta.templates.useQuery({ emitenteId: emitenteIdParaTemplates || undefined });
   const { data: templatesDoc } = trpc.templateDocumento.listar.useQuery(
     { emitenteId: emitenteIdParaTemplates || undefined },
     { enabled: !!emitenteIdParaTemplates },
   );
-  const { data: templatesProposta, refetch: refetchTemplatesProposta } = trpc.templateDocumento.listar.useQuery(
-    { emitenteId: emitenteIdParaTemplates || undefined, tipo: "PROPOSTA" },
-    { enabled: !!emitenteIdParaTemplates },
-  );
+  // Templates de proposta: sempre carregados da página Templates, sem fallback hardcoded
+  const { data: templatesProposta } = trpc.templateDocumento.listar.useQuery({ tipo: "PROPOSTA" });
 
   const [page, setPage] = useState(1);
   const [filterStatus, setFilterStatus] = useState("");
@@ -161,8 +161,35 @@ export default function Propostas() {
     pageSize: 20,
   });
 
-  const criar       = trpc.proposta.criar.useMutation({ onSuccess: () => { utils.proposta.listar.invalidate(); setForm(null); } });
-  const atualizar   = trpc.proposta.atualizar.useMutation({ onSuccess: () => { utils.proposta.listar.invalidate(); setForm(null); } });
+  const criar       = trpc.proposta.criar.useMutation({
+    onSuccess: () => { utils.proposta.listar.invalidate(); setForm(null); },
+    onError:   (e) => {
+      console.error("[criar proposta] erro completo:", e);
+      // tenta extrair mensagem legível do erro Zod
+      let msg = e.message;
+      try {
+        const issues = JSON.parse(e.message) as Array<{ path: string[]; message: string }>;
+        if (Array.isArray(issues)) {
+          msg = issues.map(i => `• ${i.path.join(".") || "campo"}: ${i.message}`).join("\n");
+        }
+      } catch { /* não é JSON */ }
+      alert(`Erro ao criar proposta:\n${msg}`);
+    },
+  });
+  const atualizar   = trpc.proposta.atualizar.useMutation({
+    onSuccess: () => { utils.proposta.listar.invalidate(); setForm(null); },
+    onError:   (e) => {
+      console.error("[atualizar proposta] erro completo:", e);
+      let msg = e.message;
+      try {
+        const issues = JSON.parse(e.message) as Array<{ path: string[]; message: string }>;
+        if (Array.isArray(issues)) {
+          msg = issues.map(i => `• ${i.path.join(".") || "campo"}: ${i.message}`).join("\n");
+        }
+      } catch { /* não é JSON */ }
+      alert(`Erro ao salvar proposta:\n${msg}`);
+    },
+  });
   const excluir     = trpc.proposta.excluir.useMutation({ onSuccess: () => utils.proposta.listar.invalidate() });
   const enviarEmail = trpc.proposta.enviarEmail.useMutation({
     onSuccess: (r) => {
@@ -184,28 +211,38 @@ export default function Propostas() {
   });
 
 
-  const criarTemplate    = trpc.templateDocumento.criar.useMutation({
-    onSuccess: () => { refetchTemplates(); refetchTemplatesProposta(); setSaveAsTemplate(null); },
-    onError:   (e) => alert(`Erro: ${e.message}`),
-  });
-  const atualizarTemplate = trpc.templateDocumento.atualizar.useMutation({
-    onSuccess: () => { refetchTemplates(); refetchTemplatesProposta(); setEditingTemplate(null); },
-    onError:   (e) => alert(`Erro: ${e.message}`),
-  });
-  const excluirTemplate = trpc.templateDocumento.excluir.useMutation({
-    onSuccess: () => { refetchTemplates(); refetchTemplatesProposta(); },
-    onError:   (e) => alert(`Erro: ${e.message}`),
-  });
 
   const editorRef = useRef<RichEditorHandle>(null);
   const [form, setForm]               = useState<PropostaForm | null>(null);
   const [converterModal, setConverterModal] = useState<any | null>(null);
   const [negociacaoModal, setNegociacaoModal] = useState<any | null>(null);
   const [negociacaoObs, setNegociacaoObs]     = useState("");
-  // Template management state
-  const [saveAsTemplate, setSaveAsTemplate]   = useState<{ titulo: string } | null>(null);
-  const [editingTemplate, setEditingTemplate] = useState<{ id: string; titulo: string } | null>(null);
   const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  function abrirWhatsApp(p: any) {
+    const nome    = p.tomador.nome.split(" ")[0];
+    const rawFone = (p.tomador as any).telefone ?? "";
+    const fone    = rawFone.replace(/\D/g, "");
+    const phone   = fone ? (fone.startsWith("55") ? fone : `55${fone}`) : "";
+
+    const link = (p as any).paktSignUrl
+      ? (p as any).paktSignUrl
+      : `${window.location.origin}/api/proposta/${p.tokenAceite}`;
+
+    const hasDocs = !!(p as any).paktSignUrl;
+    const msg = hasDocs
+      ? `Olá, ${nome}! Segue o link para assinar o contrato e a procuração:\n\n${link}\n\nQualquer dúvida é só falar. 👍`
+      : `Olá, ${nome}! Segue o link da sua proposta para aprovação:\n\n${link}\n\nQualquer dúvida é só falar. 👍`;
+
+    const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(msg)}`;
+    window.open(waUrl, "_blank");
+
+    navigator.clipboard.writeText(waUrl).then(() => {
+      setCopiedId(p.id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }).catch(() => {});
+  }
 
   function abrirNovo() {
     setForm(emptyForm());
@@ -231,12 +268,13 @@ export default function Propostas() {
       contratoIssRetido:         p.contratoIssRetido ?? false,
       contratoDescricao:         p.contratoDescricao ?? "",
       templatesGerar,
+      honorariosExitoPercStr:    p.honorariosExitoPerc ? String(p.honorariosExitoPerc) : "",
     });
     setEmitenteIdParaTemplates(p.emitenteId);
   }
 
   function aplicarTemplate(id: string) {
-    const t = templates?.find((x: any) => x.id === id);
+    const t = templatesProposta?.find((x: any) => x.id === id);
     if (!t || !form) return;
     const emitente = empresas?.find(e => e.id === form.emitenteId);
     const tomador  = tomadores?.find((t2: any) => t2.id === form.tomadorId);
@@ -265,22 +303,24 @@ export default function Propostas() {
     const valorNum = form.valorStr ? parseFloat(form.valorStr) : null;
     const valorFmt = valorNum ? valorNum.toLocaleString("pt-BR", { style: "currency", currency: "BRL" }) : "";
 
+    const honorariosExitoNum = form.honorariosExitoPercStr ? parseFloat(form.honorariosExitoPercStr) : null;
     const vars: Record<string, string> = {
-      emitente:         emitente?.nomeFantasia ?? emitente?.nome ?? "",
-      cnpj:             fmtCnpj(emitente?.cnpj ?? ""),
-      tomador:          (tomador as any)?.nome ?? "",
-      cpfCnpj:          fmtCnpj((tomador as any)?.cpfCnpj ?? ""),
-      enderecoTomador:  endTomador,
-      emailTomador:     (tomador as any)?.email ?? "",
-      telefoneTomador:  (tomador as any)?.telefone ?? "",
-      valor:            valorFmt,
-      diaVencimento:    form.contratoDiaVencimento || "",
-      metodoPagamento:  metodosLabel[form.contratoMetodoCobr] ?? "",
-      dataAtual:        new Date().toLocaleDateString("pt-BR"),
-      cidade:           localidade,
-      endereco:         endEmitente,
-      servico:          form.contratoDescricao || "",
-      validadeAte:      form.validadeAte ? form.validadeAte.split("-").reverse().join("/") : "",
+      emitente:          emitente?.nomeFantasia ?? emitente?.nome ?? "",
+      cnpj:              fmtCnpj(emitente?.cnpj ?? ""),
+      tomador:           (tomador as any)?.nome ?? "",
+      cpfCnpj:           fmtCnpj((tomador as any)?.cpfCnpj ?? ""),
+      enderecoTomador:   endTomador,
+      emailTomador:      (tomador as any)?.email ?? "",
+      telefoneTomador:   (tomador as any)?.telefone ?? "",
+      valor:             valorFmt,
+      honorariosExito:   honorariosExitoNum ? `${honorariosExitoNum}%` : "",
+      diaVencimento:     form.contratoDiaVencimento || "",
+      metodoPagamento:   metodosLabel[form.contratoMetodoCobr] ?? "",
+      dataAtual:         new Date().toLocaleDateString("pt-BR"),
+      cidade:            localidade,
+      endereco:          endEmitente,
+      servico:           form.contratoDescricao || "",
+      validadeAte:       form.validadeAte ? form.validadeAte.split("-").reverse().join("/") : "",
     };
 
     const html = Object.entries(vars).reduce(
@@ -288,15 +328,20 @@ export default function Propostas() {
       (t as any).html ?? (t as any).textoHtml ?? "",
     );
     setForm({ ...form, titulo: t.titulo, textoHtml: html });
-    // Track which DB template was applied (hardcoded ones have non-cuid IDs like "assessoria")
-    const isDbTemplate = id.length > 10 && !["assessoria","honorarios_parcelados","consultoria"].includes(id);
-    setActiveTemplateId(isDbTemplate ? id : null);
+    setActiveTemplateId(id);
   }
 
   function salvar() {
     if (!form) return;
+    if (!form.emitenteId) { alert("Selecione a empresa emitente."); return; }
+    if (!form.tomadorId)  { alert("Selecione o tomador / cliente."); return; }
+    if (form.titulo.trim().length < 3) { alert("O título deve ter pelo menos 3 caracteres."); return; }
+    const htmlSemTags = form.textoHtml.replace(/<[^>]+>/g, "").trim();
+    if (htmlSemTags.length < 5) { alert("O texto da proposta está vazio. Escreva o conteúdo ou aplique um template."); return; }
     const valorEstimado = form.valorStr ? Math.round(parseFloat(form.valorStr) * 100) : null;
     const diaVenc = parseInt(form.contratoDiaVencimento) || null;
+    const honorariosExitoPerc = form.honorariosExitoPercStr ? Math.round(parseFloat(form.honorariosExitoPercStr)) : null;
+    console.log("[salvar proposta] data:", { emitenteId: form.emitenteId, tomadorId: form.tomadorId, titulo: form.titulo, textoHtmlLen: form.textoHtml?.length, paktSignUrl: form.paktSignUrl });
     const data = {
       emitenteId: form.emitenteId, tomadorId: form.tomadorId,
       titulo: form.titulo, textoHtml: form.textoHtml,
@@ -312,6 +357,7 @@ export default function Propostas() {
       contratoIssRetido:         form.contratoIssRetido,
       contratoDescricao:         form.contratoDescricao || null,
       templatesGerar:            form.templatesGerar.length > 0 ? form.templatesGerar : null,
+      honorariosExitoPerc:       honorariosExitoPerc,
     };
     if (form.id) {
       atualizar.mutate({ id: form.id, ...data });
@@ -423,6 +469,20 @@ export default function Propostas() {
                     {p.status !== "RASCUNHO" && (
                       <a href={`/api/proposta/${p.tokenAceite}`} target="_blank" rel="noopener noreferrer"
                         className="px-2 py-1 rounded text-xs text-brand-600 hover:bg-brand-50 font-medium">Ver</a>
+                    )}
+                    {/* WhatsApp — copiar/abrir link */}
+                    {p.status !== "RASCUNHO" && (
+                      <button
+                        onClick={() => abrirWhatsApp(p)}
+                        title="Abrir no WhatsApp Web com mensagem pré-preenchida (e copiar link)"
+                        className={`px-2 py-1 rounded text-xs font-medium border transition-colors ${
+                          copiedId === p.id
+                            ? "text-green-700 border-green-300 bg-green-50"
+                            : "text-green-600 border-green-200 hover:bg-green-50"
+                        }`}
+                      >
+                        {copiedId === p.id ? "✓ Copiado" : "💬 WhatsApp"}
+                      </button>
                     )}
                     {/* Editar */}
                     {(p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") && (
@@ -571,116 +631,49 @@ export default function Propostas() {
                 </div>
               </div>
 
-              {/* Template */}
-              {/* Template selector + management */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="block text-sm font-medium text-gray-700">Usar template</label>
-                </div>
-                <select defaultValue="" onChange={e => { if (e.target.value) aplicarTemplate(e.target.value); e.target.value = ""; }}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500">
-                  <option value="">Selecione um template...</option>
-                  {templates?.map((t: any) => <option key={t.id} value={t.id}>{t.titulo}</option>)}
-                </select>
-
-                {/* Manage templates panel */}
-                {emitenteIdParaTemplates && (
-                  <div className="border border-gray-200 rounded-lg bg-gray-50 p-3 space-y-2">
-                    <p className="text-xs font-medium text-gray-600 mb-1">Templates de proposta salvos</p>
-                    {(!templatesProposta || templatesProposta.length === 0) ? (
-                      <p className="text-xs text-gray-400">Nenhum template salvo — use o botão abaixo para salvar o texto atual.</p>
-                    ) : (
-                      <div className="space-y-1">
-                        {templatesProposta.map((t: any) => (
-                          <div key={t.id} className="flex items-center gap-2 bg-white border border-gray-200 rounded-lg px-3 py-1.5">
-                            {editingTemplate?.id === t.id ? (
-                              <>
-                                <input
-                                  type="text"
-                                  value={editingTemplate!.titulo}
-                                  onChange={e => setEditingTemplate(prev => prev ? { ...prev, titulo: e.target.value } : prev)}
-                                  className="flex-1 border border-gray-300 rounded px-2 py-1 text-xs"
-                                  autoFocus
-                                />
-                                <button
-                                  type="button"
-                                  onClick={() => atualizarTemplate.mutate({ id: t.id, titulo: editingTemplate!.titulo, textoHtml: form.textoHtml })}
-                                  disabled={atualizarTemplate.isPending}
-                                  className="text-xs bg-brand-600 text-white px-2 py-1 rounded hover:bg-brand-700 disabled:opacity-50"
-                                  title="Salva o título editado + o texto atual do editor neste template"
-                                >
-                                  {atualizarTemplate.isPending ? "..." : "Salvar"}
-                                </button>
-                                <button type="button" onClick={() => setEditingTemplate(null)} className="text-xs text-gray-500 hover:text-gray-700 px-1">✕</button>
-                              </>
-                            ) : (
-                              <>
-                                <span className="flex-1 text-xs text-gray-700 truncate">{t.titulo}</span>
-                                <button
-                                  type="button"
-                                  onClick={() => { aplicarTemplate(t.id); setEditingTemplate({ id: t.id, titulo: t.titulo }); }}
-                                  className="text-xs text-blue-600 hover:text-blue-800 px-1"
-                                  title="Carrega no editor para editar"
-                                >
-                                  Editar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => { if (confirm(`Excluir "${t.titulo}"?`)) excluirTemplate.mutate({ id: t.id }); }}
-                                  className="text-xs text-red-500 hover:text-red-700 px-1"
-                                >
-                                  Excluir
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Save current as template */}
-                    {saveAsTemplate !== null ? (
-                      <div className="flex items-center gap-2 pt-1">
-                        <input
-                          type="text"
-                          placeholder="Nome do template..."
-                          value={saveAsTemplate.titulo}
-                          onChange={e => setSaveAsTemplate({ titulo: e.target.value })}
-                          className="flex-1 border border-gray-300 rounded-lg px-2 py-1.5 text-xs"
-                          autoFocus
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!form.emitenteId || !saveAsTemplate.titulo.trim()) return;
-                            criarTemplate.mutate({ emitenteId: form.emitenteId, tipo: "PROPOSTA", titulo: saveAsTemplate.titulo.trim(), textoHtml: form.textoHtml });
-                          }}
-                          disabled={criarTemplate.isPending || !saveAsTemplate.titulo.trim()}
-                          className="text-xs bg-brand-600 text-white px-3 py-1.5 rounded-lg hover:bg-brand-700 disabled:opacity-50 whitespace-nowrap"
-                        >
-                          {criarTemplate.isPending ? "Salvando..." : "Salvar"}
-                        </button>
-                        <button type="button" onClick={() => setSaveAsTemplate(null)} className="text-xs text-gray-500 hover:text-gray-700">✕</button>
-                      </div>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => setSaveAsTemplate({ titulo: form.titulo || "" })}
-                        className="text-xs text-brand-600 hover:text-brand-800 flex items-center gap-1"
-                      >
-                        + Salvar texto atual como template
-                      </button>
-                    )}
-                  </div>
+              {/* Template — busca da página Templates */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Template de proposta
+                  <span className="ml-2 text-xs font-normal text-gray-400">
+                    — gerencie na página{" "}
+                    <Link to="/templates-documentos" target="_blank" className="text-brand-600 hover:underline">Templates</Link>
+                  </span>
+                </label>
+                {!templatesProposta || templatesProposta.length === 0 ? (
+                  <p className="text-sm text-gray-400 border border-dashed border-gray-300 rounded-lg px-3 py-2">
+                    Nenhum template de proposta cadastrado.{" "}
+                    <Link to="/templates-documentos" target="_blank" className="text-brand-600 hover:underline">Criar na página Templates →</Link>
+                  </p>
+                ) : (
+                  <select defaultValue="" onChange={e => { if (e.target.value) aplicarTemplate(e.target.value); e.target.value = ""; }}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500">
+                    <option value="">Selecione um template para preencher o texto...</option>
+                    {templatesProposta.map((t: any) => (
+                      <option key={t.id} value={t.id}>{t.titulo}{t.emitente ? ` — ${t.emitente.nomeFantasia || t.emitente.nome}` : ""}</option>
+                    ))}
+                  </select>
                 )}
               </div>
 
-              {/* Título */}
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Título *</label>
-                <input type="text" value={form.titulo} onChange={e => setForm({ ...form, titulo: e.target.value })}
-                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500"
-                  placeholder="Ex: Proposta de Assessoria Jurídica" />
+              {/* Título + Descrição do Serviço */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Título *</label>
+                  <input type="text" value={form.titulo} onChange={e => setForm({ ...form, titulo: e.target.value })}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500"
+                    placeholder="Ex: Proposta de Assessoria Jurídica" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Descrição do Serviço
+                    <span className="ml-1.5 text-xs font-normal text-gray-400 font-mono">{"{{servico}}"}</span>
+                  </label>
+                  <input type="text" value={form.contratoDescricao}
+                    onChange={e => setForm({ ...form, contratoDescricao: e.target.value })}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500"
+                    placeholder="Ex: Assessoria Jurídica Trabalhista — usada em contratos, procurações e NFS-e" />
+                </div>
               </div>
 
               {/* Editor */}
@@ -698,12 +691,19 @@ export default function Propostas() {
                 <RichEditor ref={editorRef} value={form.textoHtml} onChange={html => setForm({ ...form, textoHtml: html })} minHeight="320px" />
               </div>
 
-              {/* Valor / Validade */}
-              <div className="grid grid-cols-2 gap-4">
+              {/* Valor / Honorários / Validade */}
+              <div className="grid grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Valor Estimado (R$)</label>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Valor Fixo (R$)</label>
                   <input type="number" step="0.01" value={form.valorStr} onChange={e => setForm({ ...form, valorStr: e.target.value })}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500" placeholder="0,00" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Honorários de Êxito (%)</label>
+                  <input type="number" step="1" min="1" max="100" value={form.honorariosExitoPercStr}
+                    onChange={e => setForm({ ...form, honorariosExitoPercStr: e.target.value })}
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500"
+                    placeholder="Ex: 30" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Validade da Proposta</label>
@@ -761,13 +761,6 @@ export default function Propostas() {
                         className="w-32 border border-gray-300 rounded-lg px-3 py-2 text-sm" />
                     </div>
                   )}
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Descrição para NFS-e</label>
-                  <input type="text" value={form.contratoDescricao}
-                    onChange={e => setForm({ ...form, contratoDescricao: e.target.value })}
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
-                    placeholder="Se vazio, usa o título da proposta" />
                 </div>
                 <div className="flex gap-4 flex-wrap">
                   {[

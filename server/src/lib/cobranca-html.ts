@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Geração de HTML da Carta de Cobrança com PIX e Boleto Sicoob
+// Geração de HTML da Nota de Honorários com PIX e Boleto Sicoob
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { readFileSync, existsSync } from "node:fs";
@@ -61,6 +61,13 @@ export interface CartaCobrancaParams {
   boletoLinhaDigitavel?: string;
   boletoCodigoBarras?:   string;
   boletoPdfEndpoint?:    string;  // URL para abrir o boleto PDF separadamente
+  // NFS-e (se já emitida)
+  nfse?: {
+    numero:      string;
+    emitidoEm?:  Date | null;
+    codigoVerif?: string | null;
+    linkNfse?:   string | null;
+  };
 }
 
 // ── Barcode ITF-25 (Interleaved 2 of 5) em SVG — padrão FEBRABAN ─────────────
@@ -121,7 +128,7 @@ export function gerarCartaCobrancaHtml(p: CartaCobrancaParams): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Carta de Cobrança — ${p.emitente.nomeFantasia || p.emitente.nome} — ${mesRef}</title>
+  <title>Nota de Honorários — ${p.emitente.nomeFantasia || p.emitente.nome} — ${mesRef}</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: Arial, Helvetica, sans-serif; font-size: 11pt; color: #1a1a1a; background: #fff; }
@@ -227,7 +234,7 @@ export function gerarCartaCobrancaHtml(p: CartaCobrancaParams): string {
 
   <!-- Título -->
   <div class="titulo">
-    <h1>Carta de Cobrança</h1>
+    <h1>Nota de Honorários</h1>
     <div class="ref">Competência: ${mesRef} &nbsp;·&nbsp; Vencimento: ${vencFmt}</div>
   </div>
 
@@ -323,6 +330,37 @@ export function gerarCartaCobrancaHtml(p: CartaCobrancaParams): string {
     </div>` : ""}
 
   </div>
+
+  ${p.nfse ? `
+  <!-- NFS-e -->
+  <div style="border:1px solid #c7d7dd;border-radius:8px;overflow:hidden;margin-bottom:18px;">
+    <div style="background:#004a5c;color:#fff;padding:8px 12px;font-weight:bold;font-size:10pt;display:flex;align-items:center;gap:8px;">
+      <span>🧾</span> Nota Fiscal de Serviços Eletrônica (NFS-e)
+    </div>
+    <div style="padding:12px 14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">
+      <div>
+        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Número</div>
+        <div style="font-size:11pt;font-weight:bold;color:#004a5c;">${p.nfse.numero}</div>
+      </div>
+      ${p.nfse.emitidoEm ? `
+      <div>
+        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Data de Emissão</div>
+        <div style="font-size:10.5pt;">${new Date(p.nfse.emitidoEm).toLocaleDateString("pt-BR")}</div>
+      </div>` : ""}
+      ${p.nfse.codigoVerif ? `
+      <div>
+        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Código de Verificação</div>
+        <div style="font-size:10pt;font-family:monospace;letter-spacing:1px;">${p.nfse.codigoVerif}</div>
+      </div>` : ""}
+      ${p.nfse.linkNfse ? `
+      <div style="display:flex;align-items:flex-end;">
+        <a href="${p.nfse.linkNfse}" target="_blank"
+           style="display:inline-block;background:#004a5c;color:#fff;text-decoration:none;padding:6px 14px;border-radius:5px;font-size:9pt;font-weight:bold;">
+          🔗 Acessar NFS-e no portal da Prefeitura
+        </a>
+      </div>` : ""}
+    </div>
+  </div>` : ""}
 
   <!-- Rodapé -->
   <div class="footer">

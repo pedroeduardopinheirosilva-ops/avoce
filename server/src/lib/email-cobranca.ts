@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Envio de e-mail de cobrança (Carta de Cobrança + Boleto em PDF)
+// Envio de e-mail de cobrança (Nota de Honorários + Boleto em PDF)
 // Chamado após gerar cobrança (PIX / Boleto) no router ou no cron
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -204,7 +204,7 @@ function corpoEmail(params: {
         <tr><td style="padding:0 32px 24px">
           <p style="margin:0;font-size:13px;color:#6b7280;background:#f8fafc;border-left:3px solid #004a5c;
                     padding:10px 14px;border-radius:0 6px 6px 0;">
-            📎 Os documentos completos (Carta de Cobrança${params.boletoLinhaDigitavel ? " e Boleto Bancário" : ""}) estão em anexo neste e-mail.
+            📎 Os documentos completos (Nota de Honorários${params.boletoLinhaDigitavel ? " e Boleto Bancário" : ""}) estão em anexo neste e-mail.
           </p>
         </td></tr>` : ""}
 
@@ -276,6 +276,16 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
     servico:     cobranca.contrato.nomeServico ?? undefined,
   };
 
+  // ── NFS-e emitida para esta competência ──
+  const notaFiscal = await prisma.notaFiscal.findFirst({
+    where: {
+      contratoId:  cobranca.contratoId,
+      competencia: cobranca.competencia,
+      status:      "EMITIDA",
+    },
+    orderBy: { emitidoEm: "desc" },
+  });
+
   // ── Logos ──
   const logoBase64   = loadLogoBase64(emp.logoPath);
   const sicoobLogo   = loadSicoobLogo();
@@ -320,6 +330,12 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
       pixExpiresAt: cobranca.pixExpiresAt ?? undefined,
       boletoLinhaDigitavel: cobranca.boletoLinhaDigitavel ?? undefined,
       boletoCodigoBarras:   cobranca.boletoCodigoBarras   ?? undefined,
+      nfse: notaFiscal ? {
+        numero:      notaFiscal.numero!,
+        emitidoEm:   notaFiscal.emitidoEm,
+        codigoVerif: notaFiscal.codigoVerif,
+        linkNfse:    notaFiscal.linkNfse,
+      } : undefined,
     });
     cartaPdf = await htmlToPdf(cartaHtml);
   } catch (err) {

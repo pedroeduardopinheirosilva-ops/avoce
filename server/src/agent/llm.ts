@@ -35,14 +35,29 @@ type ProviderConfig = {
 const _provedorCache: Record<string, { providers: ProviderConfig[]; ts: number }> = {};
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function getProviders(projetoId: string): Promise<ProviderConfig[]> {
-  const cached = _provedorCache[projetoId];
+async function getProviders(projetoId: string, personaProviderChave?: string | null): Promise<ProviderConfig[]> {
+  const cacheKey = `${projetoId}:${personaProviderChave ?? ""}`;
+  const cached = _provedorCache[cacheKey];
   if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.providers;
 
-  const rows = await prisma.iaLlmProvedor.findMany({
-    where: { projetoId, ativo: true },
-    orderBy: { ordem: "asc" },
-  });
+  let rows: any[] = [];
+  try {
+    rows = await prisma.iaLlmProvedor.findMany({
+      where: { projetoId, ativo: true },
+      orderBy: { ordem: "asc" },
+    });
+  } catch (err) {
+    console.warn(`[LLM] getProviders DB error: ${err instanceof Error ? err.message : err} — tentando fallback legacy`);
+  }
+
+  // If persona has a specific provider, put it first (then others as fallback)
+  if (personaProviderChave && rows.length > 0) {
+    const personaRow = rows.find((r: any) => r.provider === personaProviderChave);
+    if (personaRow) {
+      const rest = rows.filter((r: any) => r.provider !== personaProviderChave);
+      rows = [personaRow, ...rest];
+    }
+  }
 
   // Fallback to legacy anthropic_api_key in IaProjetoConfig if no IaLlmProvedor rows
   if (!rows.length) {
@@ -60,13 +75,13 @@ async function getProviders(projetoId: string): Promise<ProviderConfig[]> {
     throw new Error("Projeto sem provedores LLM configurados");
   }
 
-  const providers = rows.map((r) => ({
+  const providers = rows.map((r: any) => ({
     provider: r.provider as ProviderConfig["provider"],
     modelo: r.modelo,
     apiKey: r.apiKey,
   }));
 
-  _provedorCache[projetoId] = { providers, ts: Date.now() };
+  _provedorCache[cacheKey] = { providers, ts: Date.now() };
   return providers;
 }
 
@@ -178,12 +193,13 @@ export async function callLlm(opts: {
   systemPrompt: string;
   messages: LlmMessage[];
   personaChave?: string;
+  personaLlmChave?: string | null;
   stageChave?: string;
   maxTokens?: number;
 }): Promise<LlmCallResult> {
-  const { projetoId, dealId, systemPrompt, messages, personaChave, stageChave, maxTokens = 1024 } = opts;
+  const { projetoId, dealId, systemPrompt, messages, personaChave, personaLlmChave, stageChave, maxTokens = 1024 } = opts;
 
-  const providers = await getProviders(projetoId);
+  const providers = await getProviders(projetoId, personaLlmChave);
   let lastErr: unknown;
 
   for (const cfg of providers) {
@@ -242,8 +258,7 @@ export async function callLlm(opts: {
           .catch(() => {});
 
         lastErr = err;
-        if (!isQuotaError(err)) throw err; // non-quota error: fail immediately
-        break; // quota/transient exhausted: try next provider
+        break; // always try next provider (quota, transient, or unexpected error)
       }
     }
   }
@@ -258,8 +273,9 @@ export async function extractJson<T>(opts: {
   projetoId: string;
   instruction: string;
   text: string;
+  maxTokens?: number;
 }): Promise<T | null> {
-  const { projetoId, instruction, text } = opts;
+  const { projetoId, instruction, text, maxTokens = 2048 } = opts;
 
   try {
     const providers = await getProviders(projetoId);
@@ -269,18 +285,21 @@ export async function extractJson<T>(opts: {
           cfg,
           "You extract structured data from text. Always respond with valid JSON only, no markdown.",
           [{ role: "user", content: `${instruction}\n\nTexto:\n${text}\n\nResponda APENAS com JSON válido, sem markdown, sem explicações.` }],
-          512
+          maxTokens
         );
         // Strip markdown code fences if LLM wrapped the JSON (```json...```)
         const cleaned = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
         try {
           return JSON.parse(cleaned) as T;
         } catch {
-          console.warn(`[extractJson] JSON.parse falhou. Conteúdo bruto: "${cleaned.slice(0, 200)}"`);
-          return null;
+          console.warn(`[extractJson] JSON.parse falhou (${cfg.provider}). Conteúdo bruto: "${cleaned.slice(0, 200)}"`);
+          // Try next provider — this one returned truncated or malformed JSON
+          continue;
         }
       } catch (err) {
-        if (!isQuotaError(err)) return null;
+        console.warn(`[extractJson] ${cfg.provider} erro: ${err instanceof Error ? err.message : String(err)}`);
+        // Always try next provider on any error
+        continue;
       }
     }
   } catch {

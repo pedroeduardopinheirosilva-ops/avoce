@@ -145,6 +145,41 @@ export async function sendWhatsAppAudio(
   return res.json() as Promise<SendTextResult>;
 }
 
+/**
+ * Sends a PDF document via WhatsApp using base64 encoding.
+ */
+export async function sendDocument(
+  config: EvolutionConfig,
+  to: string,
+  pdfBase64: string,
+  fileName: string,
+  caption?: string
+): Promise<SendTextResult> {
+  const url = `${config.baseUrl}/message/sendMedia/${config.instancia}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: config.apiKey,
+    },
+    body: JSON.stringify({
+      number: to,
+      mediatype: "document",
+      media: `data:application/pdf;base64,${pdfBase64}`,
+      fileName,
+      caption: caption ?? "",
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Evolution sendDocument failed: ${res.status} ${body}`);
+  }
+
+  return res.json() as Promise<SendTextResult>;
+}
+
 export async function downloadMedia(
   config: EvolutionConfig,
   messageId: string

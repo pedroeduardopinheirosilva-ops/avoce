@@ -252,7 +252,7 @@ hr{border:none;border-top:1px solid #999;margin:10pt 0}
   writeFileSync(htmlFile, fullHtml, "utf8");
 
   execSync(
-    `libreoffice --headless --norestore --convert-to docx --outdir "${loHome}" "${htmlFile}"`,
+    `libreoffice --headless --norestore --convert-to "docx:MS Word 2007 XML" --outdir "${loHome}" "${htmlFile}"`,
     { timeout: 30000, env: { ...process.env, HOME: loHome } },
   );
 

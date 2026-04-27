@@ -41,7 +41,8 @@ step_deploy_server() {
 }
 
 step_prisma() {
-  echo "→ Prisma generate no servidor..."
+  echo "→ Prisma db push + generate no servidor..."
+  eval "$SSH 'cd $REMOTE_ROOT && DATABASE_URL=\"$DB_URL\" npx prisma db push --accept-data-loss 2>&1 | tail -5'"
   eval "$SSH 'cd $REMOTE_ROOT && DATABASE_URL=\"$DB_URL\" npx prisma generate 2>&1 | tail -3'"
   echo "→ Sincronizando Prisma client (root → server store)..."
   eval "$SSH 'cp $PRISMA_ROOT_STORE/index.js $PRISMA_SERVER_STORE/index.js && cp $PRISMA_ROOT_STORE/index.d.ts $PRISMA_SERVER_STORE/index.d.ts && cp $PRISMA_ROOT_STORE/schema.prisma $PRISMA_SERVER_STORE/schema.prisma && echo \"Prisma client OK\"'"
@@ -54,10 +55,18 @@ step_build_web() {
 
 step_deploy_web() {
   echo "→ Apagando assets antigos..."
-  eval "$SSH 'rm -f $REMOTE_ROOT/web/dist/index.html $REMOTE_ROOT/web/dist/assets/*'"
+  eval "$SSH 'rm -f $REMOTE_ROOT/web/dist/index.html $REMOTE_ROOT/web/dist/assets/*.js $REMOTE_ROOT/web/dist/assets/*.css $REMOTE_ROOT/web/dist/assets/*.svg $REMOTE_ROOT/web/dist/assets/*.png 2>/dev/null; mkdir -p $REMOTE_ROOT/web/dist/assets/banks'"
   echo "→ Deploy web dist..."
-  eval "$SCP '$LOCAL_ROOT/web/dist/index.html' '$LOCAL_ROOT/web/dist/assets/'* $HETZNER:$REMOTE_ROOT/web/dist/assets/"
+  $SCP \
+    "$LOCAL_ROOT/web/dist/index.html" \
+    "$LOCAL_ROOT"/web/dist/assets/index-*.js \
+    "$LOCAL_ROOT"/web/dist/assets/index-*.css \
+    "$HETZNER:$REMOTE_ROOT/web/dist/assets/"
   eval "$SSH 'mv $REMOTE_ROOT/web/dist/assets/index.html $REMOTE_ROOT/web/dist/'"
+  echo "→ Deploy banks SVGs..."
+  if ls "$LOCAL_ROOT/web/dist/assets/banks/"*.svg 1>/dev/null 2>&1; then
+    $SCP "$LOCAL_ROOT"/web/dist/assets/banks/*.svg "$HETZNER:$REMOTE_ROOT/web/dist/assets/banks/"
+  fi
 }
 
 step_restart() {

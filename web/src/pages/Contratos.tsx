@@ -94,7 +94,7 @@ export default function Contratos() {
     <div className="p-8">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold text-gray-900">Contratos</h1>
-        <button onClick={() => setForm({ diaVencimento: 5, issRetido: false, emitirNfseAuto: true, gerarCobrancaAuto: true, metodoCobr: "PIX_BOLETO" })} className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-2 rounded-lg text-sm font-medium">
+        <button onClick={() => setForm({ diaVencimento: 5, issRetido: false, emitirNfseAuto: false, gerarCobrancaAuto: true, metodoCobr: "PIX_BOLETO" })} className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-2 rounded-lg text-sm font-medium">
           + Novo Contrato
         </button>
       </div>
@@ -365,12 +365,12 @@ export default function Contratos() {
                 <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-3">Automação Mensal</p>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="flex items-start gap-3 p-3 bg-white border border-gray-200 rounded-lg cursor-pointer hover:border-brand-400 transition-colors">
-                    <input type="checkbox" checked={form.emitirNfseAuto ?? true}
+                    <input type="checkbox" checked={form.emitirNfseAuto ?? false}
                       onChange={e => setForm((f: any) => ({ ...f, emitirNfseAuto: e.target.checked }))}
                       className="mt-0.5" />
                     <div>
-                      <p className="text-sm font-medium text-gray-800">Emitir NFS-e</p>
-                      <p className="text-xs text-gray-500">Emissão automática no dia do vencimento</p>
+                      <p className="text-sm font-medium text-gray-800">Faturamento automático</p>
+                      <p className="text-xs text-gray-500">Participa da emissão automática (dia configurado em Faturamento)</p>
                     </div>
                   </label>
                   <label className="flex items-start gap-3 p-3 bg-white border border-gray-200 rounded-lg cursor-pointer hover:border-brand-400 transition-colors">

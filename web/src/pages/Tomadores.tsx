@@ -60,7 +60,7 @@ type TomadorForm = {
   id?: string;
   tipo: "PF" | "PJ";
   nome: string; nomeFantasia: string; cpfCnpj: string;
-  email: string; telefone: string;
+  email: string; emailFinanceiro: string; emailGeral: string; emailDiretoria: string; telefone: string;
   inscricaoEstadual: string; inscMunicipal: string;
   // Endereço
   endereco: string; numero: string; complemento: string;
@@ -77,7 +77,7 @@ function emptyForm(): TomadorForm {
   return {
     tipo: "PF",
     nome: "", nomeFantasia: "", cpfCnpj: "",
-    email: "", telefone: "",
+    email: "", emailFinanceiro: "", emailGeral: "", emailDiretoria: "", telefone: "",
     inscricaoEstadual: "", inscMunicipal: "",
     endereco: "", numero: "", complemento: "",
     bairro: "", cidade: "Vitória da Conquista", codigoMunicipio: "2933307", uf: "BA", cep: "",
@@ -243,7 +243,7 @@ export default function Tomadores() {
       id: t.id,
       tipo: pj ? "PJ" : "PF",
       nome: t.nome ?? "", nomeFantasia: t.nomeFantasia ?? "", cpfCnpj: t.cpfCnpj ?? "",
-      email: t.email ?? "", telefone: t.telefone ?? "",
+      email: t.email ?? "", emailFinanceiro: t.emailFinanceiro ?? "", emailGeral: t.emailGeral ?? "", emailDiretoria: t.emailDiretoria ?? "", telefone: t.telefone ?? "",
       inscricaoEstadual: t.inscricaoEstadual ?? "", inscMunicipal: t.inscMunicipal ?? "",
       endereco: t.endereco ?? "", numero: t.numero ?? "", complemento: t.complemento ?? "",
       bairro: t.bairro ?? "", cidade: t.cidade ?? "", codigoMunicipio: t.codigoMunicipio ?? "", uf: t.uf ?? "BA", cep: t.cep ?? "",
@@ -275,7 +275,11 @@ export default function Tomadores() {
     const payload = {
       nome: form.nome, nomeFantasia: form.nomeFantasia || null,
       cpfCnpj: doc,
-      email: form.email || null, telefone: form.telefone || null,
+      email: form.email || null,
+      emailFinanceiro: form.emailFinanceiro || null,
+      emailGeral: form.emailGeral || null,
+      emailDiretoria: form.emailDiretoria || null,
+      telefone: form.telefone || null,
       inscricaoEstadual: form.inscricaoEstadual || null,
       endereco: form.endereco || null, numero: form.numero || null,
       complemento: form.complemento || null, bairro: form.bairro || null,
@@ -480,8 +484,17 @@ export default function Tomadores() {
                       </p>
                     )}
                   </Field>
-                  <Field label="E-mail">
-                    <input type="email" value={form.email} onChange={s("email")} className={inp} />
+                  <Field label="E-mail Principal">
+                    <input type="email" value={form.email} onChange={s("email")} className={inp} placeholder="e-mail principal" />
+                  </Field>
+                  <Field label="E-mail Financeiro">
+                    <input type="email" value={form.emailFinanceiro} onChange={s("emailFinanceiro")} className={inp} placeholder="cobranças, boletos, NFS-e" />
+                  </Field>
+                  <Field label="E-mail Geral">
+                    <input type="email" value={form.emailGeral} onChange={s("emailGeral")} className={inp} placeholder="contato geral" />
+                  </Field>
+                  <Field label="E-mail Diretoria">
+                    <input type="email" value={form.emailDiretoria} onChange={s("emailDiretoria")} className={inp} placeholder="diretoria / sócios" />
                   </Field>
                   <Field label="Telefone / WhatsApp">
                     <input value={form.telefone} onChange={s("telefone")} className={inp} />

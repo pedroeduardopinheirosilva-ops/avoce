@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { trpc } from "../lib/trpc";
+import { FluxoIATab } from "../components/FluxoIATab";
 
 type Config = {
   id: string;
@@ -20,8 +21,12 @@ type Notificacao = {
 };
 
 const EVENTOS_SUGERIDOS = [
-  { value: "qualificacao_completa",            label: "Lead qualificado (dados coletados)" },
+  { value: "qualificacao_completa",            label: "Lead qualificado (Ana concluiu coleta)" },
+  { value: "fluxo_concluido",                  label: "Fluxo Daniela concluído (reunião agendada)" },
+  { value: "documentos_pessoais",              label: "Cliente enviou documentos pessoais" },
+  { value: "proposta_aceita",                  label: "Proposta aceita / contrato assinado" },
   { value: "solicita_ligacao",                 label: "Lead pede ligação telefônica" },
+  { value: "descarte_revisao_humana",          label: "Descarte — aguardando revisão do SDR" },
   { value: "stage_entrada:lead_qualificado",   label: "Entrada em: Lead Qualificado" },
   { value: "stage_entrada:com_closer",         label: "Entrada em: Com Closer" },
   { value: "stage_entrada:lead_sem_resposta",  label: "Entrada em: Sem Resposta" },
@@ -269,6 +274,7 @@ type Persona = {
   tom: string;
   ordem: number;
   ttsVoiceId: string | null;
+  llmProviderChave: string | null;
 };
 
 const CATEGORIA_LABELS: Record<string, string> = {
@@ -407,7 +413,7 @@ const BLANK_REGRA = (): Partial<Regra> => ({
 
 export default function ConfigIAPage() {
   const [projetoId, setProjetoId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta">("configs");
+  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo">("configs");
   const [editando, setEditando] = useState<Record<string, string>>({});
   const [editPersona, setEditPersona] = useState<Persona | null>(null);
   const [editNotif, setEditNotif] = useState<Partial<Notificacao> | null>(null);
@@ -425,6 +431,11 @@ export default function ConfigIAPage() {
     { projetoId: projetoId ?? "" },
     { enabled: !!projetoId }
   );
+  const llmProvedoresPage = trpc.ia.listLlmProvedores.useQuery(
+    { projetoId: projetoId ?? "" },
+    { enabled: !!projetoId }
+  );
+  const provedoresPage = (llmProvedoresPage.data as unknown as LlmProvedor[] | undefined) ?? [];
   const fases = trpc.ia.listFases.useQuery(
     { projetoId: projetoId ?? "" },
     { enabled: !!projetoId }
@@ -442,6 +453,7 @@ export default function ConfigIAPage() {
     { projetoId: projetoId ?? "" },
     { enabled: !!projetoId }
   );
+
 
   const empresas = trpc.empresa.listar.useQuery(undefined, { enabled: tab === "proposta" });
   const seedPropostaConfigs = trpc.ia.seedPropostaConfigs.useMutation({ onSuccess: () => configs.refetch() });
@@ -546,6 +558,7 @@ export default function ConfigIAPage() {
       tom: editPersona.tom,
       ordem: editPersona.ordem,
       ttsVoiceId: editPersona.ttsVoiceId || undefined,
+      llmProviderChave: editPersona.llmProviderChave || null,
     });
   }
 
@@ -607,6 +620,7 @@ export default function ConfigIAPage() {
               ["personas", "Personas"],
               ["fases", "Fases"],
               ["qualificacao", "Qualificação"],
+              ["fluxo", "Fluxo IA"],
               ["transicoes", "Transições"],
               ["notificacoes", "Notificações"],
               ["proposta", "Proposta"],
@@ -706,6 +720,89 @@ export default function ConfigIAPage() {
 
               {/* LLM Provedores — inside Configs tab */}
               {projetoId && <LlmProvedoresCard projetoId={projetoId} />}
+
+              {/* Modo de Coleta — A/B */}
+              {(() => {
+                const cfgModo = (configs.data as unknown as Config[] | undefined)?.find(
+                  (c) => c.categoria === "comportamento" && c.chave === "modo_coleta"
+                );
+                const modoAtual = cfgModo?.valor ?? "sequencial";
+                return (
+                  <div className="bg-white border rounded-xl p-5">
+                    <div className="mb-4">
+                      <h3 className="font-semibold text-gray-800 text-sm">Modo de Coleta — A/B</h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Define como a Ana coleta informações do lead. O modo <strong>conversacional</strong> é experimental —
+                        teste com leads reais antes de ativar em produção.
+                      </p>
+                    </div>
+                    <div className="flex gap-3">
+                      {([
+                        {
+                          valor: "sequencial",
+                          label: "Sequencial",
+                          badge: "padrão",
+                          badgeColor: "bg-gray-100 text-gray-600",
+                          desc: "Uma pergunta por vez. Resposta sempre exata do fluxo configurado.",
+                          pros: ["Previsível", "Sem surpresas", "Testado em produção"],
+                        },
+                        {
+                          valor: "conversacional",
+                          label: "Conversacional",
+                          badge: "novo",
+                          badgeColor: "bg-amber-100 text-amber-700",
+                          desc: "IA combina campos relacionados numa pergunta fluída. Ex: empresa + função + CLT numa só mensagem.",
+                          pros: ["Menos turnos", "Mais natural", "Melhor experiência"],
+                        },
+                      ] as const).map(({ valor, label, badge, badgeColor, desc, pros }) => {
+                        const ativo = modoAtual === valor;
+                        return (
+                          <button
+                            key={valor}
+                            onClick={() => {
+                              if (!projetoId || ativo) return;
+                              upsertConfig.mutate({
+                                projetoId,
+                                chave: "modo_coleta",
+                                valor,
+                                tipo: "texto",
+                                categoria: "comportamento",
+                                descricao: "Modo de coleta: sequencial (uma pergunta) | conversacional (perguntas compostas)",
+                              }, { onSuccess: () => configs.refetch() });
+                            }}
+                            className={`flex-1 rounded-xl border-2 p-5 text-left transition-all ${
+                              ativo
+                                ? "border-indigo-500 bg-indigo-50"
+                                : "border-gray-200 hover:border-gray-300 cursor-pointer"
+                            }`}
+                          >
+                            <div className="flex items-center gap-2 mb-2">
+                              <span className={`text-sm font-semibold ${ativo ? "text-indigo-700" : "text-gray-800"}`}>{label}</span>
+                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${badgeColor}`}>{badge}</span>
+                              {ativo && <span className="ml-auto text-xs font-medium text-indigo-600 bg-indigo-100 px-2 py-0.5 rounded-full">ativo</span>}
+                            </div>
+                            <p className="text-xs text-gray-600 mb-3">{desc}</p>
+                            <ul className="space-y-1">
+                              {pros.map(p => (
+                                <li key={p} className="text-xs text-gray-500 flex items-center gap-1.5">
+                                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${ativo ? "bg-indigo-400" : "bg-gray-300"}`} />
+                                  {p}
+                                </li>
+                              ))}
+                            </ul>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {modoAtual === "conversacional" && (
+                      <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
+                        <strong>Modo experimental ativo.</strong> A extração e as transições de stage continuam normais.
+                        Se perceber comportamento inesperado, troque para Sequencial com um clique.
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -735,6 +832,24 @@ export default function ConfigIAPage() {
                         rows={15}
                         className="w-full border rounded-lg px-3 py-2 text-sm font-mono text-xs"
                       />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Provedor LLM
+                        <span className="ml-2 text-xs font-normal text-gray-400">Deixe vazio para usar a ordem padrão do projeto</span>
+                      </label>
+                      <select
+                        value={editPersona.llmProviderChave ?? ""}
+                        onChange={(e) => setEditPersona((p) => p ? { ...p, llmProviderChave: e.target.value || null } : p)}
+                        className="w-full border rounded-lg px-3 py-2 text-sm"
+                      >
+                        <option value="">— Padrão do projeto —</option>
+                        {provedoresPage.map((prov) => (
+                          <option key={prov.id} value={prov.provider}>
+                            {prov.provider} / {prov.modelo}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -770,6 +885,9 @@ export default function ConfigIAPage() {
                         <div className="flex items-center gap-2">
                           <span className="font-semibold text-gray-800">{p.nomeExibicao}</span>
                           <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">{p.chave}</span>
+                          {p.llmProviderChave && (
+                            <span className="text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">{p.llmProviderChave}</span>
+                          )}
                         </div>
                         {p.descricaoPapel && <p className="text-sm text-gray-500 mt-1">{p.descricaoPapel}</p>}
                         <p className="text-xs text-gray-400 mt-2 line-clamp-2">{p.systemPrompt.slice(0, 120)}...</p>
@@ -948,8 +1066,8 @@ export default function ConfigIAPage() {
                     </datalist>
                     <p className="text-xs text-gray-400 mt-1">
                       Use <code>stage_entrada:chave_do_stage</code> para qualquer stage.{" "}
-                      Variáveis: {'{{nome}}'} {'{{cidade}}'} {'{{telefone}}'} {'{{stage}}'}{" "}
-                      — para <code>solicita_ligacao</code> também: {'{{empresa}}'} {'{{mensagem}}'}
+                      Variáveis: {'{{nome}}'} {'{{cidade}}'} {'{{telefone}}'} {'{{stage}}'} {'{{cpf}}'}{" "}
+                      — <code>proposta_aceita</code>: {'{{valor}}'} — <code>solicita_ligacao</code>: {'{{empresa}}'} {'{{mensagem}}'}
                     </p>
                   </div>
 
@@ -1643,7 +1761,97 @@ export default function ConfigIAPage() {
               })}
             </div>
           )}
+
+          {/* Fluxo IA tab — unified flowchart */}
+          {tab === "fluxo" && projetoId && (
+            <FluxoIATab
+              projetoId={projetoId}
+              personas={(personas.data as unknown as { id: string; chave: string; nomeExibicao: string; cor?: string | null }[] | undefined) ?? []}
+            />
+          )}
+
         </>
+      )}
+    </div>
+  );
+}
+
+// ── FlowStepCard ───────────────────────────────────────────────────────────────
+
+function FlowStepCard({
+  step, idx, total, actionColors, stepTypeBadge, projetoId,
+  onEdit, onDelete, onAddGate, onEditGate, onDeleteGate,
+}: {
+  step: any; idx: number; total: number;
+  actionColors: Record<string, string>; stepTypeBadge: Record<string, string>;
+  projetoId: string;
+  onEdit: () => void; onDelete: () => void;
+  onAddGate: () => void; onEditGate: (g: any) => void; onDeleteGate: (g: any) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div className="bg-white border rounded-lg overflow-hidden">
+      {/* Step header */}
+      <div
+        className="flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-gray-50"
+        onClick={() => setExpanded(e => !e)}
+      >
+        <span className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${stepTypeBadge[step.stepType] ?? "bg-gray-100 text-gray-600"}`}>
+          {step.ordem}
+        </span>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="font-medium text-gray-800 text-sm">{step.label}</span>
+            <span className={`text-xs px-1.5 py-0.5 rounded font-mono ${stepTypeBadge[step.stepType] ?? "bg-gray-100 text-gray-500"}`}>{step.stepType}</span>
+            {step.fase && <span className="text-xs text-gray-400 font-mono">{step.fase}</span>}
+            {!step.ativo && <span className="text-xs text-red-400">inativo</span>}
+          </div>
+          <p className="text-xs text-gray-500 italic mt-0.5 truncate">{step.pergunta}</p>
+        </div>
+        <div className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
+          <button onClick={onEdit} className="text-xs text-indigo-600 hover:underline px-2 py-1">✎</button>
+          <button onClick={onDelete} className="text-xs text-red-500 hover:underline px-2 py-1">✕</button>
+          <span className="text-gray-300 ml-1">{expanded ? "▲" : "▼"}</span>
+        </div>
+      </div>
+
+      {/* Expanded: full question + gates */}
+      {expanded && (
+        <div className="border-t bg-gray-50 px-4 py-3 space-y-3">
+          <div>
+            <p className="text-xs font-medium text-gray-500 mb-1">Pergunta completa</p>
+            <p className="text-sm text-gray-700 bg-white border rounded p-2">{step.pergunta}</p>
+          </div>
+
+          {step.campoColetar && (
+            <p className="text-xs text-gray-500">Campo coletado: <code className="bg-white border px-1 rounded">{step.campoColetar}</code></p>
+          )}
+
+          {/* Gates */}
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-xs font-medium text-gray-500">Gates ({step.gates?.length ?? 0})</p>
+              <button onClick={onAddGate} className="text-xs text-indigo-600 hover:underline">+ Gate</button>
+            </div>
+            {(step.gates ?? []).length === 0 ? (
+              <p className="text-xs text-gray-400 italic">Nenhum gate — etapa avança automaticamente (continue)</p>
+            ) : (
+              <div className="space-y-1.5">
+                {(step.gates ?? []).map((g: any) => (
+                  <div key={g.id} className="flex items-center gap-2 bg-white border rounded px-3 py-2">
+                    <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: g.cor ?? "#6b7280" }} />
+                    <span className="text-xs text-gray-700 flex-1">{g.condicao}</span>
+                    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${actionColors[g.actionType] ?? "bg-gray-100 text-gray-500"}`}>{g.actionType}</span>
+                    {g.actionValue && <span className="text-xs text-gray-400 font-mono max-w-[120px] truncate">{g.actionValue}</span>}
+                    <button onClick={() => onEditGate(g)} className="text-xs text-indigo-500 hover:underline ml-1">✎</button>
+                    <button onClick={() => onDeleteGate(g)} className="text-xs text-red-400 hover:underline">✕</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </div>
   );

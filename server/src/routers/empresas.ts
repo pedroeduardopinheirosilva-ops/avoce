@@ -95,6 +95,9 @@ export const empresaRouter = router({
       boletoContratoCobranca:   z.string().optional().nullable(),
       boletoMultaPercent:       z.number().optional().nullable(),
       boletoJurosDiaPercent:    z.number().optional().nullable(),
+      // Faturamento automático
+      faturamentoAutoAtivo:     z.boolean().optional(),
+      diaEmissaoNfse:           z.number().int().min(1).max(28).optional().nullable(),
     }))
     .mutation(async ({ input }) => {
       const { id, ...data } = input;

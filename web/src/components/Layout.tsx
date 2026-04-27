@@ -1,22 +1,89 @@
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
+import {
+  LayoutDashboard,
+  KanbanSquare,
+  MessageSquare,
+  RefreshCw,
+  ArrowDownToLine,
+  FileText,
+  ScrollText,
+  FilePlus2,
+  Zap,
+  Receipt,
+  CreditCard,
+  BookOpen,
+  Building2,
+  AlignLeft,
+  Link2,
+  TrendingUp,
+  Building,
+  Users,
+  Bot,
+  User,
+  LogOut,
+  Scale,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 
-const nav = [
-  { to: "/crm",                  label: "Funil CRM",      icon: "⚖️"  },
-  { to: "/whatsapp",             label: "WhatsApp IA",    icon: "💬"  },
-  { to: "/reengajamento",        label: "Reengajamento",  icon: "🔄"  },
-  { to: "/config-ia",            label: "Config IA",      icon: "🤖"  },
-  { to: "/usuarios",             label: "Usuários",       icon: "👤"  },
-  { to: "/financeiro",           label: "Financeiro",     icon: "💰"  },
-  { to: "/dashboard",            label: "Dashboard",      icon: "📊"  },
-  { to: "/empresas",             label: "Empresas",       icon: "🏢"  },
-  { to: "/tomadores",            label: "Tomadores",      icon: "👥"  },
-  { to: "/propostas",            label: "Propostas",      icon: "📝"  },
-  { to: "/templates-documentos", label: "Templates Doc",  icon: "📋"  },
-  { to: "/contratos",            label: "Contratos",      icon: "📄"  },
-  { to: "/faturamento",          label: "Faturamento",    icon: "🚀"  },
-  { to: "/notas",                label: "Notas Fiscais",  icon: "🧾"  },
-  { to: "/cobrancas",            label: "Cobranças",      icon: "💳"  },
-  { to: "/pipedrive",            label: "Pipedrive",      icon: "📥"  },
+type NavItem = { to: string; label: string; icon: LucideIcon; end?: boolean };
+type NavGroup = { label: string; items: NavItem[] };
+
+const groups: NavGroup[] = [
+  {
+    label: "",
+    items: [
+      { to: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+    ],
+  },
+  {
+    label: "Comercial",
+    items: [
+      { to: "/crm",           label: "Funil CRM",     icon: KanbanSquare },
+      { to: "/whatsapp",      label: "WhatsApp IA",   icon: MessageSquare },
+      { to: "/reengajamento", label: "Reengajamento", icon: RefreshCw },
+      { to: "/pipedrive",     label: "Pipedrive",     icon: ArrowDownToLine },
+    ],
+  },
+  {
+    label: "Jurídico",
+    items: [
+      { to: "/propostas",            label: "Propostas", icon: FileText },
+      { to: "/contratos",            label: "Contratos", icon: ScrollText },
+      { to: "/templates-documentos", label: "Templates", icon: FilePlus2 },
+    ],
+  },
+  {
+    label: "Fiscal",
+    items: [
+      { to: "/faturamento", label: "Faturamento",   icon: Zap },
+      { to: "/notas",       label: "Notas Fiscais", icon: Receipt },
+      { to: "/cobrancas",   label: "Cobranças",     icon: CreditCard },
+    ],
+  },
+  {
+    label: "Financeiro",
+    items: [
+      { to: "/financeiro",             label: "Lançamentos",    icon: BookOpen,   end: true },
+      { to: "/financeiro/contas",      label: "Contas",         icon: Building2 },
+      { to: "/financeiro/extrato",     label: "Extrato",        icon: AlignLeft },
+      { to: "/financeiro/conciliacao", label: "Conciliação",    icon: Link2 },
+      { to: "/financeiro/fluxo-caixa", label: "Fluxo de Caixa", icon: TrendingUp },
+    ],
+  },
+  {
+    label: "Cadastros",
+    items: [
+      { to: "/empresas",  label: "Empresas",  icon: Building },
+      { to: "/tomadores", label: "Tomadores", icon: Users },
+    ],
+  },
+  {
+    label: "Sistema",
+    items: [
+      { to: "/config-ia", label: "Config IA", icon: Bot },
+      { to: "/usuarios",  label: "Usuários",  icon: User },
+    ],
+  },
 ];
 
 export default function Layout() {
@@ -28,42 +95,73 @@ export default function Layout() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-50">
+    <div className="flex h-screen bg-gray-50 font-sans antialiased">
       {/* Sidebar */}
-      <aside className="w-56 bg-brand-900 flex flex-col">
-        <div className="px-4 py-5 border-b border-brand-700">
-          <p className="text-white font-bold text-lg leading-none">Avoce</p>
-          <p className="text-brand-100 text-xs mt-1">Plataforma Jurídica</p>
+      <aside className="w-56 bg-brand-900 flex flex-col flex-shrink-0">
+        {/* Logo */}
+        <div className="px-4 py-4 border-b border-white/10 flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-white/15 flex items-center justify-center flex-shrink-0">
+            <Scale size={14} className="text-white" />
+          </div>
+          <div>
+            <p className="text-white font-semibold text-sm leading-tight tracking-tight">Avoce</p>
+            <p className="text-blue-300/60 text-[10px] leading-tight">Plataforma Jurídica</p>
+          </div>
         </div>
-        <nav className="flex-1 py-4 space-y-1 px-2">
-          {nav.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={({ isActive }) =>
-                `flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                  isActive
-                    ? "bg-brand-600 text-white"
-                    : "text-brand-100 hover:bg-brand-700 hover:text-white"
-                }`
-              }
-            >
-              <span>{item.icon}</span>
-              {item.label}
-            </NavLink>
+
+        {/* Navigation */}
+        <nav className="flex-1 py-2 overflow-y-auto">
+          {groups.map((group, gi) => (
+            <div key={gi} className={gi > 0 ? "mt-0.5" : ""}>
+              {group.label && (
+                <p className="px-4 pt-3 pb-1 text-[10px] font-semibold text-white/30 uppercase tracking-widest select-none">
+                  {group.label}
+                </p>
+              )}
+              <div className="px-2 space-y-0.5">
+                {group.items.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end={item.end !== undefined ? item.end : true}
+                    className={({ isActive }) =>
+                      `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all ${
+                        isActive
+                          ? "bg-white text-brand-900 font-semibold shadow-sm"
+                          : "text-white/60 hover:text-white hover:bg-white/10 font-medium"
+                      }`
+                    }
+                  >
+                    {({ isActive }) => (
+                      <>
+                        <item.icon
+                          size={15}
+                          className={isActive ? "text-brand-700" : ""}
+                          strokeWidth={isActive ? 2.5 : 1.75}
+                        />
+                        <span className="truncate leading-none">{item.label}</span>
+                      </>
+                    )}
+                  </NavLink>
+                ))}
+              </div>
+            </div>
           ))}
         </nav>
-        <div className="p-4 border-t border-brand-700">
+
+        {/* Footer / Logout */}
+        <div className="p-3 border-t border-white/10">
           <button
             onClick={logout}
-            className="w-full text-left text-brand-100 hover:text-white text-sm px-3 py-2 rounded-md hover:bg-brand-700 transition-colors"
+            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium text-white/40 hover:text-white hover:bg-white/10 transition-all"
           >
-            ↩ Sair
+            <LogOut size={15} strokeWidth={1.75} />
+            Sair
           </button>
         </div>
       </aside>
 
-      {/* Main */}
+      {/* Main content */}
       <main className="flex-1 overflow-auto">
         <Outlet />
       </main>
