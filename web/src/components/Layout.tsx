@@ -21,9 +21,9 @@ import {
   Bot,
   User,
   LogOut,
-  Scale,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { AvoceLockup } from "./Logo";
 
 type NavItem = { to: string; label: string; icon: LucideIcon; end?: boolean };
 type NavGroup = { label: string; items: NavItem[] };
@@ -95,51 +95,88 @@ export default function Layout() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-50 font-sans antialiased">
+    <div
+      className="flex h-screen antialiased"
+      style={{ background: "var(--avoce-cream)", color: "var(--avoce-navy)" }}
+    >
       {/* Sidebar */}
-      <aside className="w-56 bg-brand-900 flex flex-col flex-shrink-0">
-        {/* Logo */}
-        <div className="px-4 py-4 border-b border-white/10 flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-white/15 flex items-center justify-center flex-shrink-0">
-            <Scale size={14} className="text-white" />
-          </div>
-          <div>
-            <p className="text-white font-semibold text-sm leading-tight tracking-tight">Avoce</p>
-            <p className="text-blue-300/60 text-[10px] leading-tight">Plataforma Jurídica</p>
-          </div>
+      <aside
+        className="flex flex-col flex-shrink-0 overflow-hidden"
+        style={{
+          width: "var(--avoce-sidebar-width)",
+          background: "var(--avoce-navy)",
+          borderRight: "1px solid rgba(11,37,69,0.2)",
+        }}
+      >
+        {/* Lockup */}
+        <div
+          className="flex items-center"
+          style={{
+            height: "var(--avoce-topbar-height)",
+            padding: "0 var(--avoce-space-6)",
+            borderBottom: "1px solid rgba(255,255,255,0.08)",
+            flexShrink: 0,
+          }}
+        >
+          <AvoceLockup color="#F4F1EA" accent="#C9A961" scale={0.9} />
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 py-2 overflow-y-auto">
+        <nav
+          className="flex-1 overflow-y-auto"
+          style={{ padding: "var(--avoce-space-3) 0" }}
+        >
           {groups.map((group, gi) => (
-            <div key={gi} className={gi > 0 ? "mt-0.5" : ""}>
+            <div key={gi} style={{ marginTop: gi > 0 ? "var(--avoce-space-4)" : 0 }}>
               {group.label && (
-                <p className="px-4 pt-3 pb-1 text-[10px] font-semibold text-white/30 uppercase tracking-widest select-none">
+                <p
+                  style={{
+                    fontFamily: "var(--avoce-font-mono)",
+                    fontSize: 10,
+                    letterSpacing: "var(--avoce-tracking-kicker)",
+                    textTransform: "uppercase",
+                    color: "rgba(255,255,255,0.28)",
+                    padding: "0 var(--avoce-space-6)",
+                    marginBottom: "var(--avoce-space-1)",
+                    userSelect: "none",
+                  }}
+                >
                   {group.label}
                 </p>
               )}
-              <div className="px-2 space-y-0.5">
+              <div style={{ padding: "0 var(--avoce-space-3)" }}>
                 {group.items.map((item) => (
                   <NavLink
                     key={item.to}
                     to={item.to}
                     end={item.end !== undefined ? item.end : true}
-                    className={({ isActive }) =>
-                      `flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm transition-all ${
-                        isActive
-                          ? "bg-white text-brand-900 font-semibold shadow-sm"
-                          : "text-white/60 hover:text-white hover:bg-white/10 font-medium"
-                      }`
-                    }
+                    style={({ isActive }) => ({
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "var(--avoce-space-3)",
+                      padding: "var(--avoce-space-2) var(--avoce-space-3)",
+                      fontSize: 13,
+                      fontWeight: isActive ? 600 : 500,
+                      fontFamily: "var(--avoce-font-sans)",
+                      color: isActive ? "var(--avoce-navy)" : "rgba(255,255,255,0.55)",
+                      background: isActive ? "var(--avoce-cream)" : "transparent",
+                      borderRadius: 0,
+                      textDecoration: "none",
+                      transition: "var(--avoce-transition)",
+                      marginBottom: 1,
+                    })}
+                    className={({ isActive }) => isActive ? "" : "nav-item-hover"}
                   >
                     {({ isActive }) => (
                       <>
                         <item.icon
-                          size={15}
-                          className={isActive ? "text-brand-700" : ""}
+                          size={14}
                           strokeWidth={isActive ? 2.5 : 1.75}
+                          style={{ flexShrink: 0, color: isActive ? "var(--avoce-navy)" : undefined }}
                         />
-                        <span className="truncate leading-none">{item.label}</span>
+                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
+                          {item.label}
+                        </span>
                       </>
                     )}
                   </NavLink>
@@ -150,19 +187,40 @@ export default function Layout() {
         </nav>
 
         {/* Footer / Logout */}
-        <div className="p-3 border-t border-white/10">
+        <div
+          style={{
+            padding: "var(--avoce-space-3)",
+            borderTop: "1px solid rgba(255,255,255,0.08)",
+          }}
+        >
           <button
             onClick={logout}
-            className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-sm font-medium text-white/40 hover:text-white hover:bg-white/10 transition-all"
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              gap: "var(--avoce-space-3)",
+              padding: "var(--avoce-space-2) var(--avoce-space-3)",
+              fontSize: 13,
+              fontWeight: 500,
+              color: "rgba(255,255,255,0.35)",
+              background: "transparent",
+              border: "none",
+              cursor: "pointer",
+              transition: "var(--avoce-transition)",
+              fontFamily: "var(--avoce-font-sans)",
+              borderRadius: 0,
+            }}
+            className="nav-item-hover-logout"
           >
-            <LogOut size={15} strokeWidth={1.75} />
+            <LogOut size={14} strokeWidth={1.75} />
             Sair
           </button>
         </div>
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-auto">
+      <main className="flex-1 overflow-auto" style={{ background: "var(--avoce-cream)" }}>
         <Outlet />
       </main>
     </div>

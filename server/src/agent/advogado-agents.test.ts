@@ -1,0 +1,87 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("../db.js", () => ({
+  prisma: {
+    iaFlowStep: {
+      findMany: vi.fn(),
+    },
+  },
+}));
+
+import { prisma } from "../db.js";
+import { detectAdvogadoPhase, getStepFaseMap } from "./advogado-agents.js";
+
+const mockFindMany = (prisma.iaFlowStep.findMany as ReturnType<typeof vi.fn>);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // Reset the cache between tests by clearing internal module state
+  mockFindMany.mockResolvedValue([]);
+});
+
+describe("detectAdvogadoPhase", () => {
+  it("returns 'autoridade' when iaFlowStepChave is null", async () => {
+    const phase = await detectAdvogadoPhase("proj-1", null);
+    expect(phase).toBe("autoridade");
+    expect(mockFindMany).not.toHaveBeenCalled();
+  });
+
+  it("returns 'autoridade' when step has fase 'autoridade'", async () => {
+    mockFindMany.mockResolvedValue([{ chave: "parecer", fase: "autoridade" }]);
+    const phase = await detectAdvogadoPhase("proj-autoridade", "parecer");
+    expect(phase).toBe("autoridade");
+  });
+
+  it("returns 'coleta' when step has fase 'coleta'", async () => {
+    mockFindMany.mockResolvedValue([{ chave: "cpf", fase: "coleta" }]);
+    const phase = await detectAdvogadoPhase("proj-coleta", "cpf");
+    expect(phase).toBe("coleta");
+  });
+
+  it("returns 'autoridade' for unknown step (not in DB)", async () => {
+    mockFindMany.mockResolvedValue([{ chave: "cpf", fase: "coleta" }]);
+    const phase = await detectAdvogadoPhase("proj-unknown", "step_inexistente");
+    expect(phase).toBe("autoridade");
+  });
+});
+
+describe("getStepFaseMap cache", () => {
+  it("only queries DB once for the same projetoId within TTL", async () => {
+    const freshProjetoId = "proj-cache-" + Date.now();
+    mockFindMany.mockResolvedValue([{ chave: "cpf", fase: "coleta" }]);
+
+    await getStepFaseMap(freshProjetoId);
+    await getStepFaseMap(freshProjetoId);
+
+    expect(mockFindMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a map with all step entries", async () => {
+    const pid = "proj-map-" + Date.now();
+    mockFindMany.mockResolvedValue([
+      { chave: "cpf", fase: "coleta" },
+      { chave: "parecer", fase: "autoridade" },
+    ]);
+
+    const map = await getStepFaseMap(pid);
+    expect(map.get("cpf")).toBe("coleta");
+    expect(map.get("parecer")).toBe("autoridade");
+  });
+});
+
+describe("runAdvogadoAgent", () => {
+  it("returns phase and systemInstructions for autoridade", async () => {
+    const pid = "proj-adv-" + Date.now();
+    mockFindMany.mockResolvedValue([]);
+    const { runAdvogadoAgent } = await import("./advogado-agents.js");
+    const result = await runAdvogadoAgent({
+      projetoId: pid,
+      iaFlowStepChave: null,
+      merged: { nome: "João" },
+      vinculos: [],
+    });
+    expect(result.phase).toBe("autoridade");
+    expect(typeof result.systemInstructions).toBe("string");
+    expect(result.systemInstructions.length).toBeGreaterThan(0);
+  });
+});

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Avoce" fill="currentColor">
+  <circle cx="32" cy="8" r="3.2"></circle>
+  <circle cx="44.000" cy="11.215" r="2"></circle>
+  <circle cx="52.785" cy="20.000" r="2"></circle>
+  <circle cx="56.000" cy="32.000" r="2"></circle>
+  <circle cx="52.785" cy="44.000" r="2"></circle>
+  <circle cx="44.000" cy="52.785" r="2"></circle>
+  <circle cx="32.000" cy="56.000" r="2"></circle>
+  <circle cx="20.000" cy="52.785" r="2"></circle>
+  <circle cx="11.215" cy="44.000" r="2"></circle>
+  <circle cx="8.000" cy="32.000" r="2"></circle>
+  <circle cx="11.215" cy="20.000" r="2"></circle>
+  <circle cx="20.000" cy="11.215" r="2"></circle>
+</svg>

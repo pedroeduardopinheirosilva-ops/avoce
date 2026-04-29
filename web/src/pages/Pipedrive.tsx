@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { trpc } from "../lib/trpc";
 
-const SUPABASE_URL  = "https://jruettethcumobyessqu.supabase.co";
-const SUPABASE_TOKEN = "REMOVED_ROTATE_TOKEN";
+const SUPABASE_URL   = import.meta.env.VITE_SUPABASE_URL  ?? "";
+const SUPABASE_TOKEN = import.meta.env.VITE_SUPABASE_TOKEN ?? "";
 
 export default function Pipedrive() {
   const [tokenInput, setTokenInput] = useState("");

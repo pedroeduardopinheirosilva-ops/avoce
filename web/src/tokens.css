@@ -1,0 +1,155 @@
+/* =====================================================================
+ * AVOCE — Design Tokens
+ * Sistema de design para o produto Avoce (SaaS jurídico).
+ * Paleta: navy + gold + cream. Editorial, institucional, brasileiro.
+ * ===================================================================== */
+
+:root {
+  /* ---------- CORES ---------- */
+  /* Marca primária */
+  --avoce-navy:        #0B2545;  /* azul institucional, base de tudo */
+  --avoce-navy-deep:   #061732;  /* hover de botões primários, headers densos */
+  --avoce-navy-soft:   #3B5278;  /* texto secundário sobre claro, gráficos */
+
+  /* Acento dourado (Nossa Senhora das Graças — referência velada) */
+  --avoce-gold:        #C9A961;  /* badges, acentos, ponto da coroa */
+  --avoce-gold-soft:   #E0C98A;  /* hover sobre gold, fundos sutis */
+
+  /* Neutros — papel */
+  --avoce-cream:       #F4F1EA;  /* canvas / background do app */
+  --avoce-paper:       #FBF8F0;  /* superfície de cards */
+  --avoce-paper-deep:  #EDE8DC;  /* hover de linhas, headers de coluna */
+
+  /* Tinta */
+  --avoce-ink:         #0A0A0A;
+  --avoce-mute:        #6B7186;  /* texto auxiliar */
+  --avoce-mute-soft:   #9CA0B3;  /* placeholders, metadata */
+
+  /* Linhas */
+  --avoce-hair:        #D9D3C2;  /* borda padrão (1px) */
+  --avoce-hair-soft:   #E8E2D3;  /* divisores internos */
+
+  /* Semânticas */
+  --avoce-success:     #2F6B4F;
+  --avoce-warn:        #B26B1F;
+  --avoce-danger:      #9B2C2C;
+  --avoce-info:        #3B5278;
+
+  /* Personas IA (badges das conversas) */
+  --avoce-persona-ana:      #3B5278;  /* triagem */
+  --avoce-persona-daniela:  #6B3F8C;  /* qualificação */
+  --avoce-persona-closer:   #B26B1F;  /* negociação */
+
+  /* ---------- TIPOGRAFIA ---------- */
+  --avoce-font-serif: "Instrument Serif", Georgia, serif;        /* display, números editoriais */
+  --avoce-font-sans:  "Inter", system-ui, -apple-system, sans-serif; /* UI, body */
+  --avoce-font-mono:  "JetBrains Mono", ui-monospace, "SF Mono", monospace; /* dados, kickers, códigos */
+
+  /* Pesos: Inter usa 400/500/600/700. Wordmark é 500 com letter-spacing -0.045em. */
+  --avoce-weight-regular: 400;
+  --avoce-weight-medium:  500;
+  --avoce-weight-semi:    600;
+  --avoce-weight-bold:    700;
+
+  /* Letter-spacing — kickers em mono são SEMPRE uppercase + 0.16-0.22em */
+  --avoce-tracking-kicker:    0.18em;
+  --avoce-tracking-kicker-sm: 0.22em;
+  --avoce-tracking-display:  -0.02em;
+  --avoce-tracking-wordmark: -0.045em;
+
+  /* ---------- ESPAÇAMENTO ---------- */
+  /* Grid base de 4px */
+  --avoce-space-1:  4px;
+  --avoce-space-2:  8px;
+  --avoce-space-3:  12px;
+  --avoce-space-4:  16px;
+  --avoce-space-5:  20px;
+  --avoce-space-6:  24px;
+  --avoce-space-8:  32px;
+  --avoce-space-10: 40px;
+  --avoce-space-12: 48px;
+
+  /* ---------- BORDA & RAIO ---------- */
+  /* AVOCE NÃO USA RAIO. Tudo é ângulo reto, papel, formal. */
+  --avoce-radius:     0;
+  --avoce-border-w:   1px;
+  --avoce-border:     1px solid var(--avoce-hair);
+  --avoce-border-soft: 1px solid var(--avoce-hair-soft);
+
+  /* ---------- ELEVAÇÃO ---------- */
+  /* Sombras minimalistas, raras. Avoce prefere borda a sombra. */
+  --avoce-shadow-sm: 0 1px 2px rgba(11, 37, 69, 0.04);
+  --avoce-shadow-md: 0 2px 8px rgba(11, 37, 69, 0.06), 0 12px 32px rgba(11, 37, 69, 0.04);
+  --avoce-shadow-overlay: 0 24px 60px rgba(11, 37, 69, 0.12);
+
+  /* ---------- LAYOUT ---------- */
+  --avoce-sidebar-width: 232px;
+  --avoce-topbar-height: 72px;
+  --avoce-content-max:   1400px;
+
+  /* ---------- TRANSIÇÕES ---------- */
+  --avoce-transition:        100ms ease;
+  --avoce-transition-medium: 200ms ease;
+}
+
+/* =====================================================================
+ * Defaults globais
+ * ===================================================================== */
+
+html, body {
+  background: var(--avoce-cream);
+  color: var(--avoce-navy);
+  font-family: var(--avoce-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: var(--avoce-navy);
+  color: var(--avoce-cream);
+}
+
+/* Scrollbar discreta */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: rgba(11, 37, 69, 0.15); }
+*::-webkit-scrollbar-thumb:hover { background: rgba(11, 37, 69, 0.30); }
+
+/* =====================================================================
+ * Utilitários — kickers, números editoriais
+ * ===================================================================== */
+
+.avoce-kicker {
+  font-family: var(--avoce-font-mono);
+  font-size: 10px;
+  letter-spacing: var(--avoce-tracking-kicker);
+  text-transform: uppercase;
+  color: var(--avoce-mute);
+}
+
+.avoce-display {
+  font-family: var(--avoce-font-serif);
+  font-weight: 400;
+  letter-spacing: var(--avoce-tracking-display);
+  line-height: 1;
+  color: var(--avoce-navy);
+}
+
+.avoce-data {
+  font-family: var(--avoce-font-mono);
+  color: var(--avoce-navy);
+}
+
+/* =====================================================================
+ * Layout helpers
+ * ===================================================================== */
+
+.nav-item-hover:hover {
+  color: rgba(255, 255, 255, 0.9) !important;
+  background: rgba(255, 255, 255, 0.07) !important;
+}
+
+.nav-item-hover-logout:hover {
+  color: rgba(255, 255, 255, 0.7) !important;
+  background: rgba(255, 255, 255, 0.07) !important;
+}
