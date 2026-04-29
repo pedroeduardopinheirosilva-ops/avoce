@@ -5,6 +5,7 @@ import nodemailer             from "nodemailer";
 import { htmlToPdf }         from "../lib/pdf.js";
 import { existsSync, readFileSync } from "node:fs";
 import { readFile }          from "node:fs/promises";
+import { sendText }          from "../services/evolution.js";
 
 // ── Auto-conversão de proposta aceita em contrato ────────────────────────────
 
@@ -792,6 +793,46 @@ export const propostaRouter = router({
       });
 
       return { ok: true, usandoPakt, docsGerados: docAttachments.length, paktDocs: paktDocs.length };
+    }),
+
+  enviarWhatsApp: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      const p = await prisma.proposta.findUniqueOrThrow({
+        where: { id: input.id },
+        include: { tomador: true },
+      }) as any;
+
+      const telefone: string | null = p.tomador.telefone ?? null;
+      if (!telefone) throw new Error("Tomador não possui telefone cadastrado");
+
+      const phone = telefone.replace(/\D/g, "");
+      const to = phone.startsWith("55") ? phone : `55${phone}`;
+
+      // Busca config Evolution do primeiro projeto ativo com WhatsApp configurado
+      const projeto = await (prisma as any).iaProjeto.findFirst({ where: { ativo: true } });
+      if (!projeto) throw new Error("Nenhum projeto de IA configurado");
+
+      const configs = await (prisma as any).iaProjetoConfig.findMany({
+        where: { projetoId: projeto.id, categoria: "whatsapp" },
+      });
+      const get = (k: string) => (configs as any[]).find(c => c.chave === k)?.valor ?? "";
+      const evoUrl = get("evolution_api_url");
+      const evoKey = get("evolution_api_key");
+      const evoInst = get("evolution_instancia");
+      if (!evoUrl || !evoKey || !evoInst)
+        throw new Error("Evolution API não configurada no projeto de IA");
+
+      const appUrl = process.env.APP_BASE_URL ?? "https://avoce.com.br";
+      const link = p.paktSignUrl || `${appUrl}/api/proposta/${p.tokenAceite}`;
+      const nome = (p.tomador.nome as string).split(" ")[0];
+
+      const texto = p.paktSignUrl
+        ? `Olá, ${nome}! Segue o link para assinar o contrato e a procuração:\n\n${link}\n\nQualquer dúvida é só falar. 👍`
+        : `Olá, ${nome}! Segue o link da sua proposta para aprovação:\n\n${link}\n\nQualquer dúvida é só falar. 👍`;
+
+      await sendText({ baseUrl: evoUrl, apiKey: evoKey, instancia: evoInst }, to, texto);
+      return { ok: true };
     }),
 
   converterEmContrato: authProc

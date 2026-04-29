@@ -607,6 +607,16 @@ export const iaRouter = router({
       return prisma.iaNotificacaoEvento.delete({ where: { id: input.id } });
     }),
 
+  listNotificacaoLogs: authProc
+    .input(z.object({ projetoId: z.string(), limit: z.number().optional() }))
+    .query(async ({ input }) => {
+      return prisma.iaNotificacaoLog.findMany({
+        where: { projetoId: input.projetoId },
+        orderBy: { enviadaEm: "desc" },
+        take: input.limit ?? 50,
+      });
+    }),
+
   // ── LLM Provedores ────────────────────────────────────────────────────────
 
   listLlmProvedores: authProc

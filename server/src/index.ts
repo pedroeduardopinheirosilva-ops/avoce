@@ -25,7 +25,7 @@ import bcrypt               from "bcryptjs";
 
 const PORT = parseInt(process.env.PORT ?? "8470");
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, maxParamLength: 5000 });
 
 await app.register(cors, {
   origin: true,
@@ -1059,6 +1059,44 @@ async function processMessages(body: any, projetoId: string, app: any) {
       continue;
     }
     _processedMsgIds.set(msgId, Date.now());
+
+    // Early-persist: save message to DB immediately before the 15s debounce so that
+    // a PM2 OOM restart doesn't permanently lose the message. The full processIncomingMessage
+    // will update content with richer text (audio transcription, OCR) after the debounce.
+    // Non-fatal: if contact/deal don't exist yet (new lead) this is skipped gracefully.
+    void (async () => {
+      try {
+        const m = msg.message ?? {};
+        const earlyText: string | null =
+          (m as any).conversation ??
+          (m as any).extendedTextMessage?.text ??
+          ((m as any).audioMessage ? "[Áudio]" :
+          (m as any).imageMessage ? "[Imagem]" :
+          (m as any).documentMessage ? "[Documento]" : null);
+        if (!earlyText) return;
+        const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
+        if (!contato) return; // new lead — let processIncomingMessage handle it
+        const deal = await prisma.crmDeal.findFirst({
+          where: { contatoId: contato.id, projetoId, status: "aberto" },
+          orderBy: { criadoEm: "desc" },
+        });
+        if (!deal) return;
+        await prisma.crmMensagemWhatsapp.create({
+          data: {
+            dealId: deal.id,
+            contatoId: contato.id,
+            direcao: "in",
+            remetente: phone,
+            tipo: "text",
+            conteudo: earlyText,
+            evolutionMessageId: msgId,
+          },
+        });
+        app.log.info(`[WA-Webhook] Early-persist: msg ${msgId} salva antes do debounce`);
+      } catch {
+        // P2002 = already exists, other errors = non-fatal
+      }
+    })();
 
     debounceForPhone(phone, msg, projetoId, processIncomingMessage, app);
   }

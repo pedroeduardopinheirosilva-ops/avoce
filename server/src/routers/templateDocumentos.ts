@@ -60,6 +60,8 @@ export function buildVars(
     contratoDiaVencimento?: number | null;
     contratoMetodoCobr?: string | null;
     honorariosExitoPerc?: number | null;
+    contratoDescricao?: string | null;
+    validadeAte?: Date | string | null;
   } | null,
 ): Record<string, string> {
   const emitenteNome = emitente.nomeFantasia || emitente.nome;
@@ -178,6 +180,10 @@ export function buildVars(
     metodoPagamento:   metodosLabel[contrato?.contratoMetodoCobr ?? ""] ?? "",
     honorariosExitoPerc: contrato?.honorariosExitoPerc != null ? String(contrato.honorariosExitoPerc) : "",
     honorariosExito:     contrato?.honorariosExitoPerc != null ? `${contrato.honorariosExitoPerc}%` : "",
+    servico:           contrato?.contratoDescricao ?? "",
+    validadeAte:       contrato?.validadeAte
+      ? new Date(contrato.validadeAte).toLocaleDateString("pt-BR")
+      : "",
     dataAtual:         new Date().toLocaleDateString("pt-BR"),
     cidade:            localidade,
     endereco:          endEmitente,
@@ -429,19 +435,20 @@ export async function gerarDocumentosProposta(propostaId: string): Promise<void>
       const pdfPath  = join(pdfDir, `${propostaId}-${template.id}.pdf`);
       const docxPath = isDocxTimbrado ? join(pdfDir, `${propostaId}-${template.id}.docx`) : null;
 
+      const htmlFinal = renderTemplateDoc(template.textoHtml, vars);
+
       if (isDocxTimbrado) {
         console.log(`[Doc] Timbrado DOCX detectado, usando generateFromDocxTemplate...`);
         await generateFromDocxTemplate(
           timbradoEfetivo!,
           template.titulo,
-          template.textoHtml,
-          vars,
+          htmlFinal,
+          {},
           docxPath!,
           pdfPath,
         );
         console.log(`[Doc] DOCX+PDF gerados: ${docxPath} / ${pdfPath}`);
       } else {
-        const htmlFinal = renderTemplateDoc(template.textoHtml, vars);
         const pageHtml  = documentoHtmlPage(template.titulo, htmlFinal, {
           ...proposta.emitente,
           logoSrc: logoPathToBase64(proposta.emitente.logoPath),
@@ -456,10 +463,11 @@ export async function gerarDocumentosProposta(propostaId: string): Promise<void>
       await (prisma as any).documentoGerado.create({
         data: {
           propostaId,
-          templateId: template.id,
-          tipo:       template.tipo,
-          titulo:     template.titulo,
+          templateId:  template.id,
+          tipo:        template.tipo,
+          titulo:      template.titulo,
           pdfPath,
+          htmlEditado: htmlFinal,
           ...(docxPath ? { docxPath } : {}),
         },
       });
@@ -526,6 +534,62 @@ export const templateDocumentoRouter = router({
       return (prisma as any).documentoGerado.findMany({
         where: { propostaId: input.propostaId },
         orderBy: { criadoEm: "asc" },
+        select: {
+          id: true, tipo: true, titulo: true,
+          pdfPath: true, docxPath: true, htmlEditado: true, criadoEm: true,
+        },
+      });
+    }),
+
+  // Atualizar HTML de um documento gerado e regenerar PDF/DOCX
+  atualizarDocumentoGerado: authProc
+    .input(z.object({ id: z.string(), textoHtml: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      const doc = await (prisma as any).documentoGerado.findUnique({
+        where: { id: input.id },
+        include: {
+          proposta: { include: { emitente: true } },
+          template: true,
+        },
+      });
+      if (!doc) throw new Error("Documento não encontrado");
+
+      const emitente = doc.proposta.emitente;
+      const template = doc.template;
+
+      const timbradoEfetivo = (template?.cabecalhoPath && existsSync(template.cabecalhoPath))
+        ? template.cabecalhoPath
+        : (emitente.timbradoPath && existsSync(emitente.timbradoPath))
+          ? emitente.timbradoPath
+          : null;
+
+      const isDocxTimbrado = timbradoEfetivo?.toLowerCase().endsWith(".docx");
+      const pdfDir  = resolve("./uploads/documentos-gerados");
+      mkdirSync(pdfDir, { recursive: true });
+
+      const pdfPath  = doc.pdfPath  ?? join(pdfDir, `${doc.propostaId}-${doc.templateId}.pdf`);
+      const docxPath = isDocxTimbrado
+        ? (doc.docxPath ?? join(pdfDir, `${doc.propostaId}-${doc.templateId}.docx`))
+        : null;
+
+      if (isDocxTimbrado && timbradoEfetivo && docxPath) {
+        await generateFromDocxTemplate(timbradoEfetivo, doc.titulo, input.textoHtml, {}, docxPath, pdfPath);
+      } else {
+        const pageHtml = documentoHtmlPage(doc.titulo, input.textoHtml, {
+          ...emitente,
+          logoSrc: logoPathToBase64(emitente.logoPath),
+        }, timbradoEfetivo);
+        const pdfBuffer = await htmlToPdf(pageHtml);
+        await writeFile(pdfPath, pdfBuffer);
+      }
+
+      return (prisma as any).documentoGerado.update({
+        where: { id: input.id },
+        data: {
+          htmlEditado: input.textoHtml,
+          pdfPath,
+          ...(docxPath ? { docxPath } : {}),
+        },
       });
     }),
 

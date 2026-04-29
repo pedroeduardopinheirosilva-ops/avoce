@@ -144,6 +144,43 @@ export async function recuperarMensagensPerdidas(): Promise<void> {
     }
   }
 
+  // ── Follow-up: last message was outgoing (bot asked) and no reply in 60min ──
+  // Covers two failure modes:
+  //   1. Evolution API drops the client's reply webhook (LID addressing bug)
+  //   2. PM2 OOM restart kills the 15s debounce before message is processed
+  // After 60min of silence, re-asks the pending question via respondFromDealState.
+  // Applies to ALL personas (Ana + Daniela).
+  const FOLLOWUP_MIN_MS = 60 * 60 * 1000;        // 1 hour before first follow-up
+  const FOLLOWUP_MAX_MS = 12 * 60 * 60 * 1000;   // stop after 12h (cron stage transitions take over)
+  for (const deal of deals) {
+    if (!deal.projetoId || !deal.contato?.whatsapp) continue;
+
+    try {
+      const ultimaMsgDeal = await prisma.crmMensagemWhatsapp.findFirst({
+        where: { dealId: deal.id },
+        orderBy: { enviadaEm: "desc" },
+      });
+      if (!ultimaMsgDeal || ultimaMsgDeal.direcao !== "out") continue; // last msg is inbound — normal flow handles it
+      const idadeMs = now.getTime() - ultimaMsgDeal.enviadaEm.getTime();
+      if (idadeMs < FOLLOWUP_MIN_MS || idadeMs > FOLLOWUP_MAX_MS) continue;
+      // Only follow up once per 60min window (avoid spamming every 15-min cron tick)
+      const jaEnviouNessaJanela = await prisma.crmMensagemWhatsapp.findFirst({
+        where: {
+          dealId: deal.id,
+          direcao: "out",
+          enviadaEm: { gte: new Date(now.getTime() - FOLLOWUP_MIN_MS) },
+        },
+      });
+      if (jaEnviouNessaJanela) continue; // already sent a follow-up in this 60min window
+
+      const persona = deal.iaPersonaChave ?? "assistente";
+      console.log(`[CronAgent] Follow-up [${persona}] — deal ${deal.id} (${Math.round(idadeMs / 60000)}min sem resposta do cliente) → re-enviando pergunta`);
+      await respondFromDealState(deal.projetoId, deal.id, deal.contato.whatsapp);
+    } catch (err) {
+      console.error(`[CronAgent] Erro follow-up deal ${deal.id}:`, err);
+    }
+  }
+
   let recuperados = 0;
   for (const deal of deals) {
     if (!deal.projetoId || !deal.contato?.whatsapp) continue;

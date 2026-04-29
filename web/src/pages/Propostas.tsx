@@ -21,7 +21,11 @@ const VARIAVEIS_PROPOSTA = [
 ];
 
 // Componente que carrega e exibe os documentos gerados de uma proposta
-function DocsBotoes({ propostaId, onGerar }: { propostaId: string; onGerar: () => void }) {
+function DocsBotoes({ propostaId, onGerar, onEdit }: {
+  propostaId: string;
+  onGerar: () => void;
+  onEdit: (doc: any) => void;
+}) {
   const { data: docs } = trpc.templateDocumento.listarDocumentosProposta.useQuery({ propostaId });
 
   async function baixar(docId: string, titulo: string, tipo: string, formato: "pdf" | "docx" = "pdf") {
@@ -79,8 +83,27 @@ function DocsBotoes({ propostaId, onGerar }: { propostaId: string; onGerar: () =
               📝 .docx
             </button>
           )}
+          <button
+            onClick={() => { if (doc.htmlEditado) onEdit(doc); }}
+            disabled={!doc.htmlEditado}
+            title={doc.htmlEditado ? `Editar ${doc.titulo}` : "Regenere os documentos para habilitar edição"}
+            className={`px-2 py-1 rounded text-xs font-medium border ${
+              doc.htmlEditado
+                ? "text-amber-700 border-amber-200 hover:bg-amber-50"
+                : "text-gray-300 border-gray-200 cursor-not-allowed"
+            }`}
+          >
+            ✏️
+          </button>
         </span>
       ))}
+      <button
+        onClick={() => { if (confirm("Regenerar todos os documentos desta proposta?")) onGerar(); }}
+        className="px-2 py-1 rounded text-xs text-gray-500 hover:bg-gray-100 font-medium border border-gray-200"
+        title="Regenerar documentos (apaga e recria)"
+      >
+        🔄
+      </button>
     </>
   );
 }
@@ -198,6 +221,10 @@ export default function Propostas() {
     },
     onError: (e) => alert(`Erro: ${e.message}`),
   });
+  const enviarWA = trpc.proposta.enviarWhatsApp.useMutation({
+    onSuccess: () => alert("Mensagem enviada via WhatsApp!"),
+    onError:   (e) => alert(`Erro ao enviar WhatsApp: ${e.message}`),
+  });
   const converter = trpc.proposta.converterEmContrato.useMutation({
     onSuccess: () => { alert("Proposta convertida em contrato!"); utils.proposta.listar.invalidate(); setConverterModal(null); },
     onError:   (e) => alert(`Erro: ${e.message}`),
@@ -209,16 +236,26 @@ export default function Propostas() {
     },
     onError: (e) => alert(`Erro: ${e.message}`),
   });
+  const atualizarDocGerado = trpc.templateDocumento.atualizarDocumentoGerado.useMutation({
+    onSuccess: () => {
+      utils.templateDocumento.listarDocumentosProposta.invalidate();
+      setEditDocModal(null);
+    },
+    onError: (e) => alert(`Erro: ${e.message}`),
+  });
 
 
 
   const editorRef = useRef<RichEditorHandle>(null);
+  const editDocEditorRef = useRef<RichEditorHandle>(null);
   const [form, setForm]               = useState<PropostaForm | null>(null);
   const [converterModal, setConverterModal] = useState<any | null>(null);
   const [negociacaoModal, setNegociacaoModal] = useState<any | null>(null);
   const [negociacaoObs, setNegociacaoObs]     = useState("");
   const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [editDocModal, setEditDocModal] = useState<any | null>(null);
+  const [editDocHtml, setEditDocHtml]   = useState("");
 
   function abrirWhatsApp(p: any) {
     const nome    = p.tomador.nome.split(" ")[0];
@@ -496,20 +533,30 @@ export default function Propostas() {
                         Negociar
                       </button>
                     )}
-                    {/* Enviar / Reenviar */}
+                    {/* Enviar / Reenviar e-mail */}
                     {p.status === "RASCUNHO" ? (
                       <button
                         onClick={() => { if (confirm(`Enviar proposta para ${p.tomador.email || p.tomador.nome}?`)) enviarEmail.mutate({ id: p.id }); }}
                         disabled={enviarEmail.isPending}
-                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50">
-                        {enviarEmail.isPending ? "..." : "Enviar"}
+                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50 border border-blue-200">
+                        {enviarEmail.isPending ? "..." : "✉️ Enviar"}
                       </button>
                     ) : (
                       <button
                         onClick={() => { if (confirm(`Reenviar e-mail para ${p.tomador.email || p.tomador.nome}?`)) enviarEmail.mutate({ id: p.id }); }}
                         disabled={enviarEmail.isPending}
-                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50">
-                        {enviarEmail.isPending ? "..." : "Reenviar"}
+                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50 border border-blue-200">
+                        {enviarEmail.isPending ? "..." : "✉️ E-mail"}
+                      </button>
+                    )}
+                    {/* Reenviar via WhatsApp (Evolution API) */}
+                    {p.status !== "RASCUNHO" && (
+                      <button
+                        onClick={() => { if (confirm(`Enviar link via WhatsApp para ${p.tomador.nome}?`)) enviarWA.mutate({ id: p.id }); }}
+                        disabled={enviarWA.isPending}
+                        title="Envia o link PAKT (ou de aceite) diretamente via WhatsApp"
+                        className="px-2 py-1 rounded text-xs text-green-700 hover:bg-green-50 font-medium disabled:opacity-50 border border-green-200">
+                        {enviarWA.isPending ? "..." : "📱 WA"}
                       </button>
                     )}
                     {/* PDF Assinado (PAKT) */}
@@ -532,9 +579,11 @@ export default function Propostas() {
                       </button>
                     )}
                     {/* Documentos gerados (contrato/procuração) */}
-                    {p.status === "ACEITA" && (
-                      <DocsBotoes propostaId={p.id} onGerar={() => gerarDocumentos.mutate({ propostaId: p.id })} />
-                    )}
+                    <DocsBotoes
+                      propostaId={p.id}
+                      onGerar={() => gerarDocumentos.mutate({ propostaId: p.id })}
+                      onEdit={(doc) => { setEditDocModal(doc); setEditDocHtml(doc.htmlEditado ?? ""); }}
+                    />
                     {/* Converter manual (só se não tiver parâmetros auto ou já aceita sem contrato) */}
                     {p.status === "ACEITA" && !(p as any).contratoId && !(p as any).contratoDiaVencimento && (
                       <button onClick={() => setConverterModal(p)}
@@ -838,6 +887,42 @@ export default function Propostas() {
               <button onClick={() => setForm(null)} className="btn-secondary">Cancelar</button>
               <button onClick={salvar} disabled={criar.isPending || atualizar.isPending} className="btn-primary">
                 {(criar.isPending || atualizar.isPending) ? "Salvando..." : "Salvar"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modal Editar Documento Gerado ───────────────────────────────────── */}
+      {editDocModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-start justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-4xl my-8">
+            <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-bold text-gray-900">Editar Documento</h2>
+                <p className="text-sm text-gray-500 mt-0.5">{editDocModal.titulo}</p>
+              </div>
+              <button onClick={() => setEditDocModal(null)} className="text-gray-400 hover:text-gray-600 text-xl">×</button>
+            </div>
+            <div className="p-6">
+              <p className="text-xs text-gray-400 mb-3">
+                Edite o texto do documento. Ao salvar, o PDF (e DOCX, se houver) será regenerado automaticamente.
+              </p>
+              <RichEditor
+                ref={editDocEditorRef}
+                value={editDocHtml}
+                onChange={html => setEditDocHtml(html)}
+                minHeight="500px"
+              />
+            </div>
+            <div className="px-6 py-4 border-t border-gray-200 flex justify-end gap-3">
+              <button onClick={() => setEditDocModal(null)} className="btn-secondary">Cancelar</button>
+              <button
+                onClick={() => atualizarDocGerado.mutate({ id: editDocModal.id, textoHtml: editDocHtml })}
+                disabled={atualizarDocGerado.isPending}
+                className="btn-primary"
+              >
+                {atualizarDocGerado.isPending ? "Salvando e gerando PDF..." : "Salvar e Regenerar PDF"}
               </button>
             </div>
           </div>

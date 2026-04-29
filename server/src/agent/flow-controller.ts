@@ -10,6 +10,7 @@
 
 import { prisma } from "../db.js";
 import { extractJson } from "./llm.js";
+import { saveFlowStepData } from "./deal-repository.js";
 
 // ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -115,7 +116,18 @@ export type AdvogadoFlowResult = {
  *   advances the step, and returns the next question.
  * Returns null when the flow is complete or not configured.
  */
-export async function handleAdvogadoFlow(
+export async function initAdvogadoFlowIfNeeded(projetoId: string, dealId: string): Promise<string | null> {
+  const steps = await loadSteps(projetoId, "advogado", "advogado");
+  const firstStep = steps[0];
+  if (!firstStep) return null;
+  await prisma.crmDeal.update({
+    where: { id: dealId },
+    data: { iaFlowStepChave: firstStep.chave, iaFlowStepData: {} },
+  });
+  return (firstStep.pergunta as string) ?? null;
+}
+
+export async function advanceAdvogadoFlow(
   projetoId: string,
   deal: {
     id: string;
@@ -154,6 +166,36 @@ export async function handleAdvogadoFlow(
   // Steps that don't require client validation (document sending, final confirmation)
   if (currentStep.stepType === "document" || currentStep.stepType === "end") {
     return await advanceToNextStep(deal, steps, currentStep, {}, null);
+  }
+
+  // llm_generated steps: send LLM content first, advance only after user responds
+  // Uses _enviado flag stored in iaFlowStepData to track whether content was already sent.
+  if (currentStep.stepType === "llm_generated") {
+    const stepData = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
+    const alreadySent = stepData[`${currentStepChave}_enviado`] === true;
+    if (!alreadySent) {
+      // Not yet sent — return instruction so stage-engine generates the LLM response
+      return { nextQuestion: currentStep.pergunta as string, stepType: "llm_generated", nextStepChave: currentStepChave };
+    }
+    // Already sent — user is responding to it, advance
+    console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" (llm_generated) already sent — advancing`);
+    return await advanceToNextStep(deal, steps, currentStep, {}, null);
+  }
+
+  // For plain data-collection steps (campoColetar set, no gates): any substantive text counts as answered.
+  // Skip the answered=true gate to avoid loops where the LLM rejects typed data for a step that originally
+  // asked for a document. Just extract the value and advance.
+  const ACKS_REGEX_FC = /^(ok|certo|beleza|tá|ta|aham|combinado|opa|oi|sim|não|nao|blz|bom|legal)\.?$/i;
+  const isSubstantive = incomingText.replace(/\s/g, "").length >= 4 && !ACKS_REGEX_FC.test(incomingText.trim());
+  if (currentStep.campoColetar && !currentStep.gates.length && isSubstantive) {
+    const extracted = await extractJson<Record<string, string>>({
+      projetoId,
+      instruction: `Extraia o valor do campo "${currentStep.campoColetar}" da resposta do cliente à pergunta abaixo. Retorne apenas: { "${currentStep.campoColetar}": "valor_extraído" }`,
+      text: `Pergunta: "${currentStep.pergunta}"\nResposta: "${incomingText}"`,
+      maxTokens: 128,
+    });
+    console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" answered=true (verbal) extracted=${JSON.stringify(extracted ?? {})}`);
+    return await advanceToNextStep(deal, steps, currentStep, extracted ?? {}, null);
   }
 
   // Build gate context for the LLM
@@ -203,11 +245,11 @@ async function executeGateAction(
 ): Promise<AdvogadoFlowResult> {
   switch (gate.actionType) {
     case "end":
-      await saveStepData(deal, extracted, "__done__");
+      await saveFlowStepData(deal, extracted, "__done__");
       return { nextQuestion: gate.actionValue ?? null, nextStepChave: "__done__" };
 
     case "discard":
-      await saveStepData(deal, extracted, "__discarded__");
+      await saveFlowStepData(deal, extracted, "__discarded__");
       return { nextQuestion: gate.actionValue ?? "Infelizmente não conseguiremos prosseguir com seu caso.", nextStepChave: "__discarded__" };
 
     case "repeat":
@@ -216,7 +258,7 @@ async function executeGateAction(
     case "goto_step": {
       const target = steps.find((s: any) => s.chave === gate.actionValue);
       if (!target) return await advanceToNextStep(deal, steps, currentStep, extracted, null);
-      await saveStepData(deal, extracted, target.chave);
+      await saveFlowStepData(deal, extracted, target.chave);
       return { nextQuestion: target.pergunta as string, stepType: target.stepType as string, nextStepChave: target.chave as string };
     }
 
@@ -236,7 +278,8 @@ function validarTransicaoFase(
   const subFase: string | null = proximoStep.subFase ?? null;
 
   // Não pode entrar em advogado_dados sem valor ter sido apresentado
-  if (subFase === "advogado_dados" && !merged._valor_apresentado) {
+  // Aceita tanto _valor_apresentado (path antigo) quanto valor_estimado_enviado (path flow-controller)
+  if (subFase === "advogado_dados" && !merged._valor_apresentado && !merged.valor_estimado_enviado) {
     return { permitido: false, redirecionarPara: "valor_estimado" };
   }
 
@@ -282,12 +325,14 @@ async function advanceToNextStep(
       idx++;
       const candidate = steps[idx];
       if (!candidate) {
-        await saveStepData(deal, extracted, "__done__");
+        await saveFlowStepData(deal, extracted, "__done__");
         return { nextQuestion: null, nextStepChave: "__done__" };
       }
 
-      // Pre-skip: campo já coletado
-      if (candidate.campoColetar && isFieldCollected(merged, candidate.campoColetar)) {
+      // Pre-skip: campo já coletado — usa merged (qualificacao + stepData) exceto para campos
+      // que Daniela precisa confirmar explicitamente (nunca pular mesmo que estejam na qualificacao)
+      const NUNCA_PULAR = new Set(["estado_civil", "nacionalidade"]);
+      if (candidate.campoColetar && !NUNCA_PULAR.has(candidate.campoColetar) && isFieldCollected(merged, candidate.campoColetar)) {
         console.log(`[FlowController] Pre-skip step "${candidate.chave}" — campo "${candidate.campoColetar}" já coletado`);
         continue;
       }
@@ -299,7 +344,7 @@ async function advanceToNextStep(
         if (redirectStep) {
           console.log(`[FlowController] Bloqueio de fase: "${candidate.chave}" → redireciona para "${transicao.redirecionarPara}"`);
           nextStepChave = redirectStep.chave;
-          await saveStepData(deal, extracted, nextStepChave!);
+          await saveFlowStepData(deal, extracted, nextStepChave!);
           return { nextQuestion: redirectStep.pergunta ?? null, stepType: redirectStep.stepType ?? null, nextStepChave: redirectStep.chave };
         }
       }
@@ -309,21 +354,11 @@ async function advanceToNextStep(
     }
   }
 
-  await saveStepData(deal, extracted, nextStepChave!);
+  await saveFlowStepData(deal, extracted, nextStepChave!);
 
   const nextStep = steps.find((s: any) => s.chave === nextStepChave);
   return { nextQuestion: nextStep?.pergunta ?? null, stepType: nextStep?.stepType ?? null, nextStepChave: nextStep?.chave ?? null };
 }
 
-async function saveStepData(
-  deal: { id: string; iaFlowStepData?: Record<string, unknown> | null; qualificacao?: unknown },
-  extracted: Record<string, string>,
-  nextStepChave: string,
-): Promise<void> {
-  const current = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
-  const updated: Record<string, unknown> = { ...current, ...extracted };
-  await prisma.crmDeal.update({
-    where: { id: deal.id },
-    data: { iaFlowStepChave: nextStepChave, iaFlowStepData: updated as any },
-  });
-}
+/** @deprecated Use advanceAdvogadoFlow */
+export const handleAdvogadoFlow = advanceAdvogadoFlow;

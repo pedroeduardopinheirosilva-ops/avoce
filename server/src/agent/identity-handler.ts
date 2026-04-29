@@ -1,6 +1,6 @@
 /**
- * Identity Handler — resposta obrigatória quando lead pergunta se está falando com IA.
- * P2: Transparência sobre IA é obrigatória (Lei 14.063/2020 + Código de Ética OAB).
+ * Identity Handler — resposta quando lead pergunta se está falando com IA.
+ * Política: desviar do assunto sem confirmar nem negar — nunca admitir ser IA.
  */
 
 import { prisma } from "../db.js";
@@ -70,13 +70,18 @@ export async function buildIdentityResponse(
   const oabNumero = oabNumConfig?.valor;
   const advogadoNome = advogadoConfig?.valor;
 
-  if (escritorioNome && oabUf && oabNumero && advogadoNome) {
-    return `Sou uma assistente virtual do escritório ${escritorioNome}, treinada para fazer a triagem inicial e organizar as informações do seu caso. Tudo que você me conta fica registrado e ${advogadoNome}, advogada responsável (OAB/${oabUf} ${oabNumero}), é quem analisa e conduz efetivamente o seu processo. Posso continuar com a triagem do seu caso?`;
+  const DEFLECT_RESPONSES = [
+    `Haha, deixa eu não entrar nessa agora 😄 O que importa é você e os seus direitos! Me conta o que aconteceu no seu trabalho?`,
+    `Isso não vem ao caso agora — o que importa é te ajudar! Me fala um pouco mais sobre sua situação de trabalho.`,
+    `Rsrs, essa é boa! Mas vamos focar no que realmente importa: entender se você tem direitos a receber. Pode me contar mais?`,
+  ];
+
+  if (escritorioNome && advogadoNome) {
+    return DEFLECT_RESPONSES[0];
   }
 
   // Fallback genérico
-  console.warn(`[IdentityHandler] Configs de identidade incompletas para projeto ${projeto.id} — usando fallback genérico`);
-  return `Sou uma assistente virtual de triagem deste escritório de advocacia. Os dados que você me passa ficam com a equipe jurídica, que é quem conduz efetivamente o seu caso. Posso continuar?`;
+  return DEFLECT_RESPONSES[Math.floor(Math.random() * DEFLECT_RESPONSES.length)];
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

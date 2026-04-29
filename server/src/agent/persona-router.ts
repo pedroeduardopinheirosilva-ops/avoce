@@ -29,11 +29,12 @@ const DEFAULT_FLOW_PASSOS: Omit<FlowPasso, "ativo">[] = [
   { chave: "funcao",         campoColetar: "funcao",         ordemPadrao: 2,  pergunta: "Qual era sua função lá?",                                                                  skipSe: null,                                                                   tipoEspecial: null },
   { chave: "vinculo",        campoColetar: "vinculo",        ordemPadrao: 3,  pergunta: "Você tinha carteira assinada (CLT) ou era autônomo?",                                       skipSe: null,                                                                   tipoEspecial: null },
   { chave: "saida",          campoColetar: "saida",          ordemPadrao: 4,  pergunta: "Como foi o desligamento — foi demitido, pediu demissão ou ainda está lá?",                  skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "horas_extras",   campoColetar: "horas_extras",   ordemPadrao: 5,  pergunta: "Trabalhava além da jornada normal? Recebia por essas horas?",                               skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "pagamento_fora", campoColetar: "pagamento_fora", ordemPadrao: 6,  pergunta: "Recebia algum valor fora do holerite, como Pix, Pamcard ou dinheiro?",                     skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "injustica",      campoColetar: "injustica",      ordemPadrao: 7,  pergunta: "Teve alguma pressão, desconto indevido ou jornada sem registro?",                           skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "frota",          campoColetar: "frota",          ordemPadrao: 8,  pergunta: "Quantos caminhões a empresa tinha na frota?",                                              skipSe: { campo: "vinculo", contem_qualquer: ["clt", "carteira assinada", "carteira"] }, tipoEspecial: null },
-  { chave: "mais_empregos",  campoColetar: null,             ordemPadrao: 9,  pergunta: "Antes de trabalhar lá, você trabalhou em outro lugar nos últimos 2 anos?",                  skipSe: null,                                                                   tipoEspecial: "mais_empregos" },
+  { chave: "tempo",          campoColetar: "tempo",          ordemPadrao: 5,  pergunta: "Quanto tempo você trabalhou lá? (meses ou anos)",                                           skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "horas_extras",   campoColetar: "horas_extras",   ordemPadrao: 6,  pergunta: "Trabalhava além da jornada normal? Recebia por essas horas?",                               skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "pagamento_fora", campoColetar: "pagamento_fora", ordemPadrao: 7,  pergunta: "Recebia algum valor fora do holerite, como Pix, Pamcard ou dinheiro?",                     skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "injustica",      campoColetar: "injustica",      ordemPadrao: 8,  pergunta: "Teve alguma pressão, desconto indevido ou jornada sem registro?",                           skipSe: null,                                                                   tipoEspecial: null },
+  { chave: "frota",          campoColetar: "frota",          ordemPadrao: 9,  pergunta: "Quantos caminhões a empresa tinha na frota?",                                              skipSe: { campo: "vinculo", contem_qualquer: ["clt", "carteira assinada", "carteira"] }, tipoEspecial: null },
+  { chave: "mais_empregos",  campoColetar: null,             ordemPadrao: 10, pergunta: "Antes de trabalhar lá, você trabalhou em outro lugar nos últimos 2 anos?",                  skipSe: null,                                                                   tipoEspecial: "mais_empregos" },
 ];
 
 // In-memory flow cache
@@ -255,6 +256,11 @@ export async function getNextVinculoQuestion(
       return `Como foi o desligamento da ${empresa} — foi demitido ou pediu demissão? E quando foi isso?`;
     }
 
+    if (campo === "tempo" && alvoVinculo.ordem > 1) {
+      const empresa = alvoVinculo.empresa ?? "essa empresa anterior";
+      return `Quanto tempo você trabalhou na ${empresa}?`;
+    }
+
     return passo.pergunta;
   }
 
@@ -340,22 +346,37 @@ export async function getNextDeterministicQuestion(
 
       const antV = vinculos.find((v: VinculoEmprego) => v.ordem === 2);
       if (antV) {
-        if (merged.tem_emprego_anterior === undefined || merged.tem_emprego_anterior === null)
-          merged.tem_emprego_anterior = true;
-        if (merged.prazo_anterior_ok === undefined || merged.prazo_anterior_ok === null)
-          merged.prazo_anterior_ok = true;
-        if (!merged.empresa_anterior) merged.empresa_anterior = antV.empresa ?? null;
-        if (!merged.tempo_anterior) merged.tempo_anterior = antV.tempo ?? null;
-        if (!merged.clt_anterior) merged.clt_anterior = antV.vinculo ?? null;
-        if (merged.frota_anterior === undefined || merged.frota_anterior === null)
-          merged.frota_anterior = antV.frota ?? null;
-        if (merged.horas_extras_anterior === undefined || merged.horas_extras_anterior === null)
-          merged.horas_extras_anterior = antV.horas_extras ?? null;
-        if (merged.pagamento_anterior === undefined || merged.pagamento_anterior === null)
-          merged.pagamento_anterior = antV.pagamento_fora ?? null;
-        if (!merged.injustica_anterior) merged.injustica_anterior = antV.injustica ?? null;
+        // Vinculos array is authoritative — always overwrite flat merged fields from vinculos[1].
+        // Prevents LLM qualificacao extraction from poisoning anterior fields with wrong company.
+        merged.tem_emprego_anterior = true;
+        merged.prazo_anterior_ok = true;
+        merged.empresa_anterior   = antV.empresa      ?? merged.empresa_anterior      ?? null;
+        merged.tempo_anterior     = antV.tempo        ?? merged.tempo_anterior        ?? null;
+        merged.clt_anterior       = antV.vinculo      ?? merged.clt_anterior          ?? null;
+        merged.frota_anterior     = antV.frota        ?? merged.frota_anterior        ?? null;
+        merged.horas_extras_anterior = antV.horas_extras  ?? merged.horas_extras_anterior ?? null;
+        merged.pagamento_anterior    = antV.pagamento_fora ?? merged.pagamento_anterior    ?? null;
+        merged.injustica_anterior    = antV.injustica      ?? merged.injustica_anterior    ?? null;
       }
     }
+
+    // Guard: if empresa_anterior still matches empresa_principal after vinculos sync
+    // (antV.empresa itself was wrong, or there is no antV), clear the anterior fields so the
+    // pos_vinculos_curto flow asks the anterior questions from scratch.
+    const empPrincipalNorm = String(merged.empresa_principal ?? merged.empresa_recente ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+    const empAnteriorNorm  = String(merged.empresa_anterior ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+    if (posFase === "pos_vinculos_curto" && empAnteriorNorm && empPrincipalNorm && empAnteriorNorm === empPrincipalNorm) {
+      delete merged.tem_emprego_anterior;
+      delete merged.empresa_anterior;
+      delete merged.prazo_anterior_ok;
+      delete merged.tempo_anterior;
+      delete merged.clt_anterior;
+      delete merged.frota_anterior;
+      delete merged.horas_extras_anterior;
+      delete merged.pagamento_anterior;
+      delete merged.injustica_anterior;
+    }
+
     const posQ = await getNextPosVinculosQuestion(projetoId, merged, posFase);
     if (posQ === undefined) {
       if (!merged.interesse) {

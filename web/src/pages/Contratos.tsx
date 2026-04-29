@@ -28,6 +28,9 @@ export default function Contratos() {
   const { data: tomadores } = trpc.tomador.listar.useQuery({});
   const [form, setForm] = useState<any>(null);
 
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkMetodo, setBulkMetodo] = useState<string>("BOLETO");
+
   const [cobForm, setCobForm] = useState<{ contratoId: string; diaVencimento: number; metodo: "PIX" | "BOLETO" | "AMBOS" } | null>(null);
   const [cobVencimento, setCobVencimento] = useState("");
   const [cobEnviarEmail, setCobEnviarEmail] = useState(true);
@@ -37,6 +40,14 @@ export default function Contratos() {
   const atualizar    = trpc.contrato.atualizar.useMutation({ onSuccess: () => { utils.contrato.listar.invalidate(); setForm(null); } });
   const toggleTipo   = trpc.contrato.atualizar.useMutation({ onSuccess: () => utils.contrato.listar.invalidate() });
   const excluir  = trpc.contrato.excluir.useMutation({ onSuccess: () => utils.contrato.listar.invalidate() });
+  const atualizarEmMassa = trpc.contrato.atualizarMetodoEmMassa.useMutation({
+    onSuccess: (res) => {
+      utils.contrato.listar.invalidate();
+      setSelectedIds(new Set());
+      alert(`${res.count} contrato(s) atualizado(s).`);
+    },
+    onError: (e) => alert(`Erro: ${e.message}`),
+  });
   const emitir   = trpc.nota.emitir.useMutation({
     onSuccess: () => { alert("NFS-e emitida com sucesso!"); utils.nota.listar.invalidate(); },
     onError: (e) => alert(`Erro: ${e.message}`),
@@ -115,11 +126,71 @@ export default function Contratos() {
         </div>
       )}
 
+      {/* Barra de ações em massa */}
+      {selectedIds.size > 0 && (
+        <div className="mb-4 flex items-center gap-3 bg-brand-50 border border-brand-200 rounded-xl px-4 py-3">
+          <span className="text-sm font-medium text-brand-700">{selectedIds.size} selecionado(s)</span>
+          <span className="text-gray-400">·</span>
+          <span className="text-xs text-gray-600">Mudar método para:</span>
+          <select
+            value={bulkMetodo}
+            onChange={e => setBulkMetodo(e.target.value)}
+            className="border border-gray-200 rounded-lg px-2 py-1 text-sm bg-white"
+          >
+            <option value="BOLETO">Apenas Boleto</option>
+            <option value="PIX">Apenas PIX</option>
+            <option value="PIX_BOLETO">PIX + Boleto</option>
+            <option value="NENHUM">Sem cobrança</option>
+          </select>
+          <button
+            onClick={() => {
+              if (confirm(`Alterar método de cobrança de ${selectedIds.size} contrato(s)?`))
+                atualizarEmMassa.mutate({ ids: Array.from(selectedIds), metodoCobr: bulkMetodo as any });
+            }}
+            disabled={atualizarEmMassa.isPending}
+            className="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5 rounded-lg disabled:opacity-50"
+          >
+            {atualizarEmMassa.isPending ? "Salvando..." : "Aplicar"}
+          </button>
+          <button onClick={() => setSelectedIds(new Set())} className="text-sm text-gray-500 hover:text-gray-700 ml-auto">Desmarcar todos</button>
+        </div>
+      )}
+
       <div className="space-y-3">
+        {/* Cabeçalho selecionar todos */}
+        {contratos && contratos.length > 0 && (
+          <div className="flex items-center gap-2 px-1 mb-1">
+            <input
+              type="checkbox"
+              className="w-4 h-4 rounded accent-brand-600"
+              checked={contratos.length > 0 && selectedIds.size === contratos.length}
+              onChange={e => {
+                if (e.target.checked) setSelectedIds(new Set(contratos.map(c => c.id)));
+                else setSelectedIds(new Set());
+              }}
+            />
+            <span className="text-xs text-gray-500">Selecionar todos ({contratos.length})</span>
+          </div>
+        )}
         {contratos?.map((c) => {
           const metodoCobr = (c as any).metodoCobr ?? "PIX_BOLETO";
+          const isSelected = selectedIds.has(c.id);
           return (
-          <div key={c.id} className={`bg-white border rounded-xl p-5 flex items-start justify-between ${!c.ativo ? "opacity-50" : "border-gray-200"}`}>
+          <div key={c.id} className={`bg-white border rounded-xl p-5 flex items-start justify-between ${!c.ativo ? "opacity-50" : isSelected ? "border-brand-400 ring-1 ring-brand-200" : "border-gray-200"}`}>
+            <div className="flex items-start gap-3 flex-1 min-w-0">
+              <input
+                type="checkbox"
+                className="w-4 h-4 rounded accent-brand-600 mt-1 flex-shrink-0"
+                checked={isSelected}
+                onChange={e => {
+                  setSelectedIds(prev => {
+                    const next = new Set(prev);
+                    if (e.target.checked) next.add(c.id);
+                    else next.delete(c.id);
+                    return next;
+                  });
+                }}
+              />
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <p className="font-semibold text-gray-900 truncate">{c.emitente.nome}</p>
@@ -178,6 +249,7 @@ export default function Contratos() {
                 <button onClick={() => { if (confirm("Suspender contrato? O contrato ficará inativo e não gerará mais NFS-e automática.")) excluir.mutate({ id: c.id }); }}
                   className="text-xs bg-orange-50 hover:bg-orange-100 text-orange-700 px-3 py-1.5 rounded-lg">Suspender</button>
               )}
+            </div>
             </div>
           </div>
           );

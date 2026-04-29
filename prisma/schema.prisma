@@ -267,14 +267,15 @@ model TemplateDocumento {
 }
 
 model DocumentoGerado {
-  id         String            @id @default(cuid())
-  propostaId String
-  templateId String
-  tipo       String
-  titulo     String
-  pdfPath    String?
-  criadoEm   DateTime          @default(now())
-  docxPath   String?
+  id          String            @id @default(cuid())
+  propostaId  String
+  templateId  String
+  tipo        String
+  titulo      String
+  pdfPath     String?
+  docxPath    String?
+  htmlEditado String?
+  criadoEm    DateTime          @default(now())
 
   proposta Proposta          @relation(fields: [propostaId], references: [id])
   template TemplateDocumento @relation(fields: [templateId], references: [id])
@@ -479,6 +480,7 @@ model IaProjeto {
   deals           CrmDeal[]
   provedores      IaLlmProvedor[]
   notificacoes    IaNotificacaoEvento[]
+  notificacaoLogs IaNotificacaoLog[]
   projetoUsuarios IaProjetoUsuario[]
   vinculoFlow     IaVinculoFlowPasso[]
   flowSteps       IaFlowStep[]
@@ -830,6 +832,19 @@ model IaNotificacaoEvento {
   mensagem  String
   ativo     Boolean  @default(true)
   criadoEm  DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaNotificacaoLog {
+  id        String   @id @default(cuid())
+  projetoId String
+  dealId    String?
+  evento    String
+  destino   String
+  mensagem  String   @db.Text
+  nomeLead  String?
+  enviadaEm DateTime @default(now())
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 }

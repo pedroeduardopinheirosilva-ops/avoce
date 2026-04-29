@@ -8,6 +8,33 @@ import { callLlm } from "./llm.js";
 import { isHumanized } from "./humanizer.js";
 import { getEvolutionConfig, sendHumanized, limparResposta, sendAudioIfConfigured, dispararNotificacoes } from "./message-handler.js";
 import { buildInstrucaoBase } from "./persona-router.js";
+import { initAdvogadoFlowIfNeeded } from "./flow-controller.js";
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export type PendingAction =
+  | { type: "send_proativa"; dealId: string; phone: string; motivoCron: string; nomeCliente: string; delayMs: number }
+  | { type: "notify"; evento: string; dealId: string };
+
+export type TransitionResult = {
+  transitioned: boolean;
+  pendingActions: PendingAction[];
+};
+
+// ── Instrucao templates ───────────────────────────────────────────────────────
+
+const MOTIVO_INSTRUCAO: Record<string, string> = {
+  primeira_mensagem:
+    "TIPO DE ABORDAGEM: {tipoAbordagem}\n\nEscreva APENAS a primeira mensagem para {nome}. Siga exatamente as instruções de PRIMEIRA MENSAGEM do seu system prompt para o cenário correspondente. Uma mensagem curta e natural de WhatsApp.",
+  timeout_sem_resposta:
+    "O cliente {nome} não respondeu há algum tempo. Envie uma mensagem de seguimento natural, sem pressão.",
+  closer_tentativa_1:
+    "Você é a Dra. Daniela Pires. O cliente {nome} parou de responder. Envie o lembrete sobre prescrição trabalhista (2 anos). Seja conciso e direto.",
+  closer_tentativa_2:
+    "Você é a Dra. Daniela Pires. Segunda e última tentativa com {nome}. Mencione valores que costumamos recuperar e que não há custo antecipado.",
+  solicitar_documentos:
+    "O cliente {nome} confirmou interesse. Solicite a CNH frente de forma natural e humana para dar início ao processo.",
+};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Stage transitions
@@ -18,9 +45,11 @@ export async function transitionDeal(
   dealId: string,
   condicao: string,
   phone?: string
-): Promise<boolean> {
+): Promise<TransitionResult> {
+  const NO_TRANSITION: TransitionResult = { transitioned: false, pendingActions: [] };
+
   const deal = await prisma.crmDeal.findUnique({ where: { id: dealId } });
-  if (!deal) return false;
+  if (!deal) return NO_TRANSITION;
 
   const stageAtual = deal.iaStageChave;
 
@@ -29,13 +58,13 @@ export async function transitionDeal(
     orderBy: { ordem: "asc" },
   });
 
-  if (!regra) return false;
+  if (!regra) return NO_TRANSITION;
 
   const novaFase = await prisma.iaFaseFunil.findUnique({
     where: { projetoId_chave: { projetoId, chave: regra.stageDestinoChave } },
   });
 
-  if (!novaFase) return false;
+  if (!novaFase) return NO_TRANSITION;
 
   let newStageId = deal.stageId;
   if (novaFase.pipelineId) {
@@ -70,38 +99,24 @@ export async function transitionDeal(
 
   console.log(`[StageEngine] Deal ${dealId}: ${stageAtual} → ${regra.stageDestinoChave} (${condicao})`);
 
-  {
-    const contatoNotif = await prisma.crmContato.findFirst({ where: { deals: { some: { id: dealId } } } });
-    const qual = (deal.qualificacao as Record<string, unknown>) ?? {};
-    dispararNotificacoes(projetoId, `stage_entrada:${regra.stageDestinoChave}`, {
-      nome:     String(contatoNotif?.nome ?? ""),
-      cidade:   String(qual.cidade ?? ""),
-      telefone: contatoNotif?.whatsapp ?? "",
-      stage:    regra.stageDestinoChave,
-    }).catch(() => {});
-  }
+  const pendingActions: PendingAction[] = [
+    { type: "notify", evento: `stage_entrada:${regra.stageDestinoChave}`, dealId },
+  ];
 
-  if (!regra.acaoAdicional) return false;
+  if (!regra.acaoAdicional) return { transitioned: false, pendingActions };
 
   if (regra.acaoAdicional.startsWith("trocar_persona:")) {
     if (phone) {
       const contatoTroca = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
       const nomeTroca = contatoTroca?.nome ?? "cliente";
-      const DELAY_PERSONA_MS = 45_000; // 45 seconds — feels like Daniela was just notified
       console.log(`[StageEngine] Deal ${dealId}: intro da nova persona agendada em 45s`);
-      setTimeout(async () => {
-        try {
-          await enviarMensagemProativa(projetoId, dealId, phone, "primeira_mensagem", nomeTroca);
-        } catch (err) {
-          console.warn(`[StageEngine] Falha ao enviar intro de persona (será recuperada pelo cron): ${err instanceof Error ? err.message : err}`);
-        }
-      }, DELAY_PERSONA_MS);
-      return true;
+      pendingActions.push({ type: "send_proativa", dealId, phone, motivoCron: "primeira_mensagem", nomeCliente: nomeTroca, delayMs: 45_000 });
+      return { transitioned: true, pendingActions };
     }
-    return false;
+    return { transitioned: false, pendingActions };
   }
 
-  if (!phone) return false;
+  if (!phone) return { transitioned: false, pendingActions };
 
   const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
   const nomeCliente = contato?.nome ?? "cliente";
@@ -111,7 +126,7 @@ export async function transitionDeal(
   if (acao === "solicitar_documentos") {
     await prisma.crmDeal.update({ where: { id: dealId }, data: { iaPersonaChave: novaPersona } });
     await enviarMensagemProativa(projetoId, dealId, phone, "solicitar_documentos", nomeCliente);
-    return true;
+    return { transitioned: true, pendingActions };
   }
 
   if (acao === "criar_deal_processual") {
@@ -132,10 +147,10 @@ export async function transitionDeal(
         },
       });
     }
-    return true;
+    return { transitioned: true, pendingActions };
   }
 
-  return false;
+  return { transitioned: false, pendingActions };
 }
 
 export async function checkTransitions(
@@ -144,7 +159,9 @@ export async function checkTransitions(
   stageAtual: string,
   clienteText: string,
   phone: string
-): Promise<boolean> {
+): Promise<TransitionResult> {
+  const NO_TRANSITION: TransitionResult = { transitioned: false, pendingActions: [] };
+
   if (stageAtual === "lead_sem_resposta" && clienteText) {
     return await transitionDeal(projetoId, dealId, "cliente_respondeu", phone);
   }
@@ -158,7 +175,7 @@ export async function checkTransitions(
     }
   }
 
-  return false;
+  return NO_TRANSITION;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -274,30 +291,20 @@ export async function enviarMensagemProativa(
     const tipoAbordagem = temHistorico ? "reengajamento com histórico" : "novo";
 
     let instrucao = "";
+
     if (motivoCron === "primeira_mensagem" && personaChave === "advogado") {
-      const firstStep = await prisma.iaFlowStep.findFirst({
-        where: { projetoId, personaChave: "advogado", fase: "advogado", ativo: true },
-        orderBy: { ordem: "asc" },
-      });
-      if (firstStep?.pergunta) {
-        mensagem = String(firstStep.pergunta);
-        await prisma.crmDeal.update({
-          where: { id: dealId },
-          data: { iaFlowStepChave: firstStep.chave, iaFlowStepData: {} },
-        });
+      const firstQuestion = await initAdvogadoFlowIfNeeded(projetoId, dealId);
+      if (firstQuestion) {
+        mensagem = firstQuestion;
       } else {
-        instrucao = `TIPO DE ABORDAGEM: ${tipoAbordagem}\n\nEscreva APENAS a primeira mensagem para ${nomeCliente}. Siga exatamente as instruções de PRIMEIRA MENSAGEM do seu system prompt para o cenário correspondente. Uma mensagem curta e natural de WhatsApp.`;
+        instrucao = (MOTIVO_INSTRUCAO.primeira_mensagem ?? "")
+          .replace("{nome}", nomeCliente)
+          .replace("{tipoAbordagem}", tipoAbordagem);
       }
-    } else if (motivoCron === "primeira_mensagem") {
-      instrucao = `TIPO DE ABORDAGEM: ${tipoAbordagem}\n\nEscreva APENAS a primeira mensagem para ${nomeCliente}. Siga exatamente as instruções de PRIMEIRA MENSAGEM do seu system prompt para o cenário correspondente. Uma mensagem curta e natural de WhatsApp.`;
-    } else if (motivoCron === "timeout_sem_resposta") {
-      instrucao = `O cliente ${nomeCliente} não respondeu há algum tempo. Envie uma mensagem de seguimento natural, sem pressão.`;
-    } else if (motivoCron === "closer_tentativa_1") {
-      instrucao = `Você é a Dra. Daniela Pires. O cliente ${nomeCliente} parou de responder. Envie o lembrete sobre prescrição trabalhista (2 anos). Seja conciso e direto.`;
-    } else if (motivoCron === "closer_tentativa_2") {
-      instrucao = `Você é a Dra. Daniela Pires. Segunda e última tentativa com ${nomeCliente}. Mencione valores que costumamos recuperar e que não há custo antecipado.`;
-    } else if (motivoCron === "solicitar_documentos") {
-      instrucao = `O cliente ${nomeCliente} confirmou interesse. Solicite a CNH frente de forma natural e humana para dar início ao processo.`;
+    } else {
+      instrucao = (MOTIVO_INSTRUCAO[motivoCron] ?? "")
+        .replace(/{nome}/g, nomeCliente)
+        .replace("{tipoAbordagem}", tipoAbordagem);
     }
 
     if (!mensagem && instrucao) {

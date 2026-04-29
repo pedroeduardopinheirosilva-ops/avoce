@@ -27,16 +27,21 @@ export function buildHandoffSnapshot(merged: Record<string, unknown>): string {
         `  ${i + 1}. Empresa: ${v.empresa ?? "?"}`,
         `     Função: ${v.funcao ?? "?"}`,
         `     Vínculo: ${v.vinculo ?? "?"}`,
+        v.tempo ? `     Tempo: ${v.tempo}` : null,
         v.tempo_servico
           ? `     Período: ${v.tempo_servico}`
           : (v.data_admissao ? `     Período: ${v.data_admissao} a ${v.data_saida ?? "atual"}` : null),
         v.saida ? `     Saída: ${v.saida}` : null,
         v.modalidade_saida ? `     Modalidade: ${v.modalidade_saida}` : null,
         v.salario_total_declarado ? `     Salário declarado: R$ ${Number(v.salario_total_declarado).toLocaleString("pt-BR")}` : null,
-        v.horas_extras === false ? `     Horas extras: dentro do normal` :
-        v.horas_extras === true ? `     Horas extras: trabalhava além do limite` : null,
-        v.pagamento_fora ? `     Pagamento por fora: SIM` : null,
+        v.horas_extras === false || v.horas_extras === "não" || v.horas_extras === "nao"
+          ? `     Horas extras: dentro do normal`
+          : (v.horas_extras ? `     Horas extras: SIM — ${v.horas_extras}` : null),
+        v.pagamento_fora === false || v.pagamento_fora === "não" || v.pagamento_fora === "nao"
+          ? null
+          : (v.pagamento_fora ? `     Pagamento por fora: SIM — ${v.pagamento_fora}` : null),
         v.injustica ? `     Irregularidade: ${v.injustica}` : null,
+        v.frota ? `     Frota da empresa: ${v.frota}` : null,
       ].filter(Boolean);
       fatos.push(linhas.join("\n"));
     });

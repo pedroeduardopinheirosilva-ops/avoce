@@ -249,20 +249,65 @@ export async function dispararNotificacoes(
   evento: string,
   dados: Record<string, string>
 ): Promise<void> {
+  console.log(`[Notificação] evento="${evento}" projetoId=${projetoId}`);
   const notifs = await prisma.iaNotificacaoEvento.findMany({
     where: { projetoId, evento, ativo: true },
   });
-  if (!notifs.length) return;
+  if (!notifs.length) {
+    console.log(`[Notificação] nenhuma notif configurada para evento="${evento}"`);
+    return;
+  }
 
   const evoConfig = await getEvolutionConfig(projetoId);
-  if (!evoConfig) return;
+  if (!evoConfig) {
+    console.log(`[Notificação] evoConfig null — Evolution não configurado para projetoId=${projetoId}`);
+    return;
+  }
 
   for (const notif of notifs) {
     try {
       const texto = notif.mensagem.replace(/\{\{(\w+)\}\}/g, (_, k) => dados[k] ?? "");
+      console.log(`[Notificação] enviando para ${notif.destino} (${texto.length} chars)`);
       await sendText(evoConfig, notif.destino, texto);
+      console.log(`[Notificação] enviado OK para ${notif.destino}`);
+      prisma.iaNotificacaoLog.create({
+        data: {
+          projetoId,
+          dealId: dados.dealId || null,
+          evento,
+          destino: notif.destino,
+          mensagem: texto,
+          nomeLead: dados.nome || null,
+        },
+      }).catch(() => {});
     } catch (err) {
       console.error(`[Notificação] Falha ao enviar para ${notif.destino}:`, err);
     }
   }
+}
+
+const DEFAULT_LIGACAO_PALAVRAS = "me liga,pode ligar,ligue pra mim,ligue para mim,quero ligacao,quero uma ligacao,preciso de ligacao,prefiro falar por telefone,falar por telefone,quando voces ligam,quando vocês ligam,aguardando a ligacao,espero a ligacao,manda o telefone,qual o telefone,numero de telefone";
+
+export async function checkAndNotifySolicitaLigacao(
+  projetoId: string,
+  dealId: string,
+  merged: Record<string, unknown>,
+  text: string,
+  phone: string,
+  stageChave: string,
+): Promise<{ notificado: boolean; timestamp?: string }> {
+  let config = await prisma.iaProjetoConfig.findFirst({ where: { projetoId, categoria: "comportamento", chave: "solicita_ligacao_palavras" } });
+  if (!config) config = await prisma.iaProjetoConfig.create({ data: { projetoId, categoria: "comportamento", chave: "solicita_ligacao_palavras", valor: DEFAULT_LIGACAO_PALAVRAS } }).catch(() => null);
+  const palavras = (config?.valor ?? DEFAULT_LIGACAO_PALAVRAS).split(",").map(p => p.trim()).filter(Boolean);
+  const norm = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
+  if (!palavras.some(p => norm(text).includes(norm(p)))) return { notificado: false };
+  const ultimaNotif = merged._notif_ligacao_at as string | undefined;
+  if (ultimaNotif && (Date.now() - new Date(ultimaNotif).getTime() < 2 * 60 * 60 * 1000)) return { notificado: false };
+  dispararNotificacoes(projetoId, "solicita_ligacao", {
+    nome: String(merged.nome ?? ""), telefone: phone, stage: stageChave, mensagem: text,
+    empresa: String(merged.empresa_recente ?? (Array.isArray(merged.vinculos) && (merged.vinculos as any[])[0]?.empresa) ?? ""),
+    cidade: String(merged.cidade ?? ""),
+  }).catch(() => {});
+  console.log(`[StageEngine] Cliente ${phone} pediu ligação — notificação disparada`);
+  return { notificado: true, timestamp: new Date().toISOString() };
 }

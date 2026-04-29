@@ -57,8 +57,22 @@ const fmt = (v: number) =>
 
 function parseDateSafe(str?: string): Date | null {
   if (!str) return null;
-  const d = new Date(str);
-  return isNaN(d.getTime()) ? null : d;
+  // ISO format
+  let d = new Date(str);
+  if (!isNaN(d.getTime())) return d;
+  // Brazilian DD/MM/YYYY
+  const br = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (br) {
+    d = new Date(`${br[3]}-${br[2].padStart(2, "0")}-${br[1].padStart(2, "0")}`);
+    if (!isNaN(d.getTime())) return d;
+  }
+  // MM/YYYY
+  const mmyyyy = str.match(/^(\d{1,2})\/(\d{4})$/);
+  if (mmyyyy) {
+    d = new Date(`${mmyyyy[2]}-${mmyyyy[1].padStart(2, "0")}-01`);
+    if (!isNaN(d.getTime())) return d;
+  }
+  return null;
 }
 
 function mesesEntre(inicio: Date, fim: Date): number {
@@ -276,22 +290,42 @@ export function calcularValorCausa(
 
     vinculosConsiderados++;
 
-    // Período de cálculo
+    // Período de cálculo — com corte quinquenal correto (Art. 11 CLT)
+    // A retroatividade é de 5 anos A PARTIR DE HOJE, não da duração total do contrato.
+    // Fórmula: recuperável = min(tempo_total, 60_meses) - max(0, meses_desde_saída)
     let meses: number;
-    if (dataAdmissao && dataSaida) {
-      meses = mesesEntre(dataAdmissao, dataSaida);
-      // Prescrição parcial: truncar em 5 anos se admissão > 5 anos atrás
+    const JANELA_MESES = 60; // 5 anos
+    const dataCortePrescricao = new Date(dataReferencia.getTime() - JANELA_MESES * 30.4375 * 24 * 60 * 60 * 1000);
+
+    if (dataSaida) {
+      const mesesDesde = Math.max(0,
+        (dataReferencia.getTime() - dataSaida.getTime()) / (30.4375 * 24 * 60 * 60 * 1000)
+      );
+      // Determine start of employment
+      let inicioEmprego: Date;
       if (dataAdmissao) {
-        const anosAdmissao = (dataReferencia.getTime() - dataAdmissao.getTime()) / (1000 * 60 * 60 * 24 * 365);
-        if (anosAdmissao > 5) {
-          const mesesMax = 60; // 5 anos
-          meses = Math.min(meses, mesesMax);
-          observacoes.push(`${v.empresa}: período truncado em 5 anos por prescrição parcial`);
-        }
+        inicioEmprego = dataAdmissao;
+      } else if (v.tempo_meses_estimado) {
+        inicioEmprego = new Date(dataSaida.getTime() - v.tempo_meses_estimado * 30.4375 * 24 * 60 * 60 * 1000);
+      } else {
+        // Unknown start — use cutoff as start (conservative)
+        inicioEmprego = dataCortePrescricao;
+      }
+      // Recoverable window: overlap of [inicio, saida] with [hoje-5anos, hoje]
+      const inicioRecuperavel = inicioEmprego > dataCortePrescricao ? inicioEmprego : dataCortePrescricao;
+      meses = Math.max(0, mesesEntre(inicioRecuperavel, dataSaida));
+      const mesesTotais = v.tempo_meses_estimado ?? mesesEntre(inicioEmprego, dataSaida);
+      if (meses < mesesTotais - 1) {
+        observacoes.push(
+          `${v.empresa}: prescrição quinquenal — recuperável ${Math.round(meses)} meses de ${Math.round(mesesTotais)} trabalhados`
+        );
       }
     } else if (v.tempo_meses_estimado) {
-      meses = v.tempo_meses_estimado;
-      observacoes.push(`${v.empresa}: período estimado pelo cliente (sem datas exatas)`);
+      // No departure date — use raw duration capped at 60 months.
+      // Cannot apply the "meses_desde_saída" correction without knowing when they left.
+      // This is a known limitation: value will be overestimated if they left long ago.
+      meses = Math.min(v.tempo_meses_estimado, JANELA_MESES);
+      observacoes.push(`${v.empresa}: data de saída não informada — valor pode estar superestimado`);
     } else {
       meses = 12; // fallback conservador
       observacoes.push(`${v.empresa}: período desconhecido — usando 12 meses para estimativa`);

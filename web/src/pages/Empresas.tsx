@@ -115,17 +115,18 @@ export default function Empresas() {
         headers: { Authorization: `Bearer ${localStorage.getItem("avoce_token")}` },
         body: fd,
       });
-      const j = await r.json();
+      let j: any = {};
+      try { j = await r.json(); } catch { j = { error: `HTTP ${r.status}` }; }
       if (j.ok) {
         setTimbradoMsg({ ok: true, msg: "✅ Timbrado salvo com sucesso" });
         utils.empresa.listar.invalidate();
         setTimbradoFile(null);
         if (timbradoRef.current) timbradoRef.current.value = "";
       } else {
-        setTimbradoMsg({ ok: false, msg: `❌ ${j.error}` });
+        setTimbradoMsg({ ok: false, msg: `❌ ${j.error ?? `HTTP ${r.status}`}` });
       }
-    } catch {
-      setTimbradoMsg({ ok: false, msg: "❌ Erro ao enviar timbrado" });
+    } catch (err: any) {
+      setTimbradoMsg({ ok: false, msg: `❌ ${err?.message ?? "Erro ao enviar timbrado"}` });
     } finally {
       setTimbradoUploading(false);
     }

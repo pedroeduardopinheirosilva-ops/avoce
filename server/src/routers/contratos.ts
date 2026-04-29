@@ -96,4 +96,17 @@ export const contratoRouter = router({
         data:  { ativo: false },
       });
     }),
+
+  atualizarMetodoEmMassa: authProc
+    .input(z.object({
+      ids:        z.array(z.string()).min(1),
+      metodoCobr: z.enum(["PIX_BOLETO", "PIX", "BOLETO", "NENHUM", "ALVARA"]),
+    }))
+    .mutation(async ({ input }) => {
+      const result = await prisma.contrato.updateMany({
+        where: { id: { in: input.ids } },
+        data:  { metodoCobr: input.metodoCobr },
+      });
+      return { count: result.count };
+    }),
 });
