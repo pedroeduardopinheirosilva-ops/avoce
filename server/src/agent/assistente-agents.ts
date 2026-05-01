@@ -68,7 +68,8 @@ export async function runAssistenteAgent(ctx: AgentContext): Promise<AgentResult
   );
 
   // All phases complete → signal transition to Daniela
-  if (!nextQ && ctx.merged._vinculos_ok === true) {
+  // vinculosOk (in-memory state) is the source of truth; _vinculos_ok (DB) may lag
+  if (!nextQ && (ctx.merged._vinculos_ok === true || ctx.vinculosOk)) {
     return {
       deterministicQuestion: null,
       systemInstructions: buildResumoEncerramento(ctx.vinculos),
@@ -187,7 +188,7 @@ function buildResumoInstructions(
     `AGENTE RESUMO — Vínculos completos (${vinculos.length} empresa(s): ${empresas}).`,
     `Agora: responda a pergunta pendente do fluxo (ver abaixo) de forma natural.`,
     `NÃO pergunte mais sobre empregos — essa fase já encerrou.`,
-    `Quando não houver mais perguntas, encerre brevemente e passe para a Dra. Daniela (máx 2 frases).`,
+    `Faça APENAS a próxima pergunta indicada abaixo. NÃO anuncie encerramento nem handoff para outra pessoa — o sistema controla isso.`,
   ].join("\n");
 }
 

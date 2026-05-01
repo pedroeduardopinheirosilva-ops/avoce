@@ -7,6 +7,20 @@ import type { VinculoEmprego } from "./types.js";
 
 export type SyncResult = { vinculos: VinculoEmprego[]; changed: boolean };
 
+// ── BR number parser ──────────────────────────────────────────────────────────
+// Handles "2.000", "1.500,50", "R$ 3.200", 2000 (already number), null → 0
+
+export function parseBrNumber(val: unknown): number {
+  if (typeof val === "number") return val;
+  if (!val) return 0;
+  // Strip currency prefix, thousand-dots, convert decimal comma
+  const cleaned = String(val)
+    .replace(/[^\d,.-]/g, "")   // keep only digits, comma, dot, minus
+    .replace(/\.(?=\d{3}(?:[,]|$))/g, "") // remove thousand-separator dots
+    .replace(",", ".");          // convert decimal comma to dot
+  return Number(cleaned) || 0;
+}
+
 // ── CPF validation ────────────────────────────────────────────────────────────
 
 export function validarCPF(cpf: string): boolean {

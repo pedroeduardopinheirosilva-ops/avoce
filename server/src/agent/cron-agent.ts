@@ -86,6 +86,39 @@ export async function processarTimeoutsAgente(): Promise<void> {
         }
         break;
       }
+
+      // ── Timed follow-up rules (follow_up_timed) ────────────────────────────
+      // Same-stage follow-ups at configurable intervals. Tracked via _follow_ups_enviados
+      // in qualificacao. Does NOT update ultimoContatoEm so the timer keeps running.
+      const timedRules = await prisma.iaRegraTransicao.findMany({
+        where: { projetoId, stageOrigemChave: stageChave, condicao: "follow_up_timed" },
+        orderBy: { ordem: "asc" },
+      });
+
+      if (timedRules.length > 0) {
+        const qualif = ((deal as any).qualificacao as Record<string, unknown>) ?? {};
+        const enviados: string[] = Array.isArray(qualif._follow_ups_enviados)
+          ? (qualif._follow_ups_enviados as string[])
+          : [];
+
+        for (const rule of timedRules) {
+          const delayHoras = (rule.parametros as any)?.delayHoras ?? 24;
+          if (horasSemContato < delayHoras) continue;
+
+          const motive = rule.acaoAdicional ?? "";
+          if (!motive || enviados.includes(motive)) continue;
+
+          await enviarMensagemProativa(projetoId, deal.id, phone, motive, deal.contato?.nome ?? "");
+          await prisma.crmDeal.update({
+            where: { id: deal.id },
+            data: {
+              qualificacao: { ...(qualif as object), _follow_ups_enviados: [...enviados, motive] } as any,
+            },
+          });
+          console.log(`[CronAgent] Deal ${deal.id}: follow-up "${motive}" enviado (${horasSemContato.toFixed(1)}h)`);
+          break;
+        }
+      }
     } catch (err) {
       console.error(`[CronAgent] Erro deal ${deal.id}:`, err);
     }
@@ -202,6 +235,13 @@ export async function recuperarMensagensPerdidas(): Promise<void> {
       if (idadeMs < limiteMs) continue;
       // Don't retry messages older than 4 hours (stale)
       if (idadeMs > 4 * 60 * 60 * 1000) continue;
+      // Skip if gate step returned silence — waiting for human response, no LLM loop
+      const gateStepSilenciado =
+        ((deal.iaFlowStepData ?? {}) as Record<string, unknown>)._gate_silenciado === true;
+      if (gateStepSilenciado) {
+        console.log(`[CronAgent] Deal ${deal.id}: gate silenciado — aguardando resposta humana`);
+        continue;
+      }
 
       console.log(`[CronAgent] Mensagem perdida detectada — deal ${deal.id} (${Math.round(idadeMs / 60000)}min sem resposta) → recuperando`);
       await respondFromDealState(deal.projetoId, deal.id, deal.contato.whatsapp);

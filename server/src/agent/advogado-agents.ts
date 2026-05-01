@@ -104,7 +104,31 @@ function buildAutoridadeInstructions(ctx: AdvogadoAgentContext): string {
       `- Cite artigos reais específicos do caso: horas extras não pagas → art. 59 CLT + Súmula 264 TST; pagamento por fora da folha → art. 457 CLT; rescisão indireta → art. 483 CLT; FGTS não depositado → Lei 8.036/90.`,
       `- Use os nomes reais das empresas e irregularidades informadas pelo cliente.`,
       `- Máximo 4 frases curtas. Linguagem de WhatsApp.`,
-      `- Termine perguntando: "Faz sentido prosseguir?"`,
+      `- NÃO termine com pergunta — o lead já confirmou interesse. Encerre afirmando que vai calcular o valor.`,
+    );
+  } else if (iaFlowStepChave === "valor_estimado") {
+    base.push(
+      ``,
+      `⚠️ VOCÊ ESTÁ NO PASSO DO VALOR ESTIMADO. CALCULE E APRESENTE O RANGE AGORA.`,
+      `PROIBIDO fazer qualquer pergunta neste momento. NÃO peça datas, nomes de empresas ou qualquer dado adicional.`,
+      `REGRAS OBRIGATÓRIAS DO VALOR ESTIMADO:`,
+      `- Calcule para CADA vínculo/empresa separadamente. Os vínculos são: ${vinculoDesc || "ver dados coletados"}.`,
+      `- Para cada vínculo informe: nome da empresa, período trabalhado e o range estimado (R$ X a R$ Y).`,
+      `- Ao final, some todos os vínculos e apresente o TOTAL estimado.`,
+      `- Se faltar algum dado de um vínculo, use o tempo aproximado declarado e sinalize que é estimativa preliminar.`,
+      `- Mencione brevemente as verbas: horas extras, FGTS, férias + 13º proporcional, reflexos do salário por fora.`,
+      `- NÃO peça confirmação de dados. NÃO faça perguntas. Encerre com transição natural para o próximo passo.`,
+    );
+  } else if (iaFlowStepChave === "contorno_objecao") {
+    base.push(
+      ``,
+      `⚠️ VOCÊ ESTÁ NO PASSO DE CONTORNO DE OBJEÇÃO. O LEAD HESITOU OU DISSE NÃO.`,
+      `PROIBIDO encerrar a conversa ou dizer "até mais". NÃO desista.`,
+      `REGRAS OBRIGATÓRIAS:`,
+      `- Valide a preocupação com empatia em 1 frase curta.`,
+      `- Reforce o modelo de sucesso: zero custo adiantado, só cobramos se ganhar, sem risco para o cliente.`,
+      `- Se o valor estimado ainda não foi mencionado, apresente o range agora.`,
+      `- Encerre com uma pergunta simples de fechamento: "Quer pelo menos ver quanto pode receber?".`,
     );
   } else {
     base.push(
@@ -122,7 +146,7 @@ function buildColetaInstructions(ctx: AdvogadoAgentContext): string {
   const { iaFlowStepChave, merged } = ctx;
   const nomeCliente = String(merged.nome ?? "cliente");
 
-  return [
+  const lines = [
     `AGENTE DE COLETA — Dra. Daniela Pires`,
     `Fase: coletar dados pessoais para formalizar o contrato e a procuração.`,
     ``,
@@ -135,5 +159,25 @@ function buildColetaInstructions(ctx: AdvogadoAgentContext): string {
     `- Confirme os dados que o cliente informar (ex: "Perfeito, anota aqui: CPF 000.000.000-00. Correto?").`,
     `- Step atual: ${iaFlowStepChave ?? "início"}. Dados de ${nomeCliente} sendo coletados.`,
     `- Quando todos os dados estiverem prontos, o contrato será gerado automaticamente — NÃO mencione isso antes.`,
-  ].join("\n");
+  ];
+
+  // Inject structured identity values when available so LLM doesn't re-derive them from raw OCR text
+  const cpf = merged.cpf;
+  const rg  = merged.rg;
+  const nomeCompleto = merged.nome_completo ?? merged.nome;
+  const dataNascimento = merged.data_nascimento;
+  if (cpf || rg) {
+    const dadosLines = [
+      ``,
+      `DADOS JÁ VERIFICADOS DO SISTEMA (USE ESTES EXATOS, NÃO O TEXTO BRUTO DO DOCUMENTO):`,
+    ];
+    if (cpf)            dadosLines.push(`- CPF: ${cpf}`);
+    if (rg)             dadosLines.push(`- RG: ${rg}`);
+    if (nomeCompleto)   dadosLines.push(`- Nome completo: ${nomeCompleto}`);
+    if (dataNascimento) dadosLines.push(`- Data de nascimento: ${dataNascimento}`);
+    dadosLines.push(`NUNCA confirme valores diferentes destes ao cliente.`);
+    lines.push(...dadosLines);
+  }
+
+  return lines.join("\n");
 }

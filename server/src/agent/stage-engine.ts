@@ -29,6 +29,8 @@ import {
 import { type EvolutionWebhookMessage } from "./webhook-parser.js";
 import { normalizeInput } from "./media-processor.js";
 import { processVinculos } from "./vinculos-processor.js";
+import { getModoColeta, applyConversacionalMode } from "./conversational-dispatch.js";
+export { applyConversacionalMode } from "./conversational-dispatch.js";
 import { applyDocJsonToMerged } from "./doc-extractor.js";
 import { buildSystemPrompt } from "./system-prompt-builder.js";
 export type { EvolutionWebhookMessage } from "./webhook-parser.js";
@@ -208,6 +210,24 @@ async function dedupAndSend(
   return true;
 }
 
+// Deduplicates send_proativa actions by dealId before scheduling to prevent
+// double-sending when both transitionDeal and checkTransitions return actions.
+function scheduleProativasDeduped(
+  actions: import("./transition-engine.js").PendingAction[],
+  projetoId: string,
+): void {
+  const scheduled = new Set<string>();
+  for (const a of actions) {
+    if (a.type !== "send_proativa") continue;
+    if (scheduled.has(a.dealId)) {
+      console.log(`[StageEngine] Dedup proativa: dealId=${a.dealId} motivo=${a.motivoCron} — já agendado`);
+      continue;
+    }
+    scheduled.add(a.dealId);
+    setTimeout(() => enviarMensagemProativa(projetoId, a.dealId, a.phone, a.motivoCron, a.nomeCliente).catch(() => {}), a.delayMs);
+  }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point — called by webhook
 // ──────────────────────────────────────────────────────────────────────────────
@@ -300,8 +320,10 @@ export async function processIncomingMessage(
   }
 
   // B8: value trigger (Daniela + minimum data available)
-  if (text && personaChave === "advogado" && isAskingValue(msgNorm) && temDadosMinimosCalculo(merged)) {
-    const calculo  = calcularValorCausa(extractVinculosFromMerged(merged));
+  // Merge iaFlowStepData so salary/jornada collected by Daniela's flow steps are visible to calculator
+  const mergedComFlow = { ...merged, ...((deal as any).iaFlowStepData as Record<string, unknown> ?? {}) };
+  if (text && personaChave === "advogado" && isAskingValue(msgNorm) && temDadosMinimosCalculo(mergedComFlow)) {
+    const calculo  = calcularValorCausa(extractVinculosFromMerged(mergedComFlow));
     const injecao  = buildValueResponseInjection(calculo, detectarFaseAtualDaniela(deal));
     const instrBase = buildInstrucaoBase();
     const baseSys  = persona.systemPrompt.replace("{INSTRUÇÃO BASE}", instrBase).replace(/\{nome_persona\}/g, persona.nomeExibicao);
@@ -351,7 +373,9 @@ export async function processIncomingMessage(
 
   // B9c: vinculos loop
   const ultimaMsgBot       = history.filter(m => m.direcao === "out").slice(-1)[0]?.conteudo ?? "";
-  const maisEmpregosPerguntado = /outro lugar|outra empresa|mais emprego|trabalhou antes|emprego anterior|antes dis[st]/i.test(ultimaMsgBot);
+  const maisEmpregosPerguntado =
+    merged._mais_empregos_perguntado === true ||
+    /outro lugar|outra empresa|mais emprego|trabalhou antes|emprego anterior|antes dis[st]/i.test(ultimaMsgBot);
   const vinculosResult     = await processVinculos({ projetoId, merged, text, history, maisEmpregosPerguntado });
   if (Object.keys(vinculosResult.mergedUpdates).length > 0) {
     merged = { ...merged, ...vinculosResult.mergedUpdates };
@@ -371,22 +395,34 @@ export async function processIncomingMessage(
   let assistenteAgentResult: import("./assistente-agents.js").AgentResult | null = null;
   let advFlowStepType: string | null = null;
   let advFlowNextStepChave: string | null = null;
+  let advFlowCampoColetar: string | null = null;
 
   if (personaChave === "assistente") {
     const { runAssistenteAgent } = await import("./assistente-agents.js");
     assistenteAgentResult = await runAssistenteAgent({ projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount });
     nextQDeterministico   = assistenteAgentResult.deterministicQuestion;
     console.log(`[AssistenteAgent] dealId=${deal.id} phase="${assistenteAgentResult.phase}" nextQ="${nextQDeterministico?.slice(0, 60) ?? "null"}" allDone=${assistenteAgentResult.allDone}`);
+
+    const modoColeta = await getModoColeta(projetoId);
+    const conv = await applyConversacionalMode({
+      modoColeta, personaChave,
+      agentResult: assistenteAgentResult,
+      currentNextQ: nextQDeterministico,
+      convParams: { projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount },
+    });
+    assistenteAgentResult = conv.agentResult as import("./assistente-agents.js").AgentResult;
+    nextQDeterministico   = conv.nextQDeterministico;
   } else if (personaChave === "advogado" && deal.iaAtiva) {
     const { handleAdvogadoFlow } = await import("./flow-controller.js");
     const advFlow = await handleAdvogadoFlow(
       projetoId,
       { id: deal.id, iaFlowStepChave: (deal as any).iaFlowStepChave ?? null, iaFlowStepData: (deal as any).iaFlowStepData ?? null, qualificacao: deal.qualificacao },
-      text ?? "", outgoingCount,
+      text ?? "", outgoingCount, history,
     );
     nextQDeterministico  = advFlow.nextQuestion;
     advFlowStepType      = advFlow.stepType ?? null;
     advFlowNextStepChave = advFlow.nextStepChave ?? null;
+    advFlowCampoColetar  = advFlow.campoColetar ?? null;
   }
 
   const perguntasPendentes = perguntas.filter(p => merged[p.chave] === undefined || merged[p.chave] === null);
@@ -397,22 +433,26 @@ export async function processIncomingMessage(
     const { notificado, timestamp } = await checkAndNotifySolicitaLigacao(projetoId, deal.id, merged, text, phone, stageChave);
     if (notificado && timestamp) {
       merged._notif_ligacao_at = timestamp;
-      prisma.crmDeal.update({ where: { id: deal.id }, data: splitState(merged) }).catch(() => {});
+      await atualizarMergedFlags(deal.id, merged, { _notif_ligacao_at: timestamp });
     }
   }
 
   // B11: build system prompt
   const instrBase = buildInstrucaoBase();
   let valueInjection: string | null = null;
-  if (advFlowNextStepChave === "valor_estimado" && temDadosMinimosCalculo(merged)) {
-    valueInjection = buildValueResponseInjection(calcularValorCausa(extractVinculosFromMerged(merged)), detectarFaseAtualDaniela(deal));
+  if (advFlowNextStepChave === "valor_estimado" && temDadosMinimosCalculo(mergedComFlow)) {
+    valueInjection = buildValueResponseInjection(calcularValorCausa(extractVinculosFromMerged(mergedComFlow)), detectarFaseAtualDaniela(deal));
   }
   let advogadoInstrucoes = "";
   if (personaChave === "advogado") {
     const { runAdvogadoAgent } = await import("./advogado-agents.js");
-    const advResult = await runAdvogadoAgent({ projetoId, iaFlowStepChave: (deal as any).iaFlowStepChave ?? null, merged, vinculos });
+    // Use the step the flow just advanced TO (advFlowNextStepChave), not the stale DB value.
+    // Without this, runAdvogadoAgent generates instructions for the previous step — e.g.
+    // "parecer" instructions when the LLM actually needs to generate "valor_estimado".
+    const effectiveStepChave = advFlowNextStepChave ?? (deal as any).iaFlowStepChave ?? null;
+    const advResult = await runAdvogadoAgent({ projetoId, iaFlowStepChave: effectiveStepChave, merged, vinculos });
     advogadoInstrucoes = advResult.systemInstructions;
-    console.log(`[AdvogadoAgent] dealId=${deal.id} phase="${advResult.phase}" step="${(deal as any).iaFlowStepChave ?? "null"}"`);
+    console.log(`[AdvogadoAgent] dealId=${deal.id} phase="${advResult.phase}" step="${effectiveStepChave ?? "null"}"`);
   }
   const perguntasDeterministicas = perguntasPendentes.slice(0, 2).map(p => `- ${p.perguntaContexto}${p.exemploAbordagem ? ` (ex: ${p.exemploAbordagem})` : ""}`);
   const personaTrocadaEm = (deal as any).iaPersonaTrocadaEm as Date | null | undefined;
@@ -427,10 +467,11 @@ export async function processIncomingMessage(
     personaFase: personaChave === "assistente" ? (assistenteAgentResult?.phase ?? "") : "",
     instrucaoComportamento: persona.systemPrompt, instrucaoBase: instrBase,
     perguntasDeterministicas, camposBloqueados: [],
-    merged, vinculos, vinculosOk, vinculosTodosPrescritos,
+    merged: { ...merged, ...((deal as any).iaFlowStepData as Record<string, unknown> ?? {}) },
+    vinculos, vinculosOk, vinculosTodosPrescritos,
     iaFlowStepChave: (deal as any).iaFlowStepChave ?? null,
     iaFlowStepData: (deal as any).iaFlowStepData as Record<string, unknown> ?? {},
-    documentosEnviados, nextQDeterministico, advFlowStepType, advFlowNextStepChave,
+    documentosEnviados, nextQDeterministico, advFlowStepType, advFlowNextStepChave, advFlowCampoColetar,
     valueInjection, handoffSnapshot: personaChave === "advogado" ? buildHandoffSnapshot(merged) : null,
     frustrationInjection: frustrationHandling?.injectIntoSystemPrompt ?? null,
     outgoingCount, nomeCliente: typeof merged.nome === "string" ? merged.nome : null,
@@ -457,9 +498,11 @@ export async function processIncomingMessage(
     !frustrationHandling?.skipDeterministicOverride;
   if (shouldOverride) {
     resposta = applyDeterministicOverride(resposta, nextQDeterministico!, merged, text, deal.id);
-    if (!merged._saudacao_enviada) { merged._saudacao_enviada = true; prisma.crmDeal.update({ where: { id: deal.id }, data: splitState(merged) }).catch(() => {}); }
   }
-  if (!merged._saudacao_enviada) { merged._saudacao_enviada = true; prisma.crmDeal.update({ where: { id: deal.id }, data: splitState(merged) }).catch(() => {}); }
+  if (!merged._saudacao_enviada) {
+    merged._saudacao_enviada = true;
+    await atualizarMergedFlags(deal.id, merged, { _saudacao_enviada: true });
+  }
 
   // B14: transition logic — allAnswered handoff + stage transitions
   const temVinculoValido = (vinculosOk || vinculos.length > 0) && !vinculosTodosPrescritos;
@@ -477,16 +520,12 @@ export async function processIncomingMessage(
     const qualDados = Object.fromEntries(Object.entries(merged).map(([k, v]) => [k, String(v ?? "")]));
     dispararNotificacoes(projetoId, "qualificacao_completa", { ...qualDados, telefone: phone, stage: stageChave }).catch(() => {});
     const { transitioned: t1, pendingActions: t1Actions } = await transitionDeal(projetoId, deal.id, "qualificacao_completa", phone);
-    for (const a of t1Actions) {
-      if (a.type === "send_proativa") setTimeout(() => enviarMensagemProativa(projetoId, a.dealId, a.phone, a.motivoCron, a.nomeCliente).catch(() => {}), a.delayMs);
-    }
+    scheduleProativasDeduped(t1Actions, projetoId);
     if (t1) return;
     criarPropostaAutomatica(projetoId, deal.id, phone, "qualificacao_completa").catch(() => {});
   }
   const { transitioned, pendingActions: t2Actions } = await checkTransitions(projetoId, deal.id, stageChave, text ?? "", phone);
-  for (const a of t2Actions) {
-    if (a.type === "send_proativa") setTimeout(() => enviarMensagemProativa(projetoId, a.dealId, a.phone, a.motivoCron, a.nomeCliente).catch(() => {}), a.delayMs);
-  }
+  scheduleProativasDeduped(t2Actions, projetoId);
   if (transitioned) return;
 
   // B15: load delays + intercept descarte + dedup + send
@@ -507,9 +546,21 @@ export async function processIncomingMessage(
   if (!sent) return;
 
   // B16: post-send actions
-  // Mark llm_generated flow step as sent so next message advances the step
-  if (advFlowStepType === "llm_generated" && (deal as any).iaFlowStepChave) {
-    const chave = (deal as any).iaFlowStepChave as string;
+  // Set _mais_empregos_perguntado when Ana just sent the mais_empregos question
+  if (personaChave === "assistente" && merged._mais_empregos_perguntado !== true) {
+    const MAIS_EMPREGOS_SENT_RE = /outro lugar|outra empresa|mais emprego|trabalhou antes|emprego anterior/i;
+    if (MAIS_EMPREGOS_SENT_RE.test(textoLimpo)) {
+      merged._mais_empregos_perguntado = true;
+      await persistMergedUpdates(deal.id, merged, { _mais_empregos_perguntado: true });
+    }
+  }
+
+  // Mark llm_generated flow step as sent so next message advances the step.
+  // Use advFlowNextStepChave (the step just advanced to) instead of deal.iaFlowStepChave
+  // (stale start-of-request value) — critical when advancing from parecer→valor_estimado
+  // so valor_estimado_enviado is set, not parecer_enviado again.
+  if (advFlowStepType === "llm_generated" && (advFlowNextStepChave ?? (deal as any).iaFlowStepChave)) {
+    const chave = (advFlowNextStepChave ?? (deal as any).iaFlowStepChave) as string;
     await prisma.crmDeal.update({ where: { id: deal.id }, data: { iaFlowStepData: { ...((deal as any).iaFlowStepData ?? {}), [`${chave}_enviado`]: true } } });
   }
 

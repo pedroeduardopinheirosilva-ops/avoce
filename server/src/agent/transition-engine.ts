@@ -9,6 +9,7 @@ import { isHumanized } from "./humanizer.js";
 import { getEvolutionConfig, sendHumanized, limparResposta, sendAudioIfConfigured, dispararNotificacoes } from "./message-handler.js";
 import { buildInstrucaoBase } from "./persona-router.js";
 import { initAdvogadoFlowIfNeeded } from "./flow-controller.js";
+import { saveFlowStepData } from "./deal-repository.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,16 @@ const MOTIVO_INSTRUCAO: Record<string, string> = {
     "Você é a Dra. Daniela Pires. Segunda e última tentativa com {nome}. Mencione valores que costumamos recuperar e que não há custo antecipado.",
   solicitar_documentos:
     "O cliente {nome} confirmou interesse. Solicite a CNH frente de forma natural e humana para dar início ao processo.",
+  follow_up_docs_1:
+    "O cliente {nome} aceitou o caso e você está aguardando os documentos (CNH, CTPS ou comprovante de endereço). Envie um lembrete amigável e direto: (1) relembre o valor estimado que ele tem a receber, (2) diga que é só mandar a CNH pelo WhatsApp mesmo, (3) ofereça ajuda se tiver dificuldade em tirar a foto. NÃO seja robótico. Máx 3 frases.",
+  follow_up_docs_2:
+    "O cliente {nome} não respondeu ao primeiro lembrete de documentos. Tom mais urgente mas sem pressão: (1) mencione que o processo precisa dos docs para ser protocolado, (2) reforce que quanto antes, melhor (prazo prescricional), (3) pergunte se teve algum problema para mandar. Máx 3 frases.",
+  follow_up_assinatura_1:
+    "O contrato e a procuração de {nome} foram enviados para assinatura digital. Envie lembrete curto: (1) diga que o link de assinatura foi enviado, (2) peça para assinar pelo celular mesmo — é rápido. Máx 2 frases.",
+  follow_up_assinatura_2:
+    "Segunda tentativa de lembrete de assinatura para {nome}. Tom mais direto: (1) mencione que o processo só pode ser protocolado após assinatura, (2) pergunte se teve algum problema com o link e ofereça enviar de novo. Máx 2 frases.",
+  follow_up_retorno:
+    "O cliente {nome} pediu para continuar depois e não retornou. Envie mensagem calorosa lembrando que o caso está pronto: (1) chame pelo nome, (2) mencione o valor estimado brevemente, (3) diga que é só falar para continuar de onde parou. Máx 2 frases. Tom leve, sem pressão.",
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -249,6 +260,24 @@ export async function enviarMensagemProativa(
   const stageChave = deal.iaStageChave ?? "lead_carreteiro";
   const personaChave = deal.iaPersonaChave ?? "assistente";
 
+  // Universal atomic lock: must run BEFORE initAdvogadoFlowIfNeeded, which resets iaFlowStepData
+  // and would wipe any flag written after it. Using $executeRaw ensures only ONE concurrent
+  // caller proceeds — the other sees locked===0 and returns immediately.
+  if (motivoCron === "primeira_mensagem" && personaChave === "advogado") {
+    const flagKey = "apresentacao_enviado";
+    const locked: number = await prisma.$executeRaw`
+      UPDATE "CrmDeal"
+      SET "iaFlowStepData" = COALESCE("iaFlowStepData", '{}'::jsonb)
+        || jsonb_build_object(${flagKey}::text, true::boolean)
+      WHERE id = ${dealId}
+        AND NOT (COALESCE("iaFlowStepData", '{}'::jsonb) ? ${flagKey})
+    `;
+    if (locked === 0) {
+      console.log(`[Proativa] apresentacao já enviada para deal ${dealId} — ignorando`);
+      return;
+    }
+  }
+
   const persona = await prisma.iaPersona.findUnique({
     where: { projetoId_chave: { projetoId, chave: personaChave } },
   });
@@ -293,9 +322,13 @@ export async function enviarMensagemProativa(
     let instrucao = "";
 
     if (motivoCron === "primeira_mensagem" && personaChave === "advogado") {
-      const firstQuestion = await initAdvogadoFlowIfNeeded(projetoId, dealId);
-      if (firstQuestion) {
-        mensagem = firstQuestion;
+      // Lock already acquired above — initAdvogadoFlowIfNeeded is safe to call here.
+      const { message: firstQuestion, firstStepChave } = await initAdvogadoFlowIfNeeded(projetoId, dealId);
+      if (firstQuestion && firstStepChave) {
+        const hBrasilia = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", hour: "numeric", hour12: false });
+        const h = parseInt(hBrasilia, 10);
+        const saudacao = h >= 5 && h < 12 ? "Bom dia" : h >= 12 && h < 18 ? "Boa tarde" : "Boa noite";
+        mensagem = `${saudacao}! Tudo bem? ${firstQuestion}`;
       } else {
         instrucao = (MOTIVO_INSTRUCAO.primeira_mensagem ?? "")
           .replace("{nome}", nomeCliente)

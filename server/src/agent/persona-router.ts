@@ -208,11 +208,18 @@ export async function getNextVinculoQuestion(
   empresasBloqueadas: string[],
 ): Promise<string | null> {
   if (vinculosOk || vinculosTodosPrescritos) return null;
+  if (merged._mais_empregos_negado === true) return null;
 
   const passos = await getFlowPassos(projetoId);
 
   const passosNormais = passos.filter(p => p.tipoEspecial !== "mais_empregos" && p.campoColetar);
   const passoMaisEmpregos = passos.find(p => p.tipoEspecial === "mais_empregos");
+
+  // Fields that are optional for previous employers (ordem > 1).
+  // The lead often ignores these when impatient — don't insist.
+  const CAMPOS_OPCIONAIS_ANTERIOR: Array<keyof VinculoEmprego> = [
+    "horas_extras", "pagamento_fora", "injustica", "frota",
+  ];
 
   if (vinculos.length === 0) {
     const primeiro = passosNormais[0];
@@ -231,6 +238,7 @@ export async function getNextVinculoQuestion(
     if (isEmpresaBloqueada(v.empresa)) return false;
     return passosNormais.some(p => {
       const campo = p.campoColetar as keyof VinculoEmprego;
+      if (v.ordem > 1 && CAMPOS_OPCIONAIS_ANTERIOR.includes(campo)) return false;
       const val = v[campo];
       return (val === undefined || val === null || val === "") && !shouldSkipPasso(p, v, merged);
     });
@@ -243,10 +251,14 @@ export async function getNextVinculoQuestion(
       ?? `A ${alvoVinculo.empresa} infelizmente não é uma empresa que atendemos no momento. Antes disso, você trabalhou em outro lugar nos últimos 2 anos?`;
   }
 
+  const SAIDA_INFERIDA = ['saiu', 'já saiu', 'saiu da empresa', 'deixou a empresa', 'não trabalha mais'];
+
   for (const passo of passosNormais) {
     const campo = passo.campoColetar as keyof VinculoEmprego;
+    if (alvoVinculo.ordem > 1 && CAMPOS_OPCIONAIS_ANTERIOR.includes(campo)) continue;
     const val = alvoVinculo[campo];
-    const faltando = val === undefined || val === null || val === "";
+    const faltando = val === undefined || val === null || val === ""
+      || (campo === 'saida' && SAIDA_INFERIDA.includes(String(val).toLowerCase().trim()));
     if (!faltando) continue;
 
     if (shouldSkipPasso(passo, alvoVinculo, merged)) continue;
@@ -321,6 +333,22 @@ export async function getNextDeterministicQuestion(
       projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas,
     );
     if (nextVinculo) return nextVinculo;
+  }
+
+  // Mandatory calc fields — ask after basic vinculo collected, before pos-vinculos.
+  // These are required for calc-trabalhista to produce a correct value estimate.
+  if (!vinculosTodosPrescritos && vinculos.length > 0) {
+    const mainV = vinculos.find((v: VinculoEmprego) => v.ordem === 1) ?? vinculos[0];
+    if (!mainV.tempo && !mainV.tempo_meses_estimado && !merged.tempo_meses_estimado)
+      return "Quanto tempo você trabalhou nessa empresa? (pode ser em meses ou anos)";
+    if (!mainV.salario_holerite && !merged.salario_holerite)
+      return "Qual era o valor do seu salário na carteira de trabalho? (o valor do holerite mesmo)";
+    const pagouExtra = mainV.pagamento_fora ?? merged.pagamento_fora;
+    const pagouExtraPositivo = pagouExtra && !/^(não|nao|nenhum|0|zero|nunca)/i.test(String(pagouExtra).trim());
+    if (pagouExtraPositivo && !mainV.salario_por_fora && !merged.salario_por_fora)
+      return "E quanto você recebia por fora por mês em média? (Pix, dinheiro, comissão)";
+    if (!mainV.jornada_inicio && !merged.jornada_inicio)
+      return "Qual era seu horário de trabalho? Que horas você começava e que horas terminava normalmente?";
   }
 
   if (!vinculosTodosPrescritos) {

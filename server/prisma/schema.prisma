@@ -7,6 +7,44 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum BankProvider {
+  SICOOB
+  BRADESCO
+  INTER
+  BTG
+}
+
+enum CredentialType {
+  MTLS_CERT
+  MTLS_KEYPAIR
+  OAUTH2
+}
+
+enum StatementSource {
+  API_SYNC
+  OFX_IMPORT
+  MANUAL
+}
+
+enum ReconciliationStatus {
+  UNMATCHED
+  MATCHED
+  MANUAL
+  IGNORED
+}
+
+enum EntryType {
+  DEBIT
+  CREDIT
+}
+
+enum SyncStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  ERROR
+}
+
 model Usuario {
   id       String   @id @default(cuid())
   email    String   @unique
@@ -15,8 +53,7 @@ model Usuario {
   ativo    Boolean  @default(true)
   criadoEm DateTime @default(now())
 
-  projetosUsuario IaProjetoUsuario[]
-  mensagens       CrmMensagemWhatsapp[]
+  projetoUsuarios IaProjetoUsuario[]
 }
 
 model EmpresaEmitente {
@@ -74,7 +111,7 @@ model EmpresaEmitente {
   notas              NotaFiscal[]
   propostas          Proposta[]
   templateDocumentos TemplateDocumento[]
-  lancamentos        Lancamento[]
+  bankAccounts       BankAccount[]
 }
 
 model Tomador {
@@ -82,6 +119,9 @@ model Tomador {
   nome              String
   cpfCnpj           String          @unique
   email             String?
+  emailFinanceiro   String?
+  emailGeral        String?
+  emailDiretoria    String?
   telefone          String?
   endereco          String?
   numero            String?
@@ -203,7 +243,7 @@ model Proposta {
   contratoDescricao         String?
   paktSignedPdfPath         String?
   templatesGerar            String?
-  honorariosExitoPerc       Int?              // % honorários de êxito (ex: 30 = 30%)
+  honorariosExitoPerc       Int?
 
   documentosGerados DocumentoGerado[]
   contrato          Contrato?         @relation(fields: [contratoId], references: [id])
@@ -227,14 +267,15 @@ model TemplateDocumento {
 }
 
 model DocumentoGerado {
-  id         String            @id @default(cuid())
-  propostaId String
-  templateId String
-  tipo       String
-  titulo     String
-  pdfPath    String?
-  criadoEm   DateTime          @default(now())
-  docxPath   String?
+  id          String            @id @default(cuid())
+  propostaId  String
+  templateId  String
+  tipo        String
+  titulo      String
+  pdfPath     String?
+  docxPath    String?
+  htmlEditado String?
+  criadoEm    DateTime          @default(now())
 
   proposta Proposta          @relation(fields: [propostaId], references: [id])
   template TemplateDocumento @relation(fields: [templateId], references: [id])
@@ -266,8 +307,12 @@ model Cobranca {
   pixPagadorNome       String?
   pixPagoEm            DateTime?
 
-  contrato Contrato        @relation(fields: [contratoId], references: [id])
-  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  contrato      Contrato        @relation(fields: [contratoId], references: [id])
+  emitente      EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  bankStatement BankStatement?
+
+  reconciledAt    DateTime?
+  reconciledBy    String?
 }
 
 model NotaFiscal {
@@ -295,15 +340,14 @@ model NotaFiscal {
 // ─────────────────────────────────────────────
 
 model CrmPipeline {
-  id          String     @id @default(cuid())
-  nome        String
-  descricao   String?
-  cor         String     @default("#6366f1")
-  ordem       Int        @default(0)
-  tipo        String     @default("comercial") // comercial | processual
-  ativo       Boolean    @default(true)
-  pipedriveId Int?       @unique
-  criadoEm    DateTime   @default(now())
+  id        String     @id @default(cuid())
+  nome      String
+  descricao String?
+  cor       String     @default("#6366f1")
+  ordem     Int        @default(0)
+  tipo      String     @default("comercial") // comercial | processual
+  ativo     Boolean    @default(true)
+  criadoEm  DateTime   @default(now())
 
   stages CrmStage[]
   deals  CrmDeal[]
@@ -321,7 +365,6 @@ model CrmStage {
   ehEncerramento   Boolean  @default(false)
   requerAcaoHumana Boolean  @default(false)
   ativo            Boolean  @default(true)
-  pipedriveId      Int?
 
   pipeline CrmPipeline @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
   deals    CrmDeal[]
@@ -345,15 +388,14 @@ model CrmDeal {
   camposCustom     Json?
   numeroCnj        String?
   proximoPrazo     DateTime?
-  dataFechamentoEsperada DateTime?
   qualificacao     Json?
   ultimoContatoEm  DateTime?
-  organizacao      String?
-  motivoPerda      String?
-  rotulo           String?
-  probabilidade    Int?
-  moeda            String?
-  pipedriveId      Int?      @unique
+  // Avaliação jurídica
+  parecer          String?   // Texto do parecer da Dra. Daniela
+  valorEstimado    Decimal?  @db.Decimal(12, 2)  // Estimativa IA do valor da causa
+  valorCausaAjuizada Decimal? @db.Decimal(12, 2) // Valor da causa no processo ajuizado
+  valorCondenacao  Decimal?  @db.Decimal(12, 2)  // Valor da condenação
+  valorAcordo      Decimal?  @db.Decimal(12, 2)  // Valor do acordo homologado
   // IA fields
   iaAtiva          Boolean   @default(true)
   iaStageChave     String?
@@ -363,12 +405,9 @@ model CrmDeal {
   closerTentativas Int       @default(0)
   proximoContatoEm DateTime?
   docsConfirmados  Boolean   @default(false)
-  // Avaliação jurídica
-  parecer             String?   // Texto do parecer da Dra. Daniela
-  valorEstimado       Decimal?  @db.Decimal(12, 2)  // Estimativa IA do valor da causa
-  valorCausaAjuizada  Decimal?  @db.Decimal(12, 2)  // Valor da causa no processo ajuizado
-  valorCondenacao     Decimal?  @db.Decimal(12, 2)  // Valor da condenação
-  valorAcordo         Decimal?  @db.Decimal(12, 2)  // Valor do acordo homologado
+  iaFlowStepChave  String?   // current step in flow controller (advogado phase)
+  iaFlowStepData   Json?     // data collected by flow controller (advogado phase)
+  iaFlags          Json?     // internal AI operational flags (keys prefixed with _)
   criadoEm         DateTime  @default(now())
   atualizadoEm     DateTime  @updatedAt
 
@@ -377,10 +416,9 @@ model CrmDeal {
   contato   CrmContato?         @relation(fields: [contatoId], references: [id])
   projeto   IaProjeto?          @relation(fields: [projetoId], references: [id])
   stageLog  CrmDealStageLog[]
-  notas              CrmNota[]
-  mensagens          CrmMensagemWhatsapp[]
-  vinculos           CrmVinculoEmprego[]
-  eventosIdentidade  IaEventoIdentidade[]
+  notas     CrmNota[]
+  mensagens CrmMensagemWhatsapp[]
+  vinculos  CrmVinculoEmprego[]
 }
 
 model CrmDealStageLog {
@@ -409,13 +447,10 @@ model CrmContato {
   id           String   @id @default(cuid())
   nome         String
   whatsapp     String?
-  telefone     String?
   cpf          String?
   email        String?
   cidade       String?
-  empresa      String?
   profissao    String?
-  pipedriveId  Int?     @unique
   criadoEm     DateTime @default(now())
   atualizadoEm DateTime @updatedAt
 
@@ -435,31 +470,32 @@ model IaProjeto {
   whatsappInstancia String?
   criadoEm          DateTime @default(now())
 
-  configs      IaProjetoConfig[]
-  personas     IaPersona[]
-  fases        IaFaseFunil[]
-  perguntas    IaPerguntaQualificacao[]
-  templates    IaMensagemTemplate[]
-  regras       IaRegraTransicao[]
-  logs         IaInteracaoLog[]
-  notificacoes IaNotificacaoEvento[]
-  llmProvedores IaLlmProvedor[]
-  deals        CrmDeal[]
-  campanhas    CrmCampanhaReengajamento[]
-  usuarios     IaProjetoUsuario[]
-  vinculoFlow  IaVinculoFlowPasso[]
+  configs    IaProjetoConfig[]
+  personas   IaPersona[]
+  fases      IaFaseFunil[]
+  perguntas  IaPerguntaQualificacao[]
+  templates  IaMensagemTemplate[]
+  regras     IaRegraTransicao[]
+  logs       IaInteracaoLog[]
+  deals           CrmDeal[]
+  provedores      IaLlmProvedor[]
+  notificacoes    IaNotificacaoEvento[]
+  notificacaoLogs IaNotificacaoLog[]
+  projetoUsuarios IaProjetoUsuario[]
+  vinculoFlow     IaVinculoFlowPasso[]
+  flowSteps       IaFlowStep[]
 }
 
 model IaVinculoFlowPasso {
   id           String   @id @default(cuid())
   projetoId    String
-  chave        String
+  chave        String   // "empresa" | "funcao" | "vinculo" | "saida" | "horas_extras" | "pagamento_fora" | "injustica" | "frota" | "mais_empregos" | custom
   pergunta     String   @db.Text
-  campoColetar String?
+  campoColetar String?  // field key in VinculoEmprego; null for tipoEspecial steps
   ordemPadrao  Int      @default(0)
   ativo        Boolean  @default(true)
-  skipSe       Json?
-  tipoEspecial String?
+  skipSe       Json?    // { "campo": "vinculo", "contem_qualquer": ["clt", "carteira"] }
+  tipoEspecial String?  // "mais_empregos" | null
   criadoEm     DateTime @default(now())
   atualizadoEm DateTime @updatedAt
 
@@ -468,20 +504,57 @@ model IaVinculoFlowPasso {
   @@unique([projetoId, chave])
 }
 
-model IaProjetoUsuario {
-  id           String   @id @default(cuid())
+// ─────────────────────────────────────────────
+// Flow Controller — steps & gates por persona
+// ─────────────────────────────────────────────
+
+model IaFlowStep {
+  id           String       @id @default(cuid())
   projetoId    String
-  usuarioId    String
-  funcao       String   @default("atendente") // admin | atendente | closer
-  // How this user appears in WhatsApp when intervening manually:
-  // null = keep current IA persona name | any string = show that name
-  nomeWhatsapp String?
-  criadoEm    DateTime @default(now())
+  personaChave String       // "assistente" | "advogado"
+  fase         String       // "pre_vinculos" | "pos_vinculos" | "advogado"
+  chave        String
+  ordem        Int
+  label        String
+  pergunta     String       @db.Text
+  stepType     String       @default("question") // "question" | "gate" | "document" | "end" | "saudacao" | "llm_generated"
+  subFase      String?      // "advogado_valor" | "advogado_dados" | "advogado_documentos"
+  campoColetar String?      // key in qualificacao JSON or iaFlowStepData JSON
+  skipSe       Json?
+  ativo        Boolean      @default(true)
+  criadoEm     DateTime     @default(now())
+  atualizadoEm DateTime     @updatedAt
+  gates        IaFlowGate[]
+  projeto      IaProjeto    @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, personaChave, chave])
+}
+
+model IaFlowGate {
+  id          String     @id @default(cuid())
+  stepId      String
+  condicao    String     @db.Text
+  actionType  String     // "continue" | "goto_step" | "end" | "discard" | "repeat" | "notify" | "wait"
+  actionValue String?    // target step chave, end message, etc.
+  label       String?
+  cor         String?
+  ordem       Int        @default(0)
+  criadoEm    DateTime   @default(now())
+  step        IaFlowStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+}
+
+model IaLlmProvedor {
+  id        String  @id @default(cuid())
+  projetoId String
+  ordem     Int
+  provider  String  // anthropic | openai | groq | gemini
+  modelo    String
+  apiKey    String
+  ativo     Boolean @default(true)
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
-  usuario Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
 
-  @@unique([projetoId, usuarioId])
+  @@unique([projetoId, ordem])
 }
 
 model IaProjetoConfig {
@@ -509,10 +582,11 @@ model IaPersona {
   nomeExibicao   String
   descricaoPapel String?
   systemPrompt   String
-  tom            String  @default("profissional")
-  ordem          Int     @default(0)
-  ativo          Boolean @default(true)
-  ttsVoiceId     String? // ElevenLabs voice ID para TTS
+  tom              String  @default("profissional")
+  ordem            Int     @default(0)
+  ativo            Boolean @default(true)
+  ttsVoiceId       String?
+  llmProviderChave String? // se definido, usa o provedor com este nome (ex: "gemini", "anthropic") em vez do padrão do projeto
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 
@@ -553,9 +627,6 @@ model IaPerguntaQualificacao {
   ordem            Int
   stageColeta      String?
   ativo            Boolean @default(true)
-  // Conditional activation: question becomes required when `dependeDe` field matches `ativaSeResposta` regex
-  dependeDe        String? // chave of the parent question that controls this one
-  ativaSeResposta  String? // JS regex pattern (case-insensitive) tested against the parent answer
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 }
@@ -575,42 +646,15 @@ model IaMensagemTemplate {
 }
 
 model IaRegraTransicao {
-  id                String  @id @default(cuid())
-  projetoId         String
-  stageOrigemChave  String?
-  stageDestinoChave String
-  condicao               String  // primeira_mensagem | sem_resposta_Xhoras | cliente_respondeu | qualificacao_completa | interesse_confirmado | docs_confirmados | contrato_assinado | closer_tentativas_esgotadas | humano_marcou_fase
-  parametros             Json?
-  acaoAdicional          String? // trocar_persona:X | solicitar_documentos | gerar_proposta_automatica | criar_deal_processual
-  ordem                  Int     @default(0)
-  requerPrescricaoAtiva  Boolean @default(false) // if true, qualificacao_completa only fires when prescription check passes
-
-  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
-}
-
-model IaLlmProvedor {
-  id        String  @id @default(cuid())
-  projetoId String
-  ordem     Int
-  provider  String  // anthropic | openai | groq
-  modelo    String
-  apiKey    String
-  ativo     Boolean @default(true)
-
-  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
-
-  @@unique([projetoId, ordem])
-}
-
-model IaNotificacaoEvento {
-  id         String   @id @default(cuid())
-  projetoId  String
-  nome       String   // Display name, e.g. "Lead qualificado"
-  evento     String   // Event key: "qualificacao_completa" | "stage_entrada:{chave}" | "proposta_aceita" | etc.
-  destino    String   // WhatsApp number or group JID that receives the notification
-  mensagem   String   // Template: {{nome}}, {{cidade}}, {{stage}}, {{telefone}}
-  ativo      Boolean  @default(true)
-  criadoEm  DateTime @default(now())
+  id                    String  @id @default(cuid())
+  projetoId             String
+  stageOrigemChave      String?
+  stageDestinoChave     String
+  condicao              String
+  parametros            Json?
+  acaoAdicional         String?
+  ordem                 Int     @default(0)
+  requerPrescricaoAtiva Boolean @default(false)
 
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 }
@@ -642,15 +686,12 @@ model CrmMensagemWhatsapp {
   conteudo           String?
   midiaUrl           String?
   transcricao        String?
-  evolutionMessageId String?  @unique
-  usuarioId          String?   // set when a human user sends manually
-  nomeRemetente      String?   // display name used when sending (persona or user's chosen name)
+  evolutionMessageId String?
   lida               Boolean  @default(false)
   enviadaEm          DateTime @default(now())
 
   deal    CrmDeal?    @relation(fields: [dealId], references: [id])
   contato CrmContato? @relation(fields: [contatoId], references: [id])
-  usuario Usuario?    @relation(fields: [usuarioId], references: [id])
 }
 
 model CrmVinculoEmprego {
@@ -675,68 +716,155 @@ model CrmVinculoEmprego {
 }
 
 // ─────────────────────────────────────────────
-// Configuração geral (chave-valor)
+// Banking Module
 // ─────────────────────────────────────────────
+
+model BankAccount {
+  id                String       @id @default(cuid())
+  emitenteId        String
+  provider          BankProvider
+  name              String       @db.VarChar(100)
+  bankCode          String       @db.VarChar(10)
+  agency            String       @db.VarChar(10)
+  agencyDigit       String?      @db.VarChar(2)
+  account           String       @db.VarChar(20)
+  accountDigit      String?      @db.VarChar(2)
+  accountType       String       @db.VarChar(10)
+  pixKey            String?      @db.VarChar(100)
+  isDefault         Boolean      @default(false)
+  isActive          Boolean      @default(true)
+  currentBalance    Decimal      @default(0) @db.Decimal(15, 2)
+  balanceDate       DateTime?
+  externalAccountId String?      @db.VarChar(100)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  emitente          EmpresaEmitente  @relation(fields: [emitenteId], references: [id])
+  credential        BankCredential?
+  statements        BankStatement[]
+  syncLogs          StatementSyncLog[]
+  @@unique([emitenteId, provider, account])
+  @@index([emitenteId])
+  @@map("bank_accounts")
+}
+
+model BankCredential {
+  id             String         @id @default(cuid())
+  emitenteId     String
+  bankAccountId  String         @unique
+  credentialType CredentialType
+  certData       String?        @db.Text
+  certPassword   String?        @db.Text
+  certPem        String?        @db.Text
+  keyPem         String?        @db.Text
+  clientId       String?        @db.Text
+  clientSecret   String?        @db.Text
+  expiresAt      DateTime?
+  isActive       Boolean        @default(true)
+  lastTestedAt   DateTime?
+  lastTestOk     Boolean?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  bankAccount    BankAccount    @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  @@index([emitenteId])
+  @@map("bank_credentials")
+}
+
+model BankStatement {
+  id                   String               @id @default(cuid())
+  emitenteId           String
+  bankAccountId        String
+  externalId           String?              @db.VarChar(100)
+  entryDate            DateTime
+  valueDate            DateTime?
+  amount               Decimal              @db.Decimal(15, 2)
+  entryType            EntryType
+  balance              Decimal?             @db.Decimal(15, 2)
+  description          String               @db.VarChar(500)
+  documentNumber       String?              @db.VarChar(100)
+  counterpartyName     String?              @db.VarChar(200)
+  counterpartyDocument String?              @db.VarChar(20)
+  category             String?              @db.VarChar(100)
+  source               StatementSource      @default(API_SYNC)
+  rawData              Json?
+  reconciliationStatus ReconciliationStatus @default(UNMATCHED)
+  reconciledAt         DateTime?
+  reconciledBy         String?
+  cobrancaId           String?              @unique
+  createdByUserId      String?
+  updatedByUserId      String?
+  attachmentUrl        String?              @db.VarChar(500)
+  attachmentName       String?              @db.VarChar(200)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  bankAccount          BankAccount          @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  cobranca             Cobranca?            @relation(fields: [cobrancaId], references: [id])
+  @@unique([bankAccountId, externalId])
+  @@index([emitenteId, bankAccountId, entryDate])
+  @@index([emitenteId, reconciliationStatus])
+  @@map("bank_statements")
+}
+
+model StatementSyncLog {
+  id             String      @id @default(cuid())
+  emitenteId     String
+  bankAccountId  String
+  startDate      DateTime
+  endDate        DateTime
+  status         SyncStatus  @default(PENDING)
+  recordsFetched Int         @default(0)
+  recordsNew     Int         @default(0)
+  errorMessage   String?     @db.Text
+  durationMs     Int?
+  triggeredBy    String      @db.VarChar(20)
+  createdAt      DateTime    @default(now())
+  finishedAt     DateTime?
+  bankAccount    BankAccount @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  @@index([emitenteId, bankAccountId, createdAt])
+  @@map("statement_sync_logs")
+}
+
+model IaNotificacaoEvento {
+  id        String   @id @default(cuid())
+  projetoId String
+  nome      String
+  evento    String
+  destino   String
+  mensagem  String
+  ativo     Boolean  @default(true)
+  criadoEm  DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaNotificacaoLog {
+  id        String   @id @default(cuid())
+  projetoId String
+  dealId    String?
+  evento    String
+  destino   String
+  mensagem  String   @db.Text
+  nomeLead  String?
+  enviadaEm DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+}
+
+model IaProjetoUsuario {
+  id           String   @id @default(cuid())
+  projetoId    String
+  usuarioId    String
+  funcao       String   @default("atendente")
+  nomeWhatsapp String?
+  criadoEm     DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+  usuario Usuario   @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, usuarioId])
+}
 
 model Configuracao {
   chave        String   @id
   valor        String
   atualizadoEm DateTime @updatedAt
-}
-
-// ─────────────────────────────────────────────
-// Reengajamento automático
-// ─────────────────────────────────────────────
-
-model CrmCampanhaReengajamento {
-  id             String    @id @default(cuid())
-  nome           String
-  projetoId      String?
-  pipelineId     String?
-  stageIds       String[]
-  diasSemContato Int       @default(7)
-  mensagem       String
-  ativa          Boolean   @default(true)
-  totalEnviados  Int       @default(0)
-  ultimoDisparo  DateTime?
-  criadoEm       DateTime  @default(now())
-  atualizadoEm   DateTime  @updatedAt
-
-  projeto IaProjeto? @relation(fields: [projetoId], references: [id])
-}
-
-// ─────────────────────────────────────────────
-// Financeiro
-// ─────────────────────────────────────────────
-
-model Lancamento {
-  id           String   @id @default(cuid())
-  tipo         String   // receita | despesa
-  descricao    String
-  categoria    String?
-  valor        Decimal  @db.Decimal(12, 2)
-  data         DateTime
-  emitenteId   String?
-  dealId       String?
-  pago         Boolean  @default(true)
-  obs          String?
-  criadoEm     DateTime @default(now())
-  atualizadoEm DateTime @updatedAt
-
-  emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
-}
-
-// ─────────────────────────────────────────────
-// IA — Transparência de identidade (P2)
-// ─────────────────────────────────────────────
-
-model IaEventoIdentidade {
-  id              String   @id @default(cuid())
-  dealId          String
-  deal            CrmDeal  @relation(fields: [dealId], references: [id])
-  mensagemCliente String
-  respostaEnviada String
-  criadoEm        DateTime @default(now())
-
-  @@index([dealId])
 }

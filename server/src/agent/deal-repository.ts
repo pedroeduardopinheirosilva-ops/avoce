@@ -88,7 +88,7 @@ export async function updateDealFields(
 
 export async function saveFlowStepData(
   deal: { id: string; iaFlowStepData?: Record<string, unknown> | null },
-  extracted: Record<string, string>,
+  extracted: Record<string, unknown>,
   nextStepChave: string,
 ): Promise<void> {
   const current = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;

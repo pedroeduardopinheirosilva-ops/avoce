@@ -134,4 +134,312 @@ describe("processVinculos", () => {
     expect(result.state.vinculosOk).toBe(false);
     expect(result.mergedUpdates).toEqual({});
   });
+
+  describe("gate _mais_empregos_perguntado (backward-compat via maisEmpregosPerguntado input)", () => {
+    function completeVinculo(overrides: Record<string, unknown> = {}) {
+      return {
+        ordem: 1, empresa: "TransABC", funcao: "Motorista", vinculo: "CLT",
+        saida: "demitido", tempo: "1 ano", horas_extras: "sim",
+        pagamento_fora: "nao", injustica: "nao",
+        ...overrides,
+      };
+    }
+
+    it("flag = true (maisEmpregosPerguntado = true) → vinculos_ok setado ao receber semMaisEmpregos", async () => {
+      const vinculo = completeVinculo();
+      mockTryExtract.mockResolvedValue({
+        ...emptyResult(),
+        semMaisEmpregos: true,
+        updatedVinculos: [vinculo],
+      });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [vinculo] },
+        text: "não, só trabalhei lá",
+        history: [],
+        maisEmpregosPerguntado: true, // flag = true equivalente
+      });
+
+      expect(result.state.vinculosOk).toBe(true);
+      expect(result.mergedUpdates._vinculos_ok).toBe(true);
+    });
+
+    it("semMaisEmpregos + maisEmpregosPerguntado = false + tempo < 24m → vinculos_ok setado (trusted negation) + negado flag", async () => {
+      const vinculo = completeVinculo({ tempo: "10 meses" });
+      mockTryExtract.mockResolvedValue({
+        ...emptyResult(),
+        semMaisEmpregos: true,
+        updatedVinculos: [vinculo],
+      });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [vinculo] },
+        text: "não, só trabalhei lá",
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      // Lead explicitly denied more employers — trust it regardless of maisEmpregosPerguntado
+      expect(result.state.vinculosOk).toBe(true);
+      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
+    });
+
+    it("flag = false + tempo >= 24m → vinculos_ok setado normalmente", async () => {
+      const vinculo = completeVinculo({ tempo: "3 anos" });
+      mockTryExtract.mockResolvedValue({
+        ...emptyResult(),
+        semMaisEmpregos: true,
+        updatedVinculos: [vinculo],
+      });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [vinculo] },
+        text: "não, só trabalhei lá",
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.state.vinculosOk).toBe(true);
+    });
+  });
+
+  describe("_mais_empregos_negado flag (Bug A regression)", () => {
+    function completeVinculo(overrides: Record<string, unknown> = {}) {
+      return {
+        ordem: 1, empresa: "TransABC", funcao: "Motorista", vinculo: "CLT",
+        saida: "demitido", tempo: "1 ano", horas_extras: "sim",
+        pagamento_fora: "nao", injustica: "nao",
+        ...overrides,
+      };
+    }
+
+    it("cenário 1 — semMaisEmpregos + vínculo completo → vinculos_ok + negado", async () => {
+      const vinculo = completeVinculo();
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), semMaisEmpregos: true, updatedVinculos: [vinculo] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [vinculo] },
+        text: "não",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+
+      expect(result.state.vinculosOk).toBe(true);
+      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
+    });
+
+    it("cenário 2 — semMaisEmpregos + vínculo incompleto (sem saida) → vinculos_ok false + negado true", async () => {
+      const incompleto = { ordem: 1, empresa: "TransABC", vinculo: "CLT" }; // sem saida
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), semMaisEmpregos: true, updatedVinculos: [incompleto] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [incompleto] },
+        text: "não",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+
+      expect(result.state.vinculosOk).toBe(false);
+      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
+    });
+
+    it("cenário 4 — semMaisEmpregos com maisEmpregosPerguntado=false e negação explícita → negado setado", async () => {
+      const vinculo = completeVinculo();
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), semMaisEmpregos: true, updatedVinculos: [vinculo] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [vinculo] },
+        text: "não trabalhei em outro lugar",
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
+      expect(result.state.vinculosOk).toBe(true);
+    });
+  });
+
+  describe("auto-close parcial — lead impaciente no vínculo anterior", () => {
+    // Vínculo principal completo + vínculo anterior com mínimo (empresa+vinculo+saida)
+    function vinculoPrincipal(): Record<string, unknown> {
+      return {
+        ordem: 1, empresa: "Transnorte SA", funcao: "Motorista", vinculo: "CLT",
+        saida: "demitido", data_saida: "30/03/2026", tempo: "8 meses",
+        horas_extras: "sim", pagamento_fora: "sim", injustica: "sim",
+      };
+    }
+    function vinculoAnteriorMinimo(): Record<string, unknown> {
+      return {
+        ordem: 2, empresa: "ABC Limitada", funcao: "carreteiro",
+        vinculo: "CLT", saida: "15/05/2025", tempo: "7 anos",
+        // horas_extras, pagamento_fora, injustica ausentes — lead ficou impaciente
+      };
+    }
+
+    it("2 vínculos com mínimo + _mais_empregos_perguntado=true → auto-fecha", async () => {
+      const v1 = vinculoPrincipal();
+      const v2 = vinculoAnteriorMinimo();
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), updatedVinculos: [v1, v2] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [v1, v2], _mais_empregos_perguntado: true },
+        text: "tá bom",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+
+      expect(result.state.vinculosOk).toBe(true);
+      expect(result.mergedUpdates._vinculos_ok).toBe(true);
+    });
+
+    it("2 vínculos com mínimo mas _mais_empregos_perguntado=false → NÃO auto-fecha", async () => {
+      const v1 = vinculoPrincipal();
+      const v2 = vinculoAnteriorMinimo();
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), updatedVinculos: [v1, v2] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [v1, v2] },
+        text: "tá bom",
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.state.vinculosOk).toBe(false);
+    });
+
+    it("1 vínculo com mínimo + _mais_empregos_perguntado=true → NÃO auto-fecha (exige 2+)", async () => {
+      // Vínculo parcial: tem empresa+vinculo+saida mas falta horas_extras/pagamento_fora/injustica
+      // → todosCompletos=false (bloco normal não fecha) E length<2 (parcial não fecha)
+      const v1parcial = {
+        ordem: 1, empresa: "Transnorte SA", funcao: "Motorista",
+        vinculo: "CLT", saida: "demitido", tempo: "8 meses",
+      };
+      mockTryExtract.mockResolvedValue({ ...emptyResult(), updatedVinculos: [v1parcial] });
+
+      const result = await processVinculos({
+        projetoId: "proj-1",
+        merged: { vinculos: [v1parcial], _mais_empregos_perguntado: true },
+        text: "tá bom",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+
+      expect(result.state.vinculosOk).toBe(false);
+    });
+  });
+
+  describe("buildFlatSync — campos emprego_anterior_* sempre sobrescrevem de vinculos[1]", () => {
+    const v0 = {
+      ordem: 1, empresa: "Transnorte SA", funcao: "Motorista", vinculo: "CLT",
+      saida: "demitido", tempo: "8 meses", horas_extras: "sim", pagamento_fora: "nao", injustica: "nao",
+    };
+    const v1abc = {
+      ordem: 2, empresa: "Transportadora ABC Limitada", funcao: "Carreteiro",
+      vinculo: "CLT", saida: "15/05/2025", tempo: "7 anos",
+    };
+
+    it("sobrescreve emprego_anterior_empresa stale quando vinculos[1] tem dado correto", async () => {
+      const result = await processVinculos({
+        projetoId: "proj-flat1",
+        merged: {
+          _vinculos_ok: true,
+          vinculos: [v0, v1abc],
+          emprego_anterior_empresa: "Transnorte SA", // stale — deve ser sobrescrito
+          emprego_anterior_tempo: "8 meses",
+          empresa_anterior: "Transnorte SA",
+        },
+        text: null,
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+
+      expect(result.mergedUpdates.emprego_anterior_empresa).toBe("Transportadora ABC Limitada");
+      expect(result.mergedUpdates.emprego_anterior_tempo).toBe("7 anos");
+      expect(result.mergedUpdates.empresa_anterior).toBe("Transportadora ABC Limitada");
+    });
+
+    it("não seta emprego_anterior_empresa quando há só um vínculo (sem v1)", async () => {
+      const result = await processVinculos({
+        projetoId: "proj-flat2",
+        merged: { _vinculos_ok: true, vinculos: [v0] },
+        text: null,
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.mergedUpdates.emprego_anterior_empresa).toBeUndefined();
+    });
+
+    it("recovery seed: adiciona vinculos[1] quando _mais_empregos_confirmado=true e emprego_anterior_empresa diferente", async () => {
+      mockTryExtract.mockResolvedValue({
+        vinculo: null,
+        semMaisEmpregos: false,
+        updatedVinculos: [v0],
+        confirmouMaisEmpregos: false,
+      });
+      const result = await processVinculos({
+        projetoId: "proj-seed-v1",
+        merged: {
+          vinculos: [v0],
+          _mais_empregos_confirmado: true,
+          emprego_anterior_empresa: "Azul Ltda",
+          emprego_anterior_tempo: "7 anos",
+          emprego_anterior_saida: "março de 2025",
+        },
+        text: "mais de 7 anos",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+      const vinculosResult = result.mergedUpdates.vinculos as any[];
+      expect(vinculosResult).toHaveLength(2);
+      expect(vinculosResult[1].empresa).toBe("Azul Ltda");
+      expect(vinculosResult[1].tempo).toBe("7 anos");
+    });
+
+    it("recovery seed: não duplica quando emprego_anterior_empresa é igual a vinculos[0]", async () => {
+      mockTryExtract.mockResolvedValue({
+        vinculo: null,
+        semMaisEmpregos: false,
+        updatedVinculos: [v0],
+        confirmouMaisEmpregos: false,
+      });
+      const result = await processVinculos({
+        projetoId: "proj-seed-v1-same",
+        merged: {
+          vinculos: [v0],
+          _mais_empregos_confirmado: true,
+          emprego_anterior_empresa: v0.empresa, // mesma empresa — não deve criar v1
+        },
+        text: "mais de 7 anos",
+        history: [],
+        maisEmpregosPerguntado: true,
+      });
+      const vinculosResult = (result.mergedUpdates.vinculos ?? [v0]) as any[];
+      expect(vinculosResult).toHaveLength(1);
+    });
+
+    it("não sobrescreve empresa_recente (v0-derived, guarda falsy mantida)", async () => {
+      const result = await processVinculos({
+        projetoId: "proj-flat3",
+        merged: {
+          _vinculos_ok: true,
+          vinculos: [v0],
+          empresa_recente: "JaDefinida", // deve permanecer intacta
+        },
+        text: null,
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.mergedUpdates.empresa_recente).toBeUndefined();
+    });
+  });
 });

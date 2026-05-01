@@ -24,6 +24,23 @@ vi.mock("../db.js", () => ({
     crmContato: {
       findFirst: vi.fn(),
     },
+    iaPersona: {
+      findUnique: vi.fn().mockResolvedValue({ systemPrompt: "", nomeExibicao: "Daniela", llmProviderChave: null }),
+    },
+    iaMensagemTemplate: {
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+    crmMensagemWhatsapp: {
+      findMany: vi.fn().mockResolvedValue([]),
+      create: vi.fn().mockResolvedValue({}),
+    },
+    iaInteracaoLog: {
+      create: vi.fn().mockResolvedValue({}),
+    },
+    iaProjetoConfig: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+    $executeRaw: vi.fn().mockResolvedValue(1),
   },
 }));
 
@@ -37,12 +54,18 @@ vi.mock("./message-handler.js", () => ({
   dispararNotificacoes: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("./persona-router.js", () => ({ buildInstrucaoBase: vi.fn().mockReturnValue("") }));
-vi.mock("./flow-controller.js", () => ({ initAdvogadoFlowIfNeeded: vi.fn().mockResolvedValue(null) }));
+vi.mock("./flow-controller.js", () => ({ initAdvogadoFlowIfNeeded: vi.fn().mockResolvedValue({ message: null, firstStepChave: null }) }));
+vi.mock("./deal-repository.js", () => ({ saveFlowStepData: vi.fn().mockResolvedValue(undefined) }));
 
 import { prisma } from "../db.js";
-import { transitionDeal, checkTransitions } from "./transition-engine.js";
+import { transitionDeal, checkTransitions, enviarMensagemProativa } from "./transition-engine.js";
+import { getEvolutionConfig } from "./message-handler.js";
+import { callLlm } from "./llm.js";
 
 const mockDealFindUnique = prisma.crmDeal.findUnique as ReturnType<typeof vi.fn>;
+const mockGetEvoConfig = getEvolutionConfig as ReturnType<typeof vi.fn>;
+const mockExecuteRaw = prisma.$executeRaw as unknown as ReturnType<typeof vi.fn>;
+const mockCallLlm = callLlm as ReturnType<typeof vi.fn>;
 const mockRegrFindFirst = prisma.iaRegraTransicao.findFirst as ReturnType<typeof vi.fn>;
 const mockFaseFindUnique = prisma.iaFaseFunil.findUnique as ReturnType<typeof vi.fn>;
 const mockStageFindFirst = prisma.crmStage.findFirst as ReturnType<typeof vi.fn>;
@@ -114,5 +137,75 @@ describe("checkTransitions", () => {
     const result = await checkTransitions("proj-1", "d1", "lead_sem_resposta", "oi, voltei", "5511999");
     expect(result.transitioned).toBe(false); // no proactive message
     expect(result.pendingActions.some(a => a.type === "notify")).toBe(true);
+  });
+});
+
+// Universal atomic lock: $executeRaw at the top of enviarMensagemProativa prevents duplicate intro.
+// Old in-memory guard replaced — $executeRaw is now the single source of truth.
+describe("enviarMensagemProativa — universal $executeRaw lock", () => {
+  it("retorna imediatamente quando $executeRaw retorna 0 (flag já no DB)", async () => {
+    mockDealFindUnique.mockResolvedValue({
+      id: "d-guard",
+      iaAtiva: true,
+      iaStageChave: "com_advogado",
+      iaPersonaChave: "advogado",
+      iaFlowStepData: { apresentacao_enviado: true },
+    });
+    mockExecuteRaw.mockResolvedValueOnce(0); // flag already set — another process won
+
+    await enviarMensagemProativa("proj-1", "d-guard", "5511999", "primeira_mensagem", "Pedro");
+
+    expect(mockGetEvoConfig).not.toHaveBeenCalled();
+  });
+
+  it("prossegue quando $executeRaw retorna 1 (lock adquirido)", async () => {
+    mockDealFindUnique.mockResolvedValue({
+      id: "d-guard2",
+      iaAtiva: true,
+      iaStageChave: "com_advogado",
+      iaPersonaChave: "advogado",
+      iaFlowStepData: {},
+    });
+    // mockExecuteRaw returns 1 by default → lock acquired → proceeds to getEvolutionConfig
+    mockGetEvoConfig.mockResolvedValue(null);
+
+    await enviarMensagemProativa("proj-1", "d-guard2", "5511999", "primeira_mensagem", "Pedro");
+
+    expect(mockGetEvoConfig).toHaveBeenCalled();
+  });
+});
+
+// When initAdvogadoFlowIfNeeded returns null (flow already initialized) the lock still applies.
+describe("enviarMensagemProativa — lock com initAdvogadoFlowIfNeeded retornando null", () => {
+  const advogadoDeal = {
+    id: "d-else",
+    iaAtiva: true,
+    iaStageChave: "com_advogado",
+    iaPersonaChave: "advogado",
+    iaFlowStepData: {},
+  };
+
+  beforeEach(() => {
+    mockDealFindUnique.mockResolvedValue(advogadoDeal);
+    // initAdvogadoFlowIfNeeded returns null → falls to else path
+    // (already mocked at top-level: { message: null, firstStepChave: null })
+    mockGetEvoConfig.mockResolvedValue({ instance: "test", apiKey: "key" });
+    mockCallLlm.mockResolvedValue({ content: "Olá!", tokensIn: 10, tokensOut: 5, latencyMs: 100, model: "m", provider: "groq" });
+  });
+
+  it("$executeRaw retorna 0 (outro processo ganhou) → callLlm NÃO chamado", async () => {
+    mockExecuteRaw.mockResolvedValue(0);
+
+    await enviarMensagemProativa("proj-1", "d-else", "5511999", "primeira_mensagem", "Pedro");
+
+    expect(mockCallLlm).not.toHaveBeenCalled();
+  });
+
+  it("$executeRaw retorna 1 (este processo ganhou) → callLlm É chamado", async () => {
+    mockExecuteRaw.mockResolvedValue(1);
+
+    await enviarMensagemProativa("proj-1", "d-else", "5511999", "primeira_mensagem", "Pedro");
+
+    expect(mockCallLlm).toHaveBeenCalled();
   });
 });

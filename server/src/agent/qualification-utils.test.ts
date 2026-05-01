@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validarCPF, syncVinculosFromFlat, temDadosMinimosCalculo } from "./qualification-utils.js";
+import { validarCPF, syncVinculosFromFlat, temDadosMinimosCalculo, parseBrNumber } from "./qualification-utils.js";
 import type { VinculoEmprego } from "./types.js";
 
 // ── validarCPF ────────────────────────────────────────────────────────────────
@@ -61,6 +61,20 @@ describe("temDadosMinimosCalculo", () => {
   it("returns false for empty merged", () => {
     expect(temDadosMinimosCalculo({})).toBe(false);
   });
+});
+
+// ── parseBrNumber ─────────────────────────────────────────────────────────────
+
+describe("parseBrNumber", () => {
+  it("2.000 → 2000",        () => expect(parseBrNumber("2.000")).toBe(2000));
+  it("1.500,50 → 1500.5",   () => expect(parseBrNumber("1.500,50")).toBe(1500.5));
+  it("number passthrough",   () => expect(parseBrNumber(2000)).toBe(2000));
+  it("null → 0",             () => expect(parseBrNumber(null)).toBe(0));
+  it("R$ 3.200 → 3200",     () => expect(parseBrNumber("R$ 3.200")).toBe(3200));
+  it("plain 1200 → 1200",    () => expect(parseBrNumber("1200")).toBe(1200));
+  it("1.200,99 → 1200.99",  () => expect(parseBrNumber("1.200,99")).toBe(1200.99));
+  it("undefined → 0",        () => expect(parseBrNumber(undefined)).toBe(0));
+  it("empty string → 0",     () => expect(parseBrNumber("")).toBe(0));
 });
 
 // ── syncVinculosFromFlat ──────────────────────────────────────────────────────

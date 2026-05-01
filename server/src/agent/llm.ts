@@ -31,6 +31,7 @@ function getSdkClient(provider: ProviderConfig["provider"], apiKey: string): Sdk
       case "openai":    client = new OpenAI({ apiKey }); break;
       case "groq":      client = new Groq({ apiKey }); break;
       case "gemini":    client = new GoogleGenAI({ apiKey }); break;
+      case "deepseek":  client = new OpenAI({ apiKey, baseURL: "https://api.deepseek.com" }); break;
       default: throw new Error(`Provider desconhecido: ${provider}`);
     }
     _sdkClients.set(key, client);
@@ -41,7 +42,7 @@ function getSdkClient(provider: ProviderConfig["provider"], apiKey: string): Sdk
 // ── Provider config ────────────────────────────────────────────────────────────
 
 type ProviderConfig = {
-  provider: "anthropic" | "openai" | "groq" | "gemini";
+  provider: "anthropic" | "openai" | "groq" | "gemini" | "deepseek";
   modelo: string;
   apiKey: string;
 };
@@ -115,6 +116,7 @@ async function callProvider(
   systemPrompt: string,
   messages: LlmMessage[],
   maxTokens: number,
+  jsonMode = false,
 ): Promise<{ content: string; tokensIn: number; tokensOut: number }> {
   const client = getSdkClient(cfg.provider, cfg.apiKey);
 
@@ -128,11 +130,12 @@ async function callProvider(
     return { content: block?.type === "text" ? block.text : "", tokensIn: res.usage.input_tokens, tokensOut: res.usage.output_tokens };
   }
 
-  if (cfg.provider === "openai") {
+  if (cfg.provider === "openai" || cfg.provider === "deepseek") {
     const c = client as OpenAI;
     const res = await c.chat.completions.create({
       model: cfg.modelo, max_tokens: maxTokens,
       messages: [{ role: "system", content: systemPrompt }, ...messages.map(m => ({ role: m.role, content: m.content }))],
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
     return { content: res.choices[0]?.message?.content ?? "", tokensIn: res.usage?.prompt_tokens ?? 0, tokensOut: res.usage?.completion_tokens ?? 0 };
   }
@@ -142,6 +145,7 @@ async function callProvider(
     const res = await c.chat.completions.create({
       model: cfg.modelo, max_tokens: maxTokens,
       messages: [{ role: "system", content: systemPrompt }, ...messages.map(m => ({ role: m.role, content: m.content }))],
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     });
     return { content: res.choices[0]?.message?.content ?? "", tokensIn: res.usage?.prompt_tokens ?? 0, tokensOut: res.usage?.completion_tokens ?? 0 };
   }
@@ -151,7 +155,7 @@ async function callProvider(
     const res = await c.models.generateContent({
       model: cfg.modelo,
       contents: messages.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
-      config: { systemInstruction: systemPrompt, maxOutputTokens: maxTokens },
+      config: { systemInstruction: systemPrompt, maxOutputTokens: maxTokens, ...(jsonMode ? { responseMimeType: "application/json" } : {}) },
     });
     return { content: res.text ?? "", tokensIn: res.usageMetadata?.promptTokenCount ?? 0, tokensOut: res.usageMetadata?.candidatesTokenCount ?? 0 };
   }
@@ -232,6 +236,7 @@ export async function extractJsonSafe<T>(opts: {
           cfg, EXTRACT_SYSTEM,
           [{ role: "user", content: `${instruction}\n\nTexto:\n${text}\n\nResponda APENAS com JSON válido, sem markdown, sem explicações.` }],
           maxTokens,
+          true,
         );
         const cleaned = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
         try {

@@ -38,7 +38,7 @@ const EVENTOS_SUGERIDOS = [
 type LlmProvedor = {
   id: string;
   ordem: number;
-  provider: "anthropic" | "openai" | "groq" | "gemini";
+  provider: "anthropic" | "openai" | "groq" | "gemini" | "deepseek";
   modelo: string;
   apiKey: string;
   ativo: boolean;
@@ -49,6 +49,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   openai:    "OpenAI (GPT)",
   groq:      "Groq (Llama/Mixtral)",
   gemini:    "Google (Gemini)",
+  deepseek:  "DeepSeek",
 };
 
 const PROVIDER_MODELOS: Record<string, { value: string; label: string }[]> = {
@@ -71,12 +72,18 @@ const PROVIDER_MODELOS: Record<string, { value: string; label: string }[]> = {
     { value: "gemini-2.0-flash",             label: "Gemini 2.0 Flash (rápido/barato)" },
     { value: "gemini-2.5-pro-preview-03-25", label: "Gemini 2.5 Pro Preview" },
   ],
+  deepseek: [
+    { value: "deepseek-v4-pro",   label: "DeepSeek V4 Pro (mais capaz)" },
+    { value: "deepseek-v4-flash", label: "DeepSeek V4 Flash (rápido/barato)" },
+    { value: "deepseek-chat",     label: "DeepSeek V3" },
+    { value: "deepseek-reasoner", label: "DeepSeek R1 (raciocínio)" },
+  ],
 };
 
 type LlmForm = {
   id?: string;
   ordem: number;
-  provider: "anthropic" | "openai" | "groq" | "gemini";
+  provider: "anthropic" | "openai" | "groq" | "gemini" | "deepseek";
   modelo: string;
   apiKey: string;
   ativo: boolean;
@@ -235,31 +242,39 @@ function LlmProvedoresCard({ projetoId }: { projetoId: string }) {
       )}
 
       <div className="space-y-2">
-        {provedores.map((p) => (
-          <div key={p.id} className="flex items-center gap-3 bg-gray-50 border rounded-lg px-4 py-3">
-            <div className="w-7 h-7 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-700 font-bold text-xs flex-shrink-0">
-              {p.ordem}
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="font-medium text-gray-800 text-sm">{PROVIDER_LABELS[p.provider] ?? p.provider}</span>
-                <span className={`text-xs px-2 py-0.5 rounded-full ${p.ativo ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
-                  {p.ativo ? "ativo" : "inativo"}
-                </span>
+        {provedores.map((p, idx) => {
+          const emUso = p.ativo && provedores.slice(0, idx).every(x => !x.ativo);
+          const modelLabel = PROVIDER_MODELOS[p.provider]?.find(m => m.value === p.modelo)?.label ?? p.modelo;
+          return (
+            <div key={p.id} className={`flex items-center gap-3 border rounded-lg px-4 py-3 ${emUso ? "bg-indigo-50 border-indigo-300" : "bg-gray-50"}`}>
+              <div className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs flex-shrink-0 ${emUso ? "bg-indigo-600 text-white" : "bg-indigo-100 text-indigo-700"}`}>
+                {p.ordem}
               </div>
-              <p className="text-xs text-gray-500">{p.modelo}</p>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium text-gray-800 text-sm">{PROVIDER_LABELS[p.provider] ?? p.provider}</span>
+                  {emUso && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-600 text-white font-semibold">em uso</span>
+                  )}
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${p.ativo ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                    {p.ativo ? "ativo" : "inativo"}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-600 font-medium mt-0.5">{modelLabel}</p>
+                {modelLabel !== p.modelo && <p className="text-xs text-gray-400">{p.modelo}</p>}
+              </div>
+              <div className="flex gap-2 flex-shrink-0">
+                <button onClick={() => openEdit(p)} className="text-xs text-indigo-600 hover:underline">Editar</button>
+                <button
+                  onClick={() => { if (confirm("Remover este provedor?")) deleteLlm.mutate({ id: p.id, projetoId }); }}
+                  className="text-xs text-red-500 hover:underline"
+                >
+                  Remover
+                </button>
+              </div>
             </div>
-            <div className="flex gap-2 flex-shrink-0">
-              <button onClick={() => openEdit(p)} className="text-xs text-indigo-600 hover:underline">Editar</button>
-              <button
-                onClick={() => { if (confirm("Remover este provedor?")) deleteLlm.mutate({ id: p.id, projetoId }); }}
-                className="text-xs text-red-500 hover:underline"
-              >
-                Remover
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

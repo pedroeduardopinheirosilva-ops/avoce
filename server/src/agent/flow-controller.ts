@@ -11,6 +11,7 @@
 import { prisma } from "../db.js";
 import { extractJson } from "./llm.js";
 import { saveFlowStepData } from "./deal-repository.js";
+import type { VinculoEmprego } from "./types.js";
 
 // ── Cache ──────────────────────────────────────────────────────────────────
 
@@ -106,6 +107,8 @@ export type AdvogadoFlowResult = {
   stepType?: string | null;
   /** The chave of the step that was just set as current (useful to fire side-effects on step transitions) */
   nextStepChave?: string | null;
+  /** The campoColetar of the current step — used to skip the mandatory-question instruction when already collected */
+  campoColetar?: string | null;
 };
 
 /**
@@ -116,15 +119,26 @@ export type AdvogadoFlowResult = {
  *   advances the step, and returns the next question.
  * Returns null when the flow is complete or not configured.
  */
-export async function initAdvogadoFlowIfNeeded(projetoId: string, dealId: string): Promise<string | null> {
+export async function initAdvogadoFlowIfNeeded(
+  projetoId: string,
+  dealId: string,
+): Promise<{ message: string | null; firstStepChave: string | null }> {
   const steps = await loadSteps(projetoId, "advogado", "advogado");
   const firstStep = steps[0];
-  if (!firstStep) return null;
-  await prisma.crmDeal.update({
-    where: { id: dealId },
-    data: { iaFlowStepChave: firstStep.chave, iaFlowStepData: {} },
-  });
-  return (firstStep.pergunta as string) ?? null;
+  if (!firstStep) return { message: null, firstStepChave: null };
+  // Reset flow step data but preserve apresentacao_enviado (the concurrency lock flag
+  // written by enviarMensagemProativa before this call — wiping it would allow duplicate sends).
+  await prisma.$executeRaw`
+    UPDATE "CrmDeal"
+    SET "iaFlowStepChave" = ${firstStep.chave},
+        "iaFlowStepData" = CASE
+          WHEN COALESCE("iaFlowStepData", '{}') ? 'apresentacao_enviado'
+          THEN '{"apresentacao_enviado": true}'::jsonb
+          ELSE '{}'::jsonb
+        END
+    WHERE id = ${dealId}
+  `;
+  return { message: (firstStep.pergunta as string) ?? null, firstStepChave: firstStep.chave as string };
 }
 
 export async function advanceAdvogadoFlow(
@@ -137,6 +151,7 @@ export async function advanceAdvogadoFlow(
   },
   incomingText: string,
   outgoingCount: number,
+  history?: Array<{ direcao: string; conteudo?: string | null }>,
 ): Promise<AdvogadoFlowResult> {
   const steps = await loadSteps(projetoId, "advogado", "advogado");
   if (!steps.length) return { nextQuestion: null };
@@ -144,15 +159,29 @@ export async function advanceAdvogadoFlow(
   const currentStepChave = deal.iaFlowStepChave;
   const merged = (deal.qualificacao as Record<string, unknown>) ?? {};
 
-  // First interaction with Daniela — send step 1 without validation
-  if (!currentStepChave || currentStepChave === "" || outgoingCount === 0) {
+  // First interaction with Daniela — send step 1 without validation.
+  // Only triggered when iaFlowStepChave is truly absent (null/empty).
+  // outgoingCount === 0 is NOT a valid restart signal: the deal may already be in progress
+  // but this be the first message of a new WhatsApp session.
+  if (!currentStepChave || currentStepChave === "") {
     const firstStep = steps[0];
     if (!firstStep) return { nextQuestion: null };
+    const existingStepData = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
+    // P1 guard: cron's $executeRaw lock writes apresentacao_enviado=true before calling
+    // initAdvogadoFlowIfNeeded. If that flag is already true when the webhook reads the deal,
+    // the cron won the race — return null so the webhook path doesn't send a duplicate intro.
+    if (existingStepData.apresentacao_enviado === true) {
+      return { nextQuestion: null };
+    }
     await prisma.crmDeal.update({
       where: { id: deal.id },
-      data: { iaFlowStepChave: firstStep.chave, iaFlowStepData: {} },
+      data: {
+        iaFlowStepChave: firstStep.chave,
+        // Preserve the apresentacao_enviado concurrency lock — do not wipe it.
+        iaFlowStepData: { apresentacao_enviado: existingStepData.apresentacao_enviado ?? false },
+      },
     });
-    return { nextQuestion: firstStep.pergunta as string, stepType: firstStep.stepType as string, nextStepChave: firstStep.chave as string };
+    return { nextQuestion: firstStep.pergunta as string, stepType: firstStep.stepType as string, nextStepChave: firstStep.chave as string, campoColetar: firstStep.campoColetar ?? null };
   }
 
   // Flow already completed or discarded
@@ -175,16 +204,17 @@ export async function advanceAdvogadoFlow(
     const alreadySent = stepData[`${currentStepChave}_enviado`] === true;
     if (!alreadySent) {
       // Not yet sent — return instruction so stage-engine generates the LLM response
-      return { nextQuestion: currentStep.pergunta as string, stepType: "llm_generated", nextStepChave: currentStepChave };
+      return { nextQuestion: currentStep.pergunta as string, stepType: "llm_generated", nextStepChave: currentStepChave, campoColetar: null };
     }
     // Already sent — user is responding to it, advance
     console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" (llm_generated) already sent — advancing`);
     return await advanceToNextStep(deal, steps, currentStep, {}, null);
   }
 
-  // For plain data-collection steps (campoColetar set, no gates): any substantive text counts as answered.
-  // Skip the answered=true gate to avoid loops where the LLM rejects typed data for a step that originally
-  // asked for a document. Just extract the value and advance.
+  // For plain data-collection steps (campoColetar set, no gates): extract and advance.
+  // Guard: only advance if the field was actually extracted, OR the lead has already
+  // tried 2+ times (deliberate impatience). This prevents silently losing required
+  // fields when the lead sends a non-answer like "pode seguir".
   const ACKS_REGEX_FC = /^(ok|certo|beleza|tá|ta|aham|combinado|opa|oi|sim|não|nao|blz|bom|legal)\.?$/i;
   const isSubstantive = incomingText.replace(/\s/g, "").length >= 4 && !ACKS_REGEX_FC.test(incomingText.trim());
   if (currentStep.campoColetar && !currentStep.gates.length && isSubstantive) {
@@ -194,8 +224,27 @@ export async function advanceAdvogadoFlow(
       text: `Pergunta: "${currentStep.pergunta}"\nResposta: "${incomingText}"`,
       maxTokens: 128,
     });
-    console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" answered=true (verbal) extracted=${JSON.stringify(extracted ?? {})}`);
-    return await advanceToNextStep(deal, steps, currentStep, extracted ?? {}, null);
+    const campoExtraido = extracted != null &&
+      Object.values(extracted).some(v => v !== null && v !== undefined && v !== "");
+    const stepData = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
+    const tentativasKey = `${currentStepChave}_tentativas`;
+    const tentativas = (stepData[tentativasKey] as number) ?? 0;
+    if (campoExtraido || tentativas >= 2) {
+      console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" answered=true extracted=${JSON.stringify(extracted ?? {})} tentativas=${tentativas}`);
+      return await advanceToNextStep(deal, steps, currentStep, extracted ?? {}, null);
+    }
+    const novasTentativas = tentativas + 1;
+    await saveFlowStepData(deal, { [tentativasKey]: novasTentativas }, currentStepChave);
+    console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" campo não extraído — tentativa ${novasTentativas}/3`);
+    return { nextQuestion: currentStep.pergunta as string, stepType: currentStep.stepType as string, campoColetar: currentStep.campoColetar ?? null };
+  }
+
+  // Clear gate-silence flag — lead sent a new message, allow re-evaluation
+  if (currentStep.gates.length > 0) {
+    const existingData = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
+    if (existingData._gate_silenciado === true) {
+      await saveFlowStepData(deal, { _gate_silenciado: false }, currentStepChave);
+    }
   }
 
   // Build gate context for the LLM
@@ -203,36 +252,63 @@ export async function advanceAdvogadoFlow(
     ? `Gates disponíveis:\n${currentStep.gates.map((g: any) => `  id:"${g.id}" condição:"${g.condicao}"`).join("\n")}\n\nRetorne: { "answered": boolean, "gate_id": "id_do_gate que se aplica ou null", "extracted": { "campo": "valor_extraido" } }`
     : `Retorne: { "answered": boolean, "gate_id": null, "extracted": { "${currentStep.campoColetar ?? "dado"}": "valor_extraído" } }`;
 
+  // When the step has no fixed question (llm_generated/gate with empty pergunta), inject the last
+  // outgoing message as context so the gate LLM knows what was said before the client responded.
+  const lastOutMsg = currentStep.pergunta
+    ? null
+    : (history ?? [])
+        .filter((m) => m.direcao === "out")
+        .slice(-2)
+        .map((m) => m.conteudo ?? "")
+        .filter(Boolean)
+        .join("\n");
+
+  const perguntaCtx = currentStep.pergunta
+    ? `Pergunta que foi feita ao cliente: "${currentStep.pergunta}"`
+    : lastOutMsg
+      ? `Última mensagem enviada pela advogada:\n"${lastOutMsg}"`
+      : `(sem pergunta específica — avalie apenas a resposta do cliente)`;
+
   const validation = await extractJson<{
     answered: boolean;
     gate_id?: string | null;
     extracted?: Record<string, string>;
   }>({
     projetoId,
-    instruction:
-      `Pergunta que foi feita ao cliente: "${currentStep.pergunta}"\n\n` +
-      gatesContext,
+    instruction: `${perguntaCtx}\n\n${gatesContext}`,
     text: `Resposta do cliente: "${incomingText}"`,
     maxTokens: 256,
   });
 
-  // Not answered or LLM failed → repeat current question (preserve stepType so llm_generated is never sent verbatim)
+  // Not answered or LLM failed
   if (!validation || !validation.answered) {
+    if (currentStep.gates.length > 0) {
+      // Gate step: no match — stay silent, don't pester the lead
+      console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" — gate sem match, silêncio`);
+      await saveFlowStepData(deal, { _gate_silenciado: true }, currentStepChave);
+      return { nextQuestion: null, stepType: currentStep.stepType as string ?? null, nextStepChave: currentStepChave };
+    }
     console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" — não respondida, repetindo`);
-    return { nextQuestion: currentStep.pergunta as string, stepType: currentStep.stepType as string };
+    return { nextQuestion: currentStep.pergunta as string, stepType: currentStep.stepType as string, campoColetar: currentStep.campoColetar ?? null };
   }
 
   console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" answered=true gate="${validation.gate_id ?? "none"}"`);
 
   // Handle gate action if step has gates
-  if (currentStep.gates.length > 0 && validation.gate_id) {
-    const gate = currentStep.gates.find((g: any) => g.id === validation.gate_id);
+  if (currentStep.gates.length > 0) {
+    const gate = validation.gate_id
+      ? currentStep.gates.find((g: any) => g.id === validation.gate_id)
+      : null;
     if (gate) {
       return await executeGateAction(deal, steps, currentStep, gate, validation.extracted ?? {});
     }
+    // gate_id not matched — silence
+    console.log(`[FlowController] dealId=${deal.id} step="${currentStepChave}" — gate_id="${validation.gate_id ?? "null"}" sem match, silêncio`);
+    await saveFlowStepData(deal, { _gate_silenciado: true }, currentStepChave);
+    return { nextQuestion: null, stepType: currentStep.stepType as string ?? null, nextStepChave: currentStepChave };
   }
 
-  // No gate or gate not matched → continue
+  // No gate → continue to next step
   return await advanceToNextStep(deal, steps, currentStep, validation.extracted ?? {}, null);
 }
 
@@ -295,8 +371,39 @@ function validarTransicaoFase(
   return { permitido: true };
 }
 
-function isFieldCollected(merged: Record<string, unknown>, campo: string): boolean {
-  const value = merged[campo];
+// Fallback keys: OCR pipeline stores CNH name as "nome" (not "nome_completo").
+// Only alias when the stored value looks like a full name (2+ words).
+const CAMPO_ALIAS: Record<string, string> = {
+  nome_completo: "nome",
+};
+
+// Salary and jornada fields collected by Ana land in vinculos[0], not flat merged.
+const VINCULO_FALLBACK: Record<string, (v: VinculoEmprego) => unknown> = {
+  salario_total_declarado:  (v) => v.salario_holerite  ?? v.salario_por_fora,
+  salario_holerite:         (v) => v.salario_holerite,
+  salario_mensal:           (v) => v.salario_holerite  ?? v.salario_por_fora,
+  jornada_descricao:        (v) => v.jornada_inicio    ?? v.jornada_fim,
+  jornada_inicio:           (v) => v.jornada_inicio,
+  horas_extras_descricao:   (v) => v.horas_extras,
+  pagamento_fora_descricao: (v) => v.pagamento_fora,
+};
+
+function isFieldCollected(
+  merged: Record<string, unknown>,
+  campo: string,
+  vinculos?: VinculoEmprego[],
+): boolean {
+  let value = merged[campo];
+  if ((value == null || (typeof value === "string" && value.trim().length === 0)) && CAMPO_ALIAS[campo]) {
+    const aliasVal = merged[CAMPO_ALIAS[campo]];
+    if (typeof aliasVal === "string" && aliasVal.trim().includes(" ")) {
+      value = aliasVal;
+    }
+  }
+  if (value == null && VINCULO_FALLBACK[campo] && vinculos && vinculos.length > 0) {
+    const val = VINCULO_FALLBACK[campo](vinculos[0]);
+    if (val != null && val !== "") return true;
+  }
   if (value == null) return false;
   if (typeof value === "string" && value.trim().length === 0) return false;
   if (Array.isArray(value) && value.length === 0) return false;
@@ -319,6 +426,7 @@ async function advanceToNextStep(
 
   if (!nextStepChave) {
     let idx = steps.findIndex((s: any) => s.chave === currentStep.chave);
+    const vinculos = Array.isArray(merged.vinculos) ? merged.vinculos as VinculoEmprego[] : [];
 
     // Sprint 2/3: pre-skip de steps cujo campo já está coletado + validação de fase
     while (true) {
@@ -332,7 +440,7 @@ async function advanceToNextStep(
       // Pre-skip: campo já coletado — usa merged (qualificacao + stepData) exceto para campos
       // que Daniela precisa confirmar explicitamente (nunca pular mesmo que estejam na qualificacao)
       const NUNCA_PULAR = new Set(["estado_civil", "nacionalidade"]);
-      if (candidate.campoColetar && !NUNCA_PULAR.has(candidate.campoColetar) && isFieldCollected(merged, candidate.campoColetar)) {
+      if (candidate.campoColetar && !NUNCA_PULAR.has(candidate.campoColetar) && isFieldCollected(merged, candidate.campoColetar, vinculos)) {
         console.log(`[FlowController] Pre-skip step "${candidate.chave}" — campo "${candidate.campoColetar}" já coletado`);
         continue;
       }
@@ -357,7 +465,7 @@ async function advanceToNextStep(
   await saveFlowStepData(deal, extracted, nextStepChave!);
 
   const nextStep = steps.find((s: any) => s.chave === nextStepChave);
-  return { nextQuestion: nextStep?.pergunta ?? null, stepType: nextStep?.stepType ?? null, nextStepChave: nextStep?.chave ?? null };
+  return { nextQuestion: nextStep?.pergunta ?? null, stepType: nextStep?.stepType ?? null, nextStepChave: nextStep?.chave ?? null, campoColetar: nextStep?.campoColetar ?? null };
 }
 
 /** @deprecated Use advanceAdvogadoFlow */

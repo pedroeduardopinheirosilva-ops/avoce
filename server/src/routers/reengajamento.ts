@@ -66,6 +66,130 @@ const PIPELINE_SEED = {
   ],
 };
 
+// ── Pipeline Reengajamento RAP (novo funil Dra. Daniela) ─────────────────────
+
+const RAP_REENG_STAGES = [
+  { chave: "reeng_importado",    nome: "📥 Importado",              ordem: 0, cor: "#6b7280", ehEntrada: true },
+  { chave: "reeng_msg_enviada",  nome: "📨 Mensagem enviada",       ordem: 1, cor: "#3b82f6" },
+  { chave: "reeng_respondido",   nome: "💬 Em contato",             ordem: 2, cor: "#8b5cf6" },
+  { chave: "reeng_vinculo",      nome: "🔍 Coletando vínculo",      ordem: 3, cor: "#f59e0b" },
+  { chave: "reeng_advogado",     nome: "👩‍⚖️ Dra. Daniela",         ordem: 4, cor: "#10b981" },
+  { chave: "reeng_parecer",      nome: "📋 Parecer emitido",        ordem: 5, cor: "#6366f1" },
+  { chave: "reeng_fechado",      nome: "✅ Fechado",                ordem: 6, cor: "#059669", ehGanho: true },
+  { chave: "reeng_perdido",      nome: "❌ Perdido",                ordem: 7, cor: "#dc2626", ehEncerramento: true },
+];
+
+const RAP_FASES_FUNIL: { chave: string; personaChave: string; nome: string }[] = [
+  { chave: "reeng_importado",  personaChave: "assistente", nome: "Importado" },
+  { chave: "reeng_msg_enviada", personaChave: "assistente", nome: "Mensagem enviada" },
+  { chave: "reeng_respondido", personaChave: "assistente", nome: "Em contato" },
+  { chave: "reeng_vinculo",    personaChave: "assistente", nome: "Coletando vínculo" },
+  { chave: "reeng_advogado",   personaChave: "advogado",   nome: "Dra. Daniela" },
+  { chave: "reeng_parecer",    personaChave: "advogado",   nome: "Parecer emitido" },
+];
+
+const RAP_REENG_REGRAS: { origem: string; destino: string; condicao: string; acao?: string }[] = [
+  { origem: "reeng_msg_enviada", destino: "reeng_respondido", condicao: "cliente_respondeu" },
+  { origem: "reeng_respondido",  destino: "reeng_vinculo",    condicao: "qualificacao_completa" },
+  { origem: "reeng_vinculo",     destino: "reeng_advogado",   condicao: "qualificacao_completa", acao: "trocar_persona:advogado" },
+  { origem: "reeng_advogado",    destino: "reeng_parecer",    condicao: "interesse_confirmado" },
+];
+
+/** Garante que o pipeline Reengajamento RAP existe com stages, fases e regras */
+async function ensureReengPipeline(projetoId: string): Promise<{
+  pipeline: any;
+  stageMap: Map<string, string>;
+}> {
+  // 1. Pipeline + stages
+  let pipeline = await prisma.crmPipeline.findFirst({
+    where: { nome: "Reengajamento RAP" },
+    include: { stages: true },
+  });
+
+  if (!pipeline) {
+    pipeline = await prisma.crmPipeline.create({
+      data: { nome: "Reengajamento RAP", tipo: "comercial", cor: "#6b7280", ordem: 99 },
+      include: { stages: true },
+    });
+  }
+
+  const stageMap = new Map<string, string>();
+  for (const s of (pipeline as any).stages) stageMap.set(s.chave, s.id);
+  for (const sd of RAP_REENG_STAGES) {
+    if (!stageMap.has(sd.chave)) {
+      const created = await prisma.crmStage.create({
+        data: {
+          pipelineId: (pipeline as any).id,
+          chave: sd.chave,
+          nome: sd.nome,
+          ordem: sd.ordem,
+          cor: sd.cor,
+          ehEntrada: (sd as any).ehEntrada ?? false,
+          ehGanho: (sd as any).ehGanho ?? false,
+          ehEncerramento: (sd as any).ehEncerramento ?? false,
+        },
+      });
+      stageMap.set(sd.chave, created.id);
+    }
+  }
+
+  // 2. IaFaseFunil — mapear estágios → personas
+  for (const f of RAP_FASES_FUNIL) {
+    const exists = await prisma.iaFaseFunil.findFirst({
+      where: { projetoId, chave: f.chave },
+    });
+    if (!exists) {
+      await prisma.iaFaseFunil.create({
+        data: {
+          projetoId,
+          pipelineId: (pipeline as any).id,
+          chave: f.chave,
+          nomeExibicao: f.nome,
+          personaChave: f.personaChave,
+          pipelineTipo: "comercial",
+          ordem: RAP_REENG_STAGES.find(s => s.chave === f.chave)?.ordem ?? 99,
+        },
+      });
+    }
+  }
+
+  // 3. IaRegraTransicao
+  for (const r of RAP_REENG_REGRAS) {
+    const exists = await prisma.iaRegraTransicao.findFirst({
+      where: {
+        projetoId,
+        stageOrigemChave: r.origem,
+        stageDestinoChave: r.destino,
+        condicao: r.condicao,
+      },
+    });
+    if (!exists) {
+      await prisma.iaRegraTransicao.create({
+        data: {
+          projetoId,
+          stageOrigemChave: r.origem,
+          stageDestinoChave: r.destino,
+          condicao: r.condicao,
+          acaoAdicional: r.acao,
+          ordem: RAP_REENG_REGRAS.indexOf(r),
+        },
+      });
+    }
+  }
+
+  return { pipeline, stageMap };
+}
+
+/** Mapeia segmento do JSON para estágio inicial do funil */
+function mapSegmentToStage(segmento: number | null): { stage: string; persona: string } {
+  if (!segmento || segmento <= 2) return { stage: "reeng_importado", persona: "assistente" };
+  if (segmento === 3) return { stage: "reeng_respondido", persona: "assistente" };
+  if (segmento === 4) return { stage: "reeng_vinculo", persona: "assistente" };
+  if (segmento === 5) return { stage: "reeng_advogado", persona: "advogado" };
+  if (segmento === 6) return { stage: "reeng_respondido", persona: "assistente" };
+  return { stage: "reeng_importado", persona: "assistente" };
+}
+
 export const reengajamentoRouter = router({
 
   listar: authProc.query(async () => {
@@ -929,6 +1053,182 @@ ${notasTexto.slice(0, 2500)}`;
         totalAnalisados: analisados,
         totalDeals: total,
         pendentes: total - analisados,
+      };
+    }),
+
+  // ── Disparar leads importados do JSON (mensagens personalizadas) ──────────
+
+  dispararImportados: authProc
+    .input(z.object({
+      projetoId: z.string().min(1),
+      stageChaves: z.array(z.string()).optional(),
+      maxDeals: z.number().int().min(1).max(2000).default(200),
+      delayMs: z.number().int().min(100).max(30000).default(1000),
+    }))
+    .mutation(async ({ input }) => {
+      // 1. Garantir pipeline Reengajamento RAP (cria se não existir)
+      const { pipeline, stageMap } = await ensureReengPipeline(input.projetoId);
+      const msgEnviadaId = stageMap.get("reeng_msg_enviada");
+      const importadoId = stageMap.get("reeng_importado");
+
+      // 2. Buscar configs do projeto Evolution API
+      const configs = await prisma.iaProjetoConfig.findMany({
+        where: { projetoId: input.projetoId },
+      });
+      const evolutionUrl = configs.find(c => c.chave === "evolution_url")?.valor;
+      const evolutionApiKey = configs.find(c => c.chave === "evolution_api_key")?.valor;
+      const projeto = await prisma.iaProjeto.findUnique({ where: { id: input.projetoId } });
+      const evolutionInstance = projeto?.whatsappInstancia;
+
+      if (!evolutionUrl || !evolutionApiKey || !evolutionInstance) {
+        return { ok: false, error: "Evolution API não configurada no projeto" };
+      }
+
+      // 3. Buscar deals em reeng_importado com mensagem personalizada
+      const stageIds = input.stageChaves?.length
+        ? input.stageChaves.map(ch => stageMap.get(ch)).filter(Boolean)
+        : importadoId ? [importadoId] : [];
+
+      if (!stageIds.length) return { ok: false, error: "Nenhum stage alvo encontrado" };
+
+      const deals = await prisma.crmDeal.findMany({
+        where: {
+          pipelineId: (pipeline as any).id,
+          stageId: { in: stageIds as string[] },
+          status: "aberto",
+          projetoId: input.projetoId,
+          iaAtiva: true,
+          OR: [{ ultimoContatoEm: null }],
+        },
+        include: { contato: true },
+        orderBy: { criadoEm: "asc" },
+        take: input.maxDeals,
+      });
+
+      if (!deals.length) return { ok: true, enviados: 0, msg: "Nenhum lead pendente de disparo.", total: 0 };
+
+      let enviados = 0;
+      let semMensagem = 0;
+      const erros: string[] = [];
+
+      for (const deal of deals) {
+        const customFields = (deal.camposCustom as Record<string, any>) ?? {};
+        const mensagem = customFields?.ia_mensagem_personalizada;
+        if (!mensagem) { semMensagem++; continue; }
+
+        const phone = deal.contato?.whatsapp;
+        if (!phone) { semMensagem++; continue; }
+
+        try {
+          const phoneNum = phone.replace(/\D/g, "");
+          const resp = await fetch(`${evolutionUrl}/message/sendText/${evolutionInstance}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", apikey: evolutionApiKey },
+            body: JSON.stringify({ number: phoneNum, text: mensagem }),
+          });
+
+          if (!resp.ok) {
+            erros.push(`Deal ${deal.id}: Evolution HTTP ${resp.status}`);
+            continue;
+          }
+
+          await prisma.crmDeal.update({
+            where: { id: deal.id },
+            data: {
+              stageId: msgEnviadaId ?? deal.stageId,
+              iaStageChave: "reeng_msg_enviada",
+              ultimoContatoEm: new Date(),
+              camposCustom: {
+                ...customFields,
+                ia_mensagem_enviada_em: new Date().toISOString(),
+              },
+            },
+          });
+
+          await prisma.crmDealStageLog.create({
+            data: {
+              dealId: deal.id,
+              stageAnteriorId: deal.stageId,
+              stageNovoId: msgEnviadaId ?? deal.stageId,
+              motivo: "Mensagem de reengajamento enviada",
+            },
+          });
+
+          await prisma.crmMensagemWhatsapp.create({
+            data: {
+              dealId: deal.id,
+              contatoId: deal.contatoId ?? undefined,
+              direcao: "out",
+              personaChave: "advogado",
+              conteudo: mensagem,
+              tipo: "text",
+            },
+          });
+
+          enviados++;
+          await new Promise(r => setTimeout(r, input.delayMs));
+        } catch (e: any) {
+          erros.push(`Deal ${deal.id}: ${e.message}`);
+        }
+      }
+
+      return {
+        ok: true,
+        enviados,
+        semMensagem,
+        erros,
+        total: deals.length,
+      };
+    }),
+
+  // ── Status dos leads importados ───────────────────────────────────────────
+
+  statusImportados: authProc
+    .input(z.object({ projetoId: z.string().optional() }))
+    .query(async ({ input }) => {
+      const pipeline = await prisma.crmPipeline.findFirst({
+        where: { nome: "Reengajamento RAP" },
+        include: { stages: true },
+      });
+      if (!pipeline) return { total: 0, stages: [], enviados: 0, pendentes: 0 };
+
+      const whereProjeto = input.projetoId ? { projetoId: input.projetoId } : {};
+
+      const deals = await prisma.crmDeal.findMany({
+        where: {
+          pipelineId: pipeline.id,
+          status: "aberto",
+          ...whereProjeto,
+        },
+        include: { stage: { select: { id: true, chave: true, nome: true } } },
+      });
+
+      const stageCounts = new Map<string, { chave: string; nome: string; total: number; enviados: number }>();
+      for (const s of pipeline.stages) {
+        stageCounts.set(s.chave, { chave: s.chave, nome: s.nome, total: 0, enviados: 0 });
+      }
+
+      let enviados = 0;
+      for (const d of deals) {
+        const chave = d.iaStageChave || d.stage.chave;
+        const counter = stageCounts.get(chave);
+        if (counter) counter.total++;
+        const cf = (d.camposCustom as Record<string, any>) ?? {};
+        if (cf.ia_mensagem_enviada_em) {
+          enviados++;
+          if (counter) counter.enviados++;
+        }
+      }
+
+      // Pipeline ID para link ao Kanban
+      const pipelineId = (pipeline as any).id;
+
+      return {
+        pipelineId,
+        total: deals.length,
+        stages: Array.from(stageCounts.values()).filter(s => s.total > 0),
+        enviados,
+        pendentes: deals.length - enviados,
       };
     }),
 });

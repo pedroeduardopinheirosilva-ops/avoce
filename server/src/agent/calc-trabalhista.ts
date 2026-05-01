@@ -21,6 +21,8 @@ export interface VinculoCalculo {
   modalidade_saida?: "demitido_sem_justa_causa" | "rescisao_indireta" | "pedido_demissao" | "ainda_trabalha";
   injustica_relatada?: string;
   frota_empresa?: number;
+  fgtsOk?: "sim" | "nao" | "parcial";
+  situacaoCtps?: "assinada" | "nao_assinada" | "parcial";
 }
 
 export interface TeseAplicavel {
@@ -219,6 +221,70 @@ function calcularVerbaRescisoria(
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// FGTS não depositado
+// ──────────────────────────────────────────────────────────────────────────────
+
+function calcularFgtsNaoDepositado(
+  v: VinculoCalculo,
+  salarioBase: number,
+  meses: number
+): { min: number; max: number; tese: TeseAplicavel | null; obs: string[] } {
+  const obs: string[] = [];
+  const fgtsOk = v.fgtsOk ?? "sim";
+
+  if (fgtsOk === "sim") {
+    return { min: 0, max: 0, tese: null, obs };
+  }
+
+  // 8% mensal não depositado
+  const depositoMensal = salarioBase * 0.08;
+
+  if (fgtsOk === "nao") {
+    // Nenhum depósito foi feito — total integral devido
+    const totalDevido = depositoMensal * meses;
+    // Com correção monetária + juros aproximados (1% a.m. + correção)
+    const totalCorrigido = totalDevido * 1.3;
+    const totalMin = Math.round(totalDevido * 0.85);
+    const totalMax = Math.round(totalCorrigido);
+
+    obs.push(`FGTS não depositado: ${meses} meses × R$ ${depositoMensal.toFixed(2)}/mês = R$ ${totalDevido.toFixed(2)}, mais correção + juros`);
+
+    return {
+      min: totalMin,
+      max: totalMax,
+      tese: {
+        tese: "FGTS não depositado durante o contrato",
+        fundamento: "Lei 8.036/90, art. 297 CLT",
+        valor_min: totalMin,
+        valor_max: totalMax,
+        observacao: `Empresa não recolheu FGTS por ${meses} meses. Valor já inclui correção monetária + juros estimados.`,
+      },
+      obs,
+    };
+  }
+
+  // fgtsOk === "parcial" — depósitos parciais/irregulares
+  const totalParcial = depositoMensal * meses * 0.5; // estimativa 50% não depositado
+  const totalParcialMin = Math.round(totalParcial * 0.85);
+  const totalParcialMax = Math.round(totalParcial * 1.3);
+
+  obs.push(`FGTS depositado parcialmente — estimando 50% do período sem depósito`);
+
+  return {
+    min: totalParcialMin,
+    max: totalParcialMax,
+    tese: {
+      tese: "Diferenças de FGTS (depósitos parciais/irregulares)",
+      fundamento: "Lei 8.036/90, art. 297 CLT",
+      valor_min: totalParcialMin,
+      valor_max: totalParcialMax,
+      observacao: "Cliente relatou depósitos irregulares — valor estimado proporcional.",
+    },
+    obs,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Teses qualitativas
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -253,6 +319,25 @@ function detectarTesesQualitativas(v: VinculoCalculo): TeseAplicavel[] {
       valor_min: 0,
       valor_max: 0,
       observacao: "Reflexos retroativos em todas as parcelas salariais",
+    });
+  }
+
+  const ctps = v.situacaoCtps ?? "assinada";
+  if (ctps === "nao_assinada") {
+    teses.push({
+      tese: "FGTS não depositado + CTPS não assinada (reconhecimento de vínculo)",
+      fundamento: "art. 29 CLT, art. 47 CLT, Súmula 12 TST",
+      valor_min: 0,
+      valor_max: 0,
+      observacao: "Ausência de registro em CTPS agrava a situação — presunção de todos os direitos trabalhistas. Reforça tese de rescisão indireta.",
+    });
+  } else if (ctps === "parcial") {
+    teses.push({
+      tese: "CTPS assinada com irregularidades (registro parcial/extemporâneo)",
+      fundamento: "art. 29 CLT",
+      valor_min: 0,
+      valor_max: 0,
+      observacao: "Registro em CTPS feito fora do prazo legal de 5 dias — impacta presunção de vínculo no período inicial.",
     });
   }
 
@@ -317,7 +402,7 @@ export function calcularValorCausa(
       const mesesTotais = v.tempo_meses_estimado ?? mesesEntre(inicioEmprego, dataSaida);
       if (meses < mesesTotais - 1) {
         observacoes.push(
-          `${v.empresa}: prescrição quinquenal — recuperável ${Math.round(meses)} meses de ${Math.round(mesesTotais)} trabalhados`
+          `${v.empresa}: período truncado para os últimos 5 anos (prescrição) — recuperável ${Math.round(meses)} de ${Math.round(mesesTotais)} meses trabalhados`
         );
       }
     } else if (v.tempo_meses_estimado) {
@@ -325,7 +410,7 @@ export function calcularValorCausa(
       // Cannot apply the "meses_desde_saída" correction without knowing when they left.
       // This is a known limitation: value will be overestimated if they left long ago.
       meses = Math.min(v.tempo_meses_estimado, JANELA_MESES);
-      observacoes.push(`${v.empresa}: data de saída não informada — valor pode estar superestimado`);
+      observacoes.push(`${v.empresa}: tempo de ${v.tempo_meses_estimado} meses estimado pelo cliente — sem datas confirmadas`);
     } else {
       meses = 12; // fallback conservador
       observacoes.push(`${v.empresa}: período desconhecido — usando 12 meses para estimativa`);
@@ -363,6 +448,17 @@ export function calcularValorCausa(
         todasTeses.push(vr.tese);
         totalMin += vr.min;
         totalMax += vr.max;
+      }
+    }
+
+    // FGTS não depositado (apenas se tem salário)
+    if (salarioBase > 0) {
+      const fgts = calcularFgtsNaoDepositado(v, salarioBase, meses);
+      observacoes.push(...fgts.obs);
+      if (fgts.tese) {
+        todasTeses.push(fgts.tese);
+        totalMin += fgts.min;
+        totalMax += fgts.max;
       }
     }
 

@@ -85,3 +85,41 @@ describe("runAdvogadoAgent", () => {
     expect(result.systemInstructions.length).toBeGreaterThan(0);
   });
 });
+
+// P2 — valor_estimado instruction must cover all vínculos
+describe("runAdvogadoAgent — P2 valor_estimado instruction", () => {
+  it("mentions each vínculo separately when step is valor_estimado", async () => {
+    const pid = "proj-p2-val-" + Date.now();
+    mockFindMany.mockResolvedValue([{ chave: "valor_estimado", fase: "autoridade" }]);
+    const { runAdvogadoAgent } = await import("./advogado-agents.js");
+    const vinculos = [
+      { empresa: "ABCDE Ltda", funcao: "motorista", vinculo: "CLT", tempo: "2 anos" },
+      { empresa: "Transporte Azul", funcao: "motorista", vinculo: "autônomo", tempo: "1 ano" },
+    ];
+    const result = await runAdvogadoAgent({
+      projetoId: pid,
+      iaFlowStepChave: "valor_estimado",
+      merged: { nome: "Pedro" },
+      vinculos,
+    });
+    expect(result.systemInstructions).toMatch(/cada vínculo/i);
+    expect(result.systemInstructions).toContain("ABCDE Ltda");
+    expect(result.systemInstructions).toContain("Transporte Azul");
+  });
+
+  it("mentions total sum when multiple vínculos present", async () => {
+    const pid = "proj-p2-total-" + Date.now();
+    mockFindMany.mockResolvedValue([{ chave: "valor_estimado", fase: "autoridade" }]);
+    const { runAdvogadoAgent } = await import("./advogado-agents.js");
+    const result = await runAdvogadoAgent({
+      projetoId: pid,
+      iaFlowStepChave: "valor_estimado",
+      merged: { nome: "Maria" },
+      vinculos: [
+        { empresa: "Empresa A", funcao: "op", vinculo: "CLT", tempo: "1 ano" },
+        { empresa: "Empresa B", funcao: "op", vinculo: "CLT", tempo: "2 anos" },
+      ],
+    });
+    expect(result.systemInstructions).toMatch(/total/i);
+  });
+});

@@ -102,13 +102,13 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
       }
 
       if (extraido.semMaisEmpregos) {
+        w._mais_empregos_negado = true;
         if (todosCompletos(vinculosAtuais)) {
-          const v0 = vinculosAtuais[0];
-          const tempoMeses = ((v0 as any).tempo_meses_estimado as number | undefined)
-            ?? (v0?.tempo ? parseMesesTempo(v0.tempo) : 0);
-          if (!(tempoMeses > 0 && tempoMeses < 24 && !maisEmpregosPerguntado)) {
-            w._vinculos_ok = true;
-          }
+          w._vinculos_ok = true;
+        } else {
+          // Minimum viability: lead denied more employers — close if empresa+vinculo+saida present
+          const temVinculoValido = vinculosAtuais.some(v => v.empresa && v.vinculo && v.saida);
+          if (temVinculoValido) w._vinculos_ok = true;
         }
         w.vinculos = vinculosAtuais;
 
@@ -151,11 +151,59 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
         w.vinculos = vinculosAtuais;
       }
 
+      // Recovery seed: if LLM returned confirmouMaisEmpregos in a prior call but never created
+      // vinculos[1], seed a partial entry from emprego_anterior_* flat fields. Must run BEFORE
+      // auto-close so the seed entry is counted when determining whether to close.
+      const empresaAnteriorFlat =
+        (merged.emprego_anterior_empresa as string | undefined) ??
+        (merged.empresa_anterior as string | undefined);
+      const deveSedarV1 =
+        !w._vinculos_ok &&
+        vinculosAtuais.length === 1 &&
+        w._mais_empregos_confirmado === true &&
+        !!empresaAnteriorFlat &&
+        empresaAnteriorFlat !== vinculosAtuais[0]?.empresa;
+
+      if (deveSedarV1) {
+        const v1Seed: VinculoEmprego = {
+          ordem: 2,
+          empresa: empresaAnteriorFlat as string,
+          funcao: merged.emprego_anterior_funcao
+            ? String(merged.emprego_anterior_funcao)
+            : vinculosAtuais[0]?.funcao,
+          vinculo: merged.emprego_anterior_vinculo
+            ? String(merged.emprego_anterior_vinculo)
+            : vinculosAtuais[0]?.vinculo,
+          tempo: merged.emprego_anterior_tempo ? String(merged.emprego_anterior_tempo) : undefined,
+          saida: merged.emprego_anterior_saida ? String(merged.emprego_anterior_saida) : undefined,
+          data_saida: undefined,
+          horas_extras: undefined,
+          pagamento_fora: undefined,
+          injustica: undefined,
+        };
+        vinculosAtuais.push(v1Seed);
+        w.vinculos = vinculosAtuais;
+        notas.push(`[IA] Recovery seed vinculos[1]: ${empresaAnteriorFlat}`);
+      }
+
       // Auto-close: 2+ complete vinculos, or 1 complete after mais_empregos was asked
       if (!w._vinculos_ok && todosCompletos(vinculosAtuais) &&
           (vinculosAtuais.length >= 2 || maisEmpregosPerguntado)) {
         w._vinculos_ok = true;
         w.vinculos = vinculosAtuais;
+      }
+
+      // Auto-close (partial): lead confirmed all vinculos with minimum fields,
+      // mais_empregos was already asked and confirmed. Handles leads who go quiet
+      // on secondary fields (horas_extras, pagamento_fora, injustica) of older vinculos.
+      if (!w._vinculos_ok && w._mais_empregos_perguntado === true && vinculosAtuais.length >= 2) {
+        const todosTemMinimo = vinculosAtuais.every(
+          (v: VinculoEmprego) => v.empresa && v.vinculo && v.saida,
+        );
+        if (todosTemMinimo) {
+          w._vinculos_ok = true;
+          w.vinculos = vinculosAtuais;
+        }
       }
 
     } catch (err: any) {
@@ -202,14 +250,16 @@ function buildFlatSync(vinculos: VinculoEmprego[], merged: Record<string, unknow
     if (isNull(merged.injustica_recente) && !isNull(v0.injustica)) s.injustica_recente = v0.injustica;
   }
   if (v1) {
-    if (isNull(merged.emprego_anterior_empresa) && v1.empresa) s.emprego_anterior_empresa = v1.empresa;
-    if (isNull(merged.emprego_anterior_funcao) && v1.funcao) s.emprego_anterior_funcao = v1.funcao;
-    if (isNull(merged.emprego_anterior_vinculo) && v1.vinculo) s.emprego_anterior_vinculo = v1.vinculo;
-    if (isNull(merged.emprego_anterior_tempo) && v1.tempo) s.emprego_anterior_tempo = v1.tempo;
-    if (isNull(merged.emprego_anterior_saida) && (v1.saida ?? v1.data_saida)) s.emprego_anterior_saida = v1.saida ?? v1.data_saida;
-    if (isNull(merged.emprego_anterior_horas_extras) && !isNull(v1.horas_extras)) s.emprego_anterior_horas_extras = v1.horas_extras;
-    if (isNull(merged.emprego_anterior_pagamento_fora) && !isNull(v1.pagamento_fora)) s.emprego_anterior_pagamento_fora = v1.pagamento_fora;
-    if (isNull(merged.emprego_anterior_injustica) && v1.injustica) s.emprego_anterior_injustica = v1.injustica;
+    // vinculos[] is authoritative for emprego_anterior_* — always overwrite (no isNull guard)
+    if (v1.empresa)  s.emprego_anterior_empresa  = v1.empresa;
+    if (v1.funcao)   s.emprego_anterior_funcao   = v1.funcao;
+    if (v1.vinculo)  s.emprego_anterior_vinculo  = v1.vinculo;
+    if (v1.tempo)    s.emprego_anterior_tempo    = v1.tempo;
+    if (v1.saida ?? v1.data_saida) s.emprego_anterior_saida = v1.saida ?? v1.data_saida;
+    if (v1.empresa)  s.empresa_anterior = v1.empresa;
+    if (!isNull(v1.horas_extras))   s.emprego_anterior_horas_extras   = v1.horas_extras;
+    if (!isNull(v1.pagamento_fora)) s.emprego_anterior_pagamento_fora = v1.pagamento_fora;
+    if (v1.injustica) s.emprego_anterior_injustica = v1.injustica;
   }
   return s;
 }

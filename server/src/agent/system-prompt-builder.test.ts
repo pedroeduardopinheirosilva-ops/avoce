@@ -121,4 +121,49 @@ describe("buildSystemPrompt", () => {
     }));
     expect(prescribed).not.toContain("INFORMAÇÕES AINDA NÃO COLETADAS");
   });
+
+  // FIX 2B — skip instruction when campo already collected
+  it("step com campoColetar já em merged → instrução 'já coletado', NÃO OBRIGATÓRIA", () => {
+    const ctx = minimalCtx({
+      personaChave: "advogado",
+      personaNome: "Dra. Daniela Pires",
+      personaInstrucoes: "",
+      nextQDeterministico: "Qual o salário?",
+      advFlowNextStepChave: "comp_salario",
+      advFlowCampoColetar: "salario_total_declarado",
+      merged: { salario_total_declarado: 10000 },
+    });
+    const result = buildSystemPrompt(ctx);
+    expect(result).not.toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+    expect(result).toContain("já foi coletado");
+    expect(result).toContain("10000");
+  });
+
+  it("step com campoColetar ausente no merged → instrução OBRIGATÓRIA", () => {
+    const ctx = minimalCtx({
+      personaChave: "advogado",
+      personaNome: "Dra. Daniela Pires",
+      personaInstrucoes: "",
+      nextQDeterministico: "Qual o salário?",
+      advFlowNextStepChave: "comp_salario",
+      advFlowCampoColetar: "salario_total_declarado",
+      merged: {},
+    });
+    const result = buildSystemPrompt(ctx);
+    expect(result).toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+  });
+
+  it("step de documento (solicitar_cnh) com cpf no merged → mantém instrução OBRIGATÓRIA", () => {
+    const ctx = minimalCtx({
+      personaChave: "advogado",
+      personaNome: "Dra. Daniela Pires",
+      personaInstrucoes: "",
+      nextQDeterministico: "Envie sua CNH",
+      advFlowNextStepChave: "solicitar_cnh",
+      advFlowCampoColetar: "cpf",
+      merged: { cpf: "12345678901" },
+    });
+    const result = buildSystemPrompt(ctx);
+    expect(result).toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+  });
 });

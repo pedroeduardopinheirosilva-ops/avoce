@@ -90,6 +90,7 @@ export async function criarPropostaAutomatica(
       ...(rgCliente       ? { rg: rgCliente }                   : {}),
       ...(orgaoEmissorRg  ? { rgOrgaoEmissor: orgaoEmissorRg }  : {}),
       ...(dataNascimento && !isNaN(dataNascimento.getTime()) ? { dataNascimento } : {}),
+      ...(enderecoCliente ? { endereco: enderecoCliente } : {}),
     };
     if (!tomador) {
       tomador = await prisma.tomador.create({
@@ -247,7 +248,12 @@ export async function criarPropostaAutomatica(
               const signUrl = paktDoc.signers[0]?.signUrl;
               if (signUrl) {
                 paktDocs.push({ titulo: doc.titulo, signUrl, documentId: paktDoc.id });
+              } else {
+                console.error(`[Proposta] PAKT doc ${doc.id}: signUrl ausente — resposta:`, JSON.stringify(paktDoc));
               }
+            } else {
+              const errBody = await createRes.text().catch(() => "(sem corpo)");
+              console.error(`[Proposta] PAKT rejeitou doc ${doc.id}: HTTP ${createRes.status} — ${errBody}`);
             }
           } catch (e) {
             console.error(`[Proposta] PAKT falhou para doc ${doc.id}:`, e);
@@ -289,9 +295,13 @@ export async function criarPropostaAutomatica(
       .trim();
 
     const textoEnviar = textoPlano.length > 3000 ? textoPlano.slice(0, 2997) + "..." : textoPlano;
+    // Normalize phone to JID format for Evolution API
+    const phoneJid = phone.includes("@") ? phone : `${phone}@s.whatsapp.net`;
+    let enviado = false;
     if (textoEnviar) {
-      await sendText(evoConfig, phone, textoEnviar);
+      await sendText(evoConfig, phoneJid, textoEnviar);
       await new Promise(r => setTimeout(r, 1500));
+      enviado = true;
     }
 
     if (paktDocs.length > 0) {
@@ -299,8 +309,12 @@ export async function criarPropostaAutomatica(
         .map((d, i) => `${i + 1}. ${d.titulo}:\n${d.signUrl}`)
         .join("\n\n");
       const msgAssinatura = `Para assinar digitalmente, acesse os links abaixo:\n\n${linhasAssinatura}`;
-      await sendText(evoConfig, phone, msgAssinatura);
+      await sendText(evoConfig, phoneJid, msgAssinatura);
+      enviado = true;
     } else if (templatesGerar.length > 0) {
+      if (paktApiKey) {
+        console.error(`[Proposta] PAKT configurado mas nenhum link gerado para deal ${dealId} — cliente não receberá link de assinatura`);
+      }
       try {
         const docs = await (prisma as any).documentoGerado.findMany({
           where: { propostaId: proposta.id },
@@ -312,9 +326,10 @@ export async function criarPropostaAutomatica(
             const pdfBuf = await readFile(doc.pdfPath);
             const pdfBase64 = pdfBuf.toString("base64");
             const fileName  = `${doc.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`;
-            await sendDocument(evoConfig, phone, pdfBase64, fileName, doc.titulo);
+            await sendDocument(evoConfig, phoneJid, pdfBase64, fileName, doc.titulo);
             console.log(`[Proposta] PDF enviado via WhatsApp: ${doc.titulo}`);
             await new Promise(r => setTimeout(r, 1500));
+            enviado = true;
           } catch (e) {
             console.error(`[Proposta] Falha ao enviar PDF ${doc.id}:`, e);
           }
@@ -324,18 +339,21 @@ export async function criarPropostaAutomatica(
       }
     }
 
-    // Log outgoing message
-    prisma.crmMensagemWhatsapp.create({
-      data: {
-        dealId,
-        direcao: "out",
-        personaChave: "sistema",
-        tipo: "text",
-        conteudo: `[Proposta automática] ${proposta.id} | Contrato gerado e enviado para assinatura`,
-      },
-    }).catch(() => {});
-
-    console.log(`[Proposta] Proposta ${proposta.id} enviada via WhatsApp para ${phone}`);
+    if (enviado) {
+      // Log outgoing message
+      prisma.crmMensagemWhatsapp.create({
+        data: {
+          dealId,
+          direcao: "out",
+          personaChave: "sistema",
+          tipo: "text",
+          conteudo: `[Proposta automática] ${proposta.id} | Contrato gerado e enviado para assinatura`,
+        },
+      }).catch(() => {});
+      console.log(`[Proposta] Proposta ${proposta.id} enviada via WhatsApp para ${phone}`);
+    } else {
+      console.warn(`[Proposta] Proposta ${proposta.id} criada mas NADA enviado ao cliente ${phone}`);
+    }
   } catch (err: any) {
     console.error(`[Proposta] Erro em criarPropostaAutomatica: ${err?.message ?? err}`);
   }

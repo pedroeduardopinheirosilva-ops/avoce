@@ -14,6 +14,23 @@ interface SendTextResult {
   status: string;
 }
 
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit,
+  timeoutMs = 15_000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === "AbortError") throw new Error(`Evolution API timeout após ${timeoutMs}ms: ${url}`);
+    throw err;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 export async function sendText(
   config: EvolutionConfig,
   to: string,
@@ -21,7 +38,7 @@ export async function sendText(
 ): Promise<SendTextResult> {
   const url = `${config.baseUrl}/message/sendText/${config.instancia}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -49,7 +66,7 @@ export async function sendImage(
 ): Promise<SendTextResult> {
   const url = `${config.baseUrl}/message/sendMedia/${config.instancia}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -83,7 +100,7 @@ export async function sendTyping(
   const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
   const url = `${config.baseUrl}/chat/sendPresence/${config.instancia}`;
 
-  await fetch(url, {
+  await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -93,7 +110,7 @@ export async function sendTyping(
       number: jid,
       options: { presence: "composing", delay: durationMs },
     }),
-  }).catch(() => { /* non-critical */ });
+  }, 10_000).catch(() => { /* non-critical */ });
 }
 
 export async function markAsRead(
@@ -102,14 +119,14 @@ export async function markAsRead(
 ): Promise<void> {
   const url = `${config.baseUrl}/message/markMessageAsRead/${config.instancia}`;
 
-  await fetch(url, {
+  await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       apikey: config.apiKey,
     },
     body: JSON.stringify({ read_messages: [messageKey] }),
-  }).catch(() => {
+  }, 10_000).catch(() => {
     /* non-critical */
   });
 }
@@ -125,7 +142,7 @@ export async function sendWhatsAppAudio(
 ): Promise<SendTextResult> {
   const url = `${config.baseUrl}/message/sendWhatsAppAudio/${config.instancia}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -157,7 +174,7 @@ export async function sendDocument(
 ): Promise<SendTextResult> {
   const url = `${config.baseUrl}/message/sendMedia/${config.instancia}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -186,7 +203,7 @@ export async function downloadMedia(
 ): Promise<Buffer> {
   const url = `${config.baseUrl}/chat/getBase64FromMediaMessage/${config.instancia}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

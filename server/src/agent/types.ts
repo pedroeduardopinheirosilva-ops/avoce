@@ -17,6 +17,22 @@ export interface VinculoEmprego {
   pagamento_fora?: string;
   injustica?: string;
   frota?: string;
+  /** Salary on payslip (holerite) in BRL */
+  salario_holerite?: number | string;
+  /** Off-payroll salary portion (Pix, Pamcard, cash) in BRL */
+  salario_por_fora?: number | string;
+  /** Shift start time, e.g. "05:00" */
+  jornada_inicio?: string;
+  /** Shift end time, e.g. "22:00" */
+  jornada_fim?: string;
+  /** Break duration in minutes */
+  intervalo_minutos?: number | string;
+  /** Estimated employment duration in months (calculated from tempo or data_saida) */
+  tempo_meses_estimado?: number;
+  /** FGTS depositado? "sim" | "nao" | "parcial" */
+  fgts_ok?: string;
+  /** CTPS assinada? "assinada" | "nao_assinada" | "parcial" */
+  situacao_ctps?: string;
 }
 
 // ── Document extraction ───────────────────────────────────────────────────────
@@ -89,6 +105,22 @@ export interface ExtractJsonOptions {
 export interface ExtractJsonResult<T> {
   data: T | null;
   error: string | null;
+}
+
+// ── IA flags (iaFlags JSONB — keys with leading _) ───────────────────────────
+
+export interface KnownIaFlags {
+  _vinculos_ok?: boolean;
+  _vinculos_todos_prescritos?: boolean;
+  _mais_empregos_confirmado?: boolean;
+  /** Set to true after Ana sends the mais_empregos question; used by vinculos gate. */
+  _mais_empregos_perguntado?: boolean;
+  /** Set to true when lead explicitly denied having more employers (semMaisEmpregos). Stops loop. */
+  _mais_empregos_negado?: boolean;
+  _saudacao_enviada?: boolean;
+  _pos_vinculos_fase?: string;
+  _valor_apresentado?: boolean;
+  [key: string]: unknown;
 }
 
 // ── Vinculos processing ───────────────────────────────────────────────────────

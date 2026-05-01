@@ -35,6 +35,7 @@ export interface SystemPromptContext {
   nextQDeterministico?: string | null;
   advFlowStepType?: string | null;
   advFlowNextStepChave?: string | null;
+  advFlowCampoColetar?: string | null;
   valueInjection?: string | null;       // pre-computed calcular/format result for valor_estimado step
   handoffSnapshot?: string | null;      // pre-computed buildHandoffSnapshot(merged) for Daniela
 
@@ -104,6 +105,17 @@ function buildDocFeedback(ctx: SystemPromptContext): string {
     `\nExemplo de resposta natural: "Recebi sua CNH! Pode me confirmar seu CPF e o número do RG para fecharmos o contrato?"` +
     `\nNÃO mencione nem peça: número de registro CNH, categoria, validade da habilitação, foto do verso da CNH.` +
     `\nA frente da CNH já contém todos os dados necessários.` + proibicaoTecnica + instrucaoLink;
+}
+
+// ── Private: step type helpers ────────────────────────────────────────────────
+
+const DOCUMENT_STEP_CHAVES = new Set([
+  "solicitar_cnh", "solicitar_rg", "solicitar_ctps", "solicitar_comprovante_endereco",
+  "cnh", "rg", "ctps", "comprovante_endereco",
+]);
+
+function isDocumentStep(chave: string | null | undefined, stepType: string | null | undefined): boolean {
+  return stepType === "document" || (!!chave && DOCUMENT_STEP_CHAVES.has(chave));
 }
 
 // ── Public ─────────────────────────────────────────────────────────────────────
@@ -193,7 +205,15 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
       if (ctx.valueInjection) instrucaoLlm += `\n\n${ctx.valueInjection}`;
       userSystem += instrucaoLlm;
     } else {
-      userSystem += `\n\n⚠️ PRÓXIMA PERGUNTA OBRIGATÓRIA — PERGUNTE AGORA de forma natural e conversacional. NÃO assuma que já foi respondido com base no histórico antigo — só pule se o cliente respondeu NESTA mensagem atual: ${ctx.nextQDeterministico}`;
+      const docStep = isDocumentStep(ctx.advFlowNextStepChave, ctx.advFlowStepType);
+      const campoVal = ctx.advFlowCampoColetar ? merged[ctx.advFlowCampoColetar] : undefined;
+      const campoJaColetado = !docStep && ctx.advFlowCampoColetar &&
+        campoVal != null && campoVal !== "";
+      if (campoJaColetado) {
+        userSystem += `\n\nO campo "${ctx.advFlowCampoColetar}" já foi coletado: ${campoVal}. Use esse valor. NÃO peça novamente. Confirme brevemente e avance para o próximo assunto.`;
+      } else {
+        userSystem += `\n\n⚠️ PRÓXIMA PERGUNTA OBRIGATÓRIA — PERGUNTE AGORA de forma natural e conversacional. NÃO assuma que já foi respondido com base no histórico antigo — só pule se o cliente respondeu NESTA mensagem atual: ${ctx.nextQDeterministico}`;
+      }
     }
   }
 

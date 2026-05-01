@@ -8,6 +8,7 @@
 import { extractJson } from "./llm.js";
 import type { VinculoCalculo } from "./calc-trabalhista.js";
 import type { VinculoEmprego } from "./types.js";
+import { parseBrNumber } from "./qualification-utils.js";
 
 // Re-export for backward compat — callers should migrate to types.ts
 export type { VinculoEmprego };
@@ -31,26 +32,36 @@ export function extractVinculosFromMerged(merged: Record<string, unknown>): Vinc
       data_admissao: v.data_admissao ?? undefined,
       data_saida: v.data_saida ?? v.saida ?? undefined,
       tempo_meses_estimado: v.tempo_meses_estimado ? Number(v.tempo_meses_estimado) : parseTempo(v.tempo),
-      salario_holerite: v.salario_holerite ? Number(v.salario_holerite) : undefined,
-      salario_por_fora: v.salario_por_fora ? Number(v.salario_por_fora) : undefined,
+      salario_holerite: v.salario_holerite
+        ? parseBrNumber(v.salario_holerite) || undefined
+        : (idx === 0 && merged.salario_holerite ? parseBrNumber(merged.salario_holerite) || undefined : undefined),
+      salario_por_fora: v.salario_por_fora
+        ? parseBrNumber(v.salario_por_fora) || undefined
+        : (idx === 0 && merged.salario_por_fora ? parseBrNumber(merged.salario_por_fora) || undefined : undefined),
       salario_total_declarado: v.salario_total_declarado
-        ? Number(v.salario_total_declarado)
-        : (idx === 0 && merged.salario_total_declarado ? Number(merged.salario_total_declarado) : undefined),
-      jornada_inicio: v.jornada_inicio ?? undefined,
-      jornada_fim: v.jornada_fim ?? undefined,
-      intervalo_minutos: v.intervalo_minutos ? Number(v.intervalo_minutos) : undefined,
+        ? parseBrNumber(v.salario_total_declarado) || undefined
+        : (idx === 0 && merged.salario_total_declarado ? parseBrNumber(merged.salario_total_declarado) || undefined : undefined),
+      jornada_inicio: v.jornada_inicio ?? (idx === 0 ? (merged.jornada_inicio as string | undefined) : undefined),
+      jornada_fim: v.jornada_fim ?? (idx === 0 ? (merged.jornada_fim as string | undefined) : undefined),
+      intervalo_minutos: v.intervalo_minutos
+        ? Number(v.intervalo_minutos)
+        : (idx === 0 && merged.intervalo_minutos ? Number(merged.intervalo_minutos) : undefined),
       horas_extras_pagas: v.horas_extras_pagas ?? (v.horas_extras === false ? false : undefined),
       modalidade_saida: v.modalidade_saida ?? undefined,
       injustica_relatada: v.injustica ?? v.injustica_relatada ?? undefined,
       frota_empresa: v.frota ? Number(v.frota) : undefined,
+      fgtsOk: (v.fgts_ok ?? (idx === 0 ? merged.fgts_ok : undefined)) as "sim" | "nao" | "parcial" | undefined,
+      situacaoCtps: (v.situacao_ctps ?? (idx === 0 ? merged.situacao_ctps : undefined)) as "assinada" | "nao_assinada" | "parcial" | undefined,
     }));
   }
   return [{
     empresa: String(merged.empresa_recente ?? merged.empresa_principal ?? "Empresa não informada"),
     funcao: String(merged.funcao ?? "Função não informada"),
     vinculo: "CLT",
-    salario_total_declarado: merged.salario_total_declarado ? Number(merged.salario_total_declarado) : undefined,
-    salario_holerite: merged.salario_holerite ? Number(merged.salario_holerite) : undefined,
+    salario_total_declarado: merged.salario_total_declarado ? parseBrNumber(merged.salario_total_declarado) || undefined : undefined,
+    salario_holerite: merged.salario_holerite ? parseBrNumber(merged.salario_holerite) || undefined : undefined,
+    fgtsOk: merged.fgts_ok as "sim" | "nao" | "parcial" | undefined,
+    situacaoCtps: merged.situacao_ctps as "assinada" | "nao_assinada" | "parcial" | undefined,
   }];
 }
 
@@ -92,6 +103,9 @@ export async function tryExtractVinculo(
       vinculo: v.vinculo ?? null, tempo: v.tempo ?? null, data_saida: v.data_saida ?? null,
       saida: v.saida ?? null, horas_extras: v.horas_extras ?? null,
       pagamento_fora: v.pagamento_fora ?? null, injustica: v.injustica ?? null, frota: v.frota ?? null,
+      salario_holerite: v.salario_holerite ?? null, salario_por_fora: v.salario_por_fora ?? null,
+      jornada_inicio: v.jornada_inicio ?? null, jornada_fim: v.jornada_fim ?? null,
+      intervalo_minutos: v.intervalo_minutos ?? null,
     })),
     null, 2
   );
@@ -103,11 +117,15 @@ export async function tryExtractVinculo(
       ordem: number; empresa?: string | null; funcao?: string | null; vinculo?: string | null;
       tempo?: string | null; data_saida?: string | null; saida?: string | null;
       horas_extras?: string | null; pagamento_fora?: string | null; injustica?: string | null; frota?: string | null;
+      salario_holerite?: number | null; salario_por_fora?: number | null;
+      jornada_inicio?: string | null; jornada_fim?: string | null; intervalo_minutos?: number | null;
     }>;
     novo_vinculo?: {
       empresa?: string | null; funcao?: string | null; vinculo?: string | null;
       tempo?: string | null; data_saida?: string | null; saida?: string | null;
       horas_extras?: string | null; pagamento_fora?: string | null; injustica?: string | null; frota?: string | null;
+      salario_holerite?: number | null; salario_por_fora?: number | null;
+      jornada_inicio?: string | null; jornada_fim?: string | null; intervalo_minutos?: number | null;
     } | null;
   }>({
     projetoId,
@@ -121,11 +139,21 @@ ${vinculosJson}
 TAREFA:
 1. Preencha campos null dos vínculos existentes com informações mencionadas no texto.
 2. Se o cliente mencionou um emprego DIFERENTE dos já listados, inclua em "novo_vinculo". SE O ARRAY ESTÁ VAZIO ([]) e o cliente mencionou qualquer empresa/empregador, coloque OBRIGATORIAMENTE em "novo_vinculo".
-3. Marque "sem_mais_empregos": true SOMENTE se ${maisEmpregosPerguntado ? "a pergunta sobre empregos anteriores foi feita e" : "(ATENÇÃO: a pergunta sobre empregos anteriores NÃO foi feita ainda — portanto NUNCA marque true neste turno, mesmo que o cliente use palavras como 'por último' ou 'meu último emprego') e"} o cliente indicou que não tem mais empregos. REGRAS (quando a pergunta foi feita):
+3. Marque "sem_mais_empregos": true SOMENTE se ${maisEmpregosPerguntado ? "a pergunta sobre empregos anteriores foi feita e" : "o cliente usou negação inequívoca e explícita de outros empregos — ex: 'não', 'não trabalhei', 'só essa empresa', 'nenhuma outra', 'somente lá'. NÃO marque true para frases passivas como 'meu último emprego', 'trabalhei por último em'. NUNCA infira ausência de empregos sem negação explícita. Caso contrário (não houver negação clara), e"} o cliente indicou que não tem mais empregos. REGRAS (quando a pergunta foi feita ou o cliente negou explicitamente):
    - Se o cliente começar com "não", "nao", "não trabalhei", "só esses", "foi só" → marque true.
    - Se o cliente mencionar uma empresa que JÁ ESTÁ na lista de vínculos → marque true (está descrevendo trajetória já coletada).
    - NUNCA inferir de frases passivas como "por último", "meu último emprego", "saí de lá e" — essas frases NÃO confirmam ausência de empregos anteriores.
 4. Marque "confirmou_mais_empregos": true quando o cliente confirmou que teve outro emprego mas NÃO deu o nome ainda (ex: "sim", "sim trabalhei", "tive mais", "trabalhei sim", "tinha outro"). Só marque true se NÃO colocou o nome em novo_vinculo.
+
+REGRA CRÍTICA — confirmação + nome de empresa na mesma mensagem:
+Se a mensagem contém confirmação de outro emprego (ex: "sim", "trabalhei sim", "tive") E o nome de uma empresa, preencha AMBOS:
+- confirmou_mais_empregos: true
+- novo_vinculo: { "empresa": "[nome da empresa]", ... }
+NÃO marque apenas confirmou_mais_empregos sem preencher novo_vinculo.empresa quando o nome da empresa está presente na mensagem.
+Exemplos:
+  "trabalhei sim até abril na Transporte Azul Ltda" → confirmou_mais_empregos: true, novo_vinculo: { empresa: "Transporte Azul Ltda", saida: "abril de ..." }
+  "sim, trabalhei em outra empresa antes" → confirmou_mais_empregos: true, novo_vinculo: null (sem nome)
+
 ${maisEmpregosConfirmado ? `
 MODO MAIS EMPREGOS ATIVO: o cliente já confirmou que trabalhou em outra empresa ANTES das já listadas. A mensagem atual é a resposta dele dando o nome desse emprego anterior. REGRA ABSOLUTA:
 - Qualquer nome de empresa que o cliente mencionar DEVE ir para "novo_vinculo", MESMO que seja igual ou parecido com um já listado (a pessoa pode ter trabalhado na mesma empresa em períodos diferentes).
@@ -137,7 +165,14 @@ REGRAS CRÍTICAS DE PREENCHIMENTO:
 - "não" é uma resposta válida. Ex: cliente disse "não tinha horas extras" → horas_extras = "não tinha horas extras".
 - "sim" genérico = capture o contexto. Ex: "sim, recebia por Pix" → pagamento_fora = "sim, recebia por Pix".
 - Capture o máximo possível do que o cliente disse, mesmo que incompleto.
-- Para "saida": se o cliente ainda está empregado → saida = "ainda empregado". Se foi demitido → saida = "demitido em [data/período]". Se pediu demissão → saida = "pediu demissão".
+- REGRA CRÍTICA para o campo "saida":
+  Só preencha saida se o lead declarou EXPLICITAMENTE uma das seguintes situações:
+    * Foi demitido (palavras: demitido, mandaram embora, fui dispensado, perdi o emprego, me mandaram embora)
+    * Pediu demissão (palavras: pedi demissão, saí por conta própria, eu saí, me desliguei, larguei)
+    * Ainda trabalha lá (palavras: ainda trabalho, estou lá, trabalho até hoje, continuo lá)
+    * Uma data ou período de saída ("saí em março", "saí há 6 meses", "saí ano passado")
+  Se a resposta contiver apenas o nome da empresa, função, ou tempo verbal no passado SEM nenhum dos sinais acima → saida = null.
+  NÃO infira saida a partir de: tempo verbal passado ("trabalhei", "era motorista"), menção à empresa no passado, ou qualquer outra inferência que não seja declaração explícita.
 
 CAMPOS A EXTRAIR (para cada vínculo):
 - empresa: nome da empresa
@@ -150,6 +185,11 @@ CAMPOS A EXTRAIR (para cada vínculo):
 - pagamento_fora: pagamentos fora do holerite (PIX, Pamcard, dinheiro). Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
 - injustica: irregularidades sofridas. Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
 - frota: tamanho da frota da empresa (se mencionado)
+- salario_holerite: número — valor exato do salário registrado na carteira/holerite em R$. Se mencionar "mínimo do sindicato", "salário base" ou valor específico, capture o número. Ex: "2000 na carteira" → 2000. DEIXE NULL se não mencionado.
+- salario_por_fora: número — valor recebido fora do holerite (PIX, Pamcard, dinheiro, comissão por frete) em R$ por mês. Se percentual sem valor mensal (ex: "12% do frete"), registre null. Ex: "8000 por fora" → 8000. DEIXE NULL se não mencionado.
+- jornada_inicio: string "HH:MM" — hora de início da jornada. Converta horas informais: "das 5" → "05:00", "às 6h" → "06:00", "de manhã às 4" → "04:00". DEIXE NULL se não mencionado.
+- jornada_fim: string "HH:MM" — hora de término da jornada. Converta: "até as 23" → "23:00", "até meia-noite" → "00:00", "até as 22h30" → "22:30". DEIXE NULL se não mencionado.
+- intervalo_minutos: número inteiro — minutos de intervalo/almoço. Se não informado explicitamente, DEIXE NULL (não assuma 60min).
 
 Responda APENAS JSON no formato:
 {
@@ -176,16 +216,21 @@ Responda APENAS JSON no formato:
         const existing = updatedVinculos[idx];
         updatedVinculos[idx] = {
           ...existing,
-          empresa:        existing.empresa        ?? (upd.empresa        ?? undefined),
-          funcao:         existing.funcao         ?? (upd.funcao         ?? undefined),
-          vinculo:        existing.vinculo        ?? (upd.vinculo        ?? undefined),
-          tempo:          existing.tempo          ?? (upd.tempo          ?? undefined),
-          data_saida:     existing.data_saida     ?? (upd.data_saida     ?? undefined),
-          saida:          existing.saida          ?? (upd.saida          ?? undefined),
-          horas_extras:   existing.horas_extras   ?? (upd.horas_extras   ?? undefined),
-          pagamento_fora: existing.pagamento_fora ?? (upd.pagamento_fora ?? undefined),
-          injustica:      existing.injustica      ?? (upd.injustica      ?? undefined),
-          frota:          existing.frota          ?? (upd.frota          ?? undefined),
+          empresa:           existing.empresa           ?? (upd.empresa           ?? undefined),
+          funcao:            existing.funcao            ?? (upd.funcao            ?? undefined),
+          vinculo:           existing.vinculo           ?? (upd.vinculo           ?? undefined),
+          tempo:             existing.tempo             ?? (upd.tempo             ?? undefined),
+          data_saida:        existing.data_saida        ?? (upd.data_saida        ?? undefined),
+          saida:             existing.saida             ?? (upd.saida             ?? undefined),
+          horas_extras:      existing.horas_extras      ?? (upd.horas_extras      ?? undefined),
+          pagamento_fora:    existing.pagamento_fora    ?? (upd.pagamento_fora    ?? undefined),
+          injustica:         existing.injustica         ?? (upd.injustica         ?? undefined),
+          frota:             existing.frota             ?? (upd.frota             ?? undefined),
+          salario_holerite:  existing.salario_holerite  ?? (upd.salario_holerite  ?? undefined),
+          salario_por_fora:  existing.salario_por_fora  ?? (upd.salario_por_fora  ?? undefined),
+          jornada_inicio:    existing.jornada_inicio    ?? (upd.jornada_inicio    ?? undefined),
+          jornada_fim:       existing.jornada_fim       ?? (upd.jornada_fim       ?? undefined),
+          intervalo_minutos: existing.intervalo_minutos ?? (upd.intervalo_minutos ?? undefined),
         };
       }
     }
@@ -198,16 +243,21 @@ Responda APENAS JSON no formato:
   if (result.novo_vinculo?.empresa) {
     const novoVinculo: VinculoEmprego = {
       ordem: updatedVinculos.length + 1,
-      empresa:        result.novo_vinculo.empresa        ?? undefined,
-      funcao:         result.novo_vinculo.funcao         ?? undefined,
-      vinculo:        result.novo_vinculo.vinculo        ?? undefined,
-      tempo:          result.novo_vinculo.tempo          ?? undefined,
-      data_saida:     result.novo_vinculo.data_saida     ?? undefined,
-      saida:          result.novo_vinculo.saida          ?? undefined,
-      horas_extras:   result.novo_vinculo.horas_extras   ?? undefined,
-      pagamento_fora: result.novo_vinculo.pagamento_fora ?? undefined,
-      injustica:      result.novo_vinculo.injustica      ?? undefined,
-      frota:          result.novo_vinculo.frota          ?? undefined,
+      empresa:           result.novo_vinculo.empresa           ?? undefined,
+      funcao:            result.novo_vinculo.funcao            ?? undefined,
+      vinculo:           result.novo_vinculo.vinculo           ?? undefined,
+      tempo:             result.novo_vinculo.tempo             ?? undefined,
+      data_saida:        result.novo_vinculo.data_saida        ?? undefined,
+      saida:             result.novo_vinculo.saida             ?? undefined,
+      horas_extras:      result.novo_vinculo.horas_extras      ?? undefined,
+      pagamento_fora:    result.novo_vinculo.pagamento_fora    ?? undefined,
+      injustica:         result.novo_vinculo.injustica         ?? undefined,
+      frota:             result.novo_vinculo.frota             ?? undefined,
+      salario_holerite:  result.novo_vinculo.salario_holerite  ?? undefined,
+      salario_por_fora:  result.novo_vinculo.salario_por_fora  ?? undefined,
+      jornada_inicio:    result.novo_vinculo.jornada_inicio    ?? undefined,
+      jornada_fim:       result.novo_vinculo.jornada_fim       ?? undefined,
+      intervalo_minutos: result.novo_vinculo.intervalo_minutos ?? undefined,
     };
     return { vinculo: novoVinculo, semMaisEmpregos: false, updatedVinculos, confirmouMaisEmpregos: false };
   }

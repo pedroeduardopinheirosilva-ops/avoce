@@ -1,0 +1,233 @@
+================================================================================
+ANÁLISE DE CÓDIGO — FIXES P6, P7 E SAUDAÇÃO DANIELA
+Avoce (ex-NfseCapium) — Agente WhatsApp
+================================================================================
+Data: 29/04/2026
+Arquivos modificados: stage-engine.ts, persona-router.ts, qualification.ts,
+                       flow-controller.ts, transition-engine.ts
+================================================================================
+
+
+════════════════════════════════════════════════════════════════════════════════
+FIX P6 — Daniela pulando parecer/valor_estimado e indo direto para CNH
+════════════════════════════════════════════════════════════════════════════════
+
+ARQUIVO: server/src/agent/stage-engine.ts (linhas ~536-542)
+
+PROBLEMA:
+Quando Daniela avançava do step "parecer" para "valor_estimado", o código
+usava deal.iaFlowStepChave (carregado no início do request) para gravar o
+flag _enviado. Como deal.iaFlowStepChave ainda era "parecer" naquele momento,
+o sistema gravava { parecer_enviado: true } de novo em vez de
+{ valor_estimado_enviado: true }. Isso fazia valor_estimado nunca ter o flag
+e o step ficava sendo re-executado, ou o sistema avançava para CNH prematuramente.
+
+ANTES:
+  if (advFlowStepType === "llm_generated" && (deal as any).iaFlowStepChave) {
+      const chave = (deal as any).iaFlowStepChave as string;
+      await prisma.crmDeal.update({
+          where: { id: deal.id },
+          data: { iaFlowStepData: {
+              ...((deal as any).iaFlowStepData ?? {}),
+              [`${chave}_enviado`]: true
+          }}
+      });
+  }
+
+DEPOIS:
+  // Use advFlowNextStepChave (step just advanced to) instead of stale deal.iaFlowStepChave
+  if (advFlowStepType === "llm_generated" && (advFlowNextStepChave ?? (deal as any).iaFlowStepChave)) {
+      const chave = (advFlowNextStepChave ?? (deal as any).iaFlowStepChave) as string;
+      await prisma.crmDeal.update({
+          where: { id: deal.id },
+          data: { iaFlowStepData: {
+              ...((deal as any).iaFlowStepData ?? {}),
+              [`${chave}_enviado`]: true
+          }}
+      });
+  }
+
+RAZÃO: advFlowNextStepChave é retornado por advanceAdvogadoFlow() e reflete
+o step ATUAL após o avanço — é a fonte de verdade. O deal em memória é stale.
+
+
+════════════════════════════════════════════════════════════════════════════════
+FIX P7.1 — Ana não coletava campos obrigatórios para cálculo trabalhista
+════════════════════════════════════════════════════════════════════════════════
+
+ARQUIVO: server/src/agent/persona-router.ts (linhas ~330-344)
+FUNÇÃO: getNextDeterministicQuestion()
+
+PROBLEMA:
+salario_holerite, salario_por_fora, jornada_inicio, jornada_fim não eram
+perguntados deterministicamente — só eram extraídos se o cliente mencionasse
+espontaneamente. Sem esses campos, o cálculo trabalhista ficava incompleto.
+
+BLOCO INSERIDO (após getNextVinculoQuestion retornar null, antes do pos-vinculos):
+
+  // Mandatory calc fields — ask after basic vinculo collected, before pos-vinculos.
+  // These are required for calc-trabalhista to produce a correct value estimate.
+  if (!vinculosTodosPrescritos && vinculos.length > 0) {
+    const mainV = vinculos.find((v: VinculoEmprego) => v.ordem === 1) ?? vinculos[0];
+
+    if (!mainV.tempo && !mainV.tempo_meses_estimado && !merged.tempo_meses_estimado)
+      return "Quanto tempo você trabalhou nessa empresa? (pode ser em meses ou anos)";
+
+    if (!mainV.salario_holerite && !merged.salario_holerite)
+      return "Qual era o valor do seu salário na carteira de trabalho? (o valor do holerite mesmo)";
+
+    const pagouExtra = mainV.pagamento_fora ?? merged.pagamento_fora;
+    const pagouExtraPositivo = pagouExtra && !/^(não|nao|nenhum|0|zero|nunca)/i.test(String(pagouExtra).trim());
+    if (pagouExtraPositivo && !mainV.salario_por_fora && !merged.salario_por_fora)
+      return "E quanto você recebia por fora por mês em média? (Pix, dinheiro, comissão)";
+
+    if (!mainV.jornada_inicio && !merged.jornada_inicio)
+      return "Qual era seu horário de trabalho? Que horas você começava e que horas terminava normalmente?";
+  }
+
+LÓGICA DE SEQUÊNCIA:
+1. tempo: verificado primeiro — sem tempo não há base de cálculo
+2. salario_holerite: perguntado sempre (exceto prescritos)
+3. salario_por_fora: apenas se pagamento_fora for positivo ("sim", valor, Pix, etc.)
+   — regex rejeita: "não", "nao", "nenhum", "0", "zero", "nunca"
+4. jornada_inicio: perguntado sempre — para cálculo de horas extras
+5. Tudo bloqueado se vinculosTodosPrescritos=true (não tem ação trabalhista)
+
+NOTA: jornada_fim e intervalo_minutos são extraídos da resposta de jornada_inicio.
+      A pergunta "que horas começava e terminava" coleta ambos em uma só resposta.
+
+
+════════════════════════════════════════════════════════════════════════════════
+FIX P7.2 — Extração de campos de cálculo pela LLM
+════════════════════════════════════════════════════════════════════════════════
+
+ARQUIVO: server/src/agent/qualification.ts (linhas ~173-177)
+FUNÇÃO: tryExtractVinculo() — prompt da extractJson
+
+ANTES (instruções vagas):
+  - salario_holerite: valor do salário registrado em holerite (número em R$, ex: 2000). DEIXE NULL se não mencionado.
+  - salario_por_fora: valor pago fora do holerite (PIX, dinheiro, Pamcard). DEIXE NULL se não mencionado.
+  - jornada_inicio: horário de entrada no formato "HH:MM" (ex: "05:00"). DEIXE NULL se não mencionado.
+  - jornada_fim: horário de saída no formato "HH:MM" (ex: "22:00"). DEIXE NULL se não mencionado.
+  - intervalo_minutos: duração do intervalo em minutos (número inteiro). DEIXE NULL se não mencionado.
+
+DEPOIS (instruções com exemplos de conversão):
+  - salario_holerite: número — valor exato do salário registrado na carteira/holerite em R$.
+    Se mencionar "mínimo do sindicato", "salário base" ou valor específico, capture o número.
+    Ex: "2000 na carteira" → 2000. DEIXE NULL se não mencionado.
+
+  - salario_por_fora: número — valor recebido fora do holerite (PIX, Pamcard, dinheiro, comissão
+    por frete) em R$ por mês. Se percentual sem valor mensal (ex: "12% do frete"), registre null.
+    Ex: "8000 por fora" → 8000. DEIXE NULL se não mencionado.
+
+  - jornada_inicio: string "HH:MM" — hora de início da jornada.
+    Converta horas informais: "das 5" → "05:00", "às 6h" → "06:00", "de manhã às 4" → "04:00".
+    DEIXE NULL se não mencionado.
+
+  - jornada_fim: string "HH:MM" — hora de término da jornada.
+    Converta: "até as 23" → "23:00", "até meia-noite" → "00:00", "até as 22h30" → "22:30".
+    DEIXE NULL se não mencionado.
+
+  - intervalo_minutos: número inteiro — minutos de intervalo/almoço.
+    Se não informado explicitamente, DEIXE NULL (não assuma 60min).
+
+
+════════════════════════════════════════════════════════════════════════════════
+FIX P8 — Saudação da Dra. Daniela ao entrar em contato
+════════════════════════════════════════════════════════════════════════════════
+
+ARQUIVO: server/src/agent/transition-engine.ts (linhas ~304-306)
+FUNÇÃO: enviarMensagemProativa() — bloco primeira_mensagem
+
+PROBLEMA:
+Quando o sistema enviava a primeira mensagem da Daniela (ao trocar de persona
+ou no cron de primeira_mensagem), a mensagem era diretamente o conteúdo do
+step "apresentacao" no DB — sem nenhuma saudação pessoal. Soava robótico.
+O LLM não era chamado nesse caminho (só era chamado se não havia firstQuestion).
+
+ANTES:
+  const { message: firstQuestion, firstStepChave } = await initAdvogadoFlowIfNeeded(projetoId, dealId);
+  if (firstQuestion && firstStepChave) {
+    mensagem = firstQuestion;
+    // ...
+
+DEPOIS:
+  const { message: firstQuestion, firstStepChave } = await initAdvogadoFlowIfNeeded(projetoId, dealId);
+  if (firstQuestion && firstStepChave) {
+    const hBrasilia = new Date().toLocaleString("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+        hour: "numeric",
+        hour12: false
+    });
+    const h = parseInt(hBrasilia, 10);
+    const saudacao = h >= 5 && h < 12 ? "Bom dia" : h >= 12 && h < 18 ? "Boa tarde" : "Boa noite";
+    mensagem = `${saudacao}! Tudo bem? ${firstQuestion}`;
+    // ...
+
+RESULTADO: Daniela agora envia, ex:
+  "Boa tarde! Tudo bem? Aqui é a Dra. Daniela Pires, advogada do escritório..."
+  "Bom dia! Tudo bem? Olá! Aqui é a Dra. Daniela..."
+
+FUSOS HORÁRIOS:
+  05:00–11:59 → "Bom dia"
+  12:00–17:59 → "Boa tarde"
+  18:00–04:59 → "Boa noite"
+  (sempre horário de Brasília via America/Sao_Paulo)
+
+
+════════════════════════════════════════════════════════════════════════════════
+TESTES ADICIONADOS
+════════════════════════════════════════════════════════════════════════════════
+
+ARQUIVO: server/src/agent/flow-controller.test.ts
+describe("P6 — llm_generated step sequencing"):
+  - "returns parecer when apresentacao_enviado=true but parecer_enviado=false"
+  - "advances to valor_estimado when parecer_enviado=true and lead responds"
+  - "does not advance to CNH when valor_estimado_enviado=false"
+
+ARQUIVO: server/src/agent/persona-router-p7.test.ts (novo)
+describe("P7 — mandatory calc field questions"):
+  - "asks for salario_holerite when missing from vinculo and merged"
+  - "does not ask for salario_holerite when already set in vinculo"
+  - "asks for salario_holerite when set in merged (not vinculo)" [→ não pede de novo]
+  - "asks for jornada when salario collected but jornada missing"
+  - "does not ask for jornada when already set in vinculo"
+  - "asks for salario_por_fora when pagamento_fora is positive and amount missing"
+  - "does not ask for salario_por_fora when pagamento_fora is negative"
+  - "skips mandatory field questions when vinculosTodosPrescritos=true"
+  - "asks for tempo when vinculo has no tempo and no tempo_meses_estimado"
+
+STATUS: 21 testes passando (2 arquivos).
+
+
+════════════════════════════════════════════════════════════════════════════════
+RESUMO DOS PROMPTS DO SISTEMA (para referência)
+════════════════════════════════════════════════════════════════════════════════
+
+PERSONA ANA (assistente) — base do system prompt:
+  Construído em buildSystemPrompt() em persona-router.ts.
+  Inclui: identidade da Ana, regras de coleta de vínculos, regras de prescrição,
+  regras de humanização, instruções de documentos, CNH digital.
+
+PERSONA DANIELA (advogado) — base do system prompt:
+  Construído em advogado-agents.ts (buildAutoridadeInstructions / buildColetaInstructions).
+  Inclui: autoridade jurídica, sequência de steps, coleta de documentos.
+  Fluxo controlado por IaFlowStep (steps com stepType: question/llm_generated/document).
+
+FLOW STEPS DE DANIELA (exemplo típico):
+  1. apresentacao (question)     — Saudação + apresentação
+  2. parecer      (llm_generated) — LLM gera parecer jurídico personalizado
+  3. valor_estimado (llm_generated) — LLM gera estimativa do valor da causa
+  4. solicitar_cnh (question)    — Pede CNH do carreteiro
+  5. solicitar_rg  (question)    — Pede RG
+  6. proposta     (end/question) — Envia proposta
+
+IMPORTANTE — llm_generated:
+  Flag <chave>_enviado no iaFlowStepData controla se o conteúdo já foi enviado.
+  Após envio: LLM aguarda resposta do lead.
+  Após resposta: avança para próximo step (advanceAdvogadoFlow).
+
+
+================================================================================
+FIM DA ANÁLISE
+================================================================================

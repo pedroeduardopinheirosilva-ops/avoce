@@ -270,7 +270,7 @@ export async function dispararNotificacoes(
       console.log(`[Notificação] enviando para ${notif.destino} (${texto.length} chars)`);
       await sendText(evoConfig, notif.destino, texto);
       console.log(`[Notificação] enviado OK para ${notif.destino}`);
-      prisma.iaNotificacaoLog.create({
+      await prisma.iaNotificacaoLog.create({
         data: {
           projetoId,
           dealId: dados.dealId || null,
@@ -279,7 +279,7 @@ export async function dispararNotificacoes(
           mensagem: texto,
           nomeLead: dados.nome || null,
         },
-      }).catch(() => {});
+      });
     } catch (err) {
       console.error(`[Notificação] Falha ao enviar para ${notif.destino}:`, err);
     }
