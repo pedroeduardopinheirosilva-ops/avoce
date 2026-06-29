@@ -43,7 +43,9 @@ const OCR_EXTRACT_PROMPT =
   "  Tipo: COMPROVANTE_ENDERECO\n" +
   "  Titular:, Endereço:, Bairro:, Cidade:, UF:, CEP:\n\n" +
   "SE TIPO E (outro):\n  Tipo: OUTRO\n\n" +
-  "Retorne em formato de lista 'Campo: Valor', um por linha. Omita campos não encontrados. Nunca invente valores.";
+  "Retorne em formato de lista 'Campo: Valor', um por linha.\n" +
+  "REGRA CRÍTICA: Omita completamente qualquer campo não encontrado — NUNCA use 'Não disponível', 'N/A', '?' ou equivalentes.\n" +
+  "Nunca invente valores. Se CPF não estiver legível, simplesmente não inclua o campo CPF na resposta.";
 
 // ── Mistral ────────────────────────────────────────────────────────────────────
 
@@ -143,16 +145,29 @@ export async function ocrGroqVision(apiKey: string, buffer: Buffer, mimetype: st
       { type: "text", text: OCR_EXTRACT_PROMPT },
     ]}],
   });
-  return res.choices[0]?.message?.content ?? null;
+  const content = res.choices[0]?.message?.content ?? "";
+  // Detect prompt-echo: model returned the instruction text instead of OCR output
+  const ECHO_SIGNATURES = ["PASSO 1", "Passo 1", "Identifique o tipo", "## Passo", "##Passo"];
+  if (ECHO_SIGNATURES.some(s => content.includes(s))) {
+    console.warn("[OCR] ocrGroqVision: modelo ecoou o prompt — descartando resposta");
+    return null;
+  }
+  return content || null;
 }
 
 export async function ocrGroqVisionJson(apiKey: string, buffer: Buffer, mimetype: string): Promise<DocJsonResult | null> {
   const imgMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mimetype) ? mimetype : "image/jpeg";
-  const prompt = "Analise este documento brasileiro e retorne APENAS um JSON válido (sem markdown).\n" +
+  const prompt = "Analise este documento brasileiro e retorne APENAS um JSON válido (sem markdown, sem texto extra).\n" +
     "Campos: tipo_documento (CNH|RG|CTPS|COMPROVANTE_ENDERECO|OUTRO), nome, cpf, rg, orgao_emissor_rg, " +
     "data_nascimento, naturalidade, pis, numero_ctps, serie_ctps, endereco, bairro, cidade, uf, cep.\n" +
-    "REGRA: CPF e RG têm rótulos DIFERENTES — nunca coloque o mesmo valor nos dois.\n" +
-    "Nº Registro da CNH NÃO é RG. Retorne SOMENTE JSON, sem texto extra.";
+    "REGRAS CRÍTICAS para CNH (incluindo CNH-e digital):\n" +
+    "- O CPF fica logo abaixo do nome com rótulo 'CPF' e tem EXATAMENTE 11 dígitos (formato XXX.XXX.XXX-XX). Se o valor encontrado não tiver 11 dígitos após remover pontos e traços, retorne null para CPF.\n" +
+    "- O 'Nº Registro' da CNH (geralmente 11 dígitos começando com número alto) NÃO é CPF nem RG — ignore completamente.\n" +
+    "- O campo 'Doc. Identidade' / 'IDENTIDADE' / 'ID' na CNH é o RG — geralmente 7-9 dígitos.\n" +
+    "- CPF e RG NUNCA têm o mesmo valor. Se estiverem iguais, retorne null para ambos.\n" +
+    "- Na CNH-e digital, o CPF pode estar em fonte diferente do restante — procure especificamente o rótulo 'CPF:'.\n" +
+    "- Use null para campos não encontrados ou ambíguos. JAMAIS invente valores.\n" +
+    "Retorne SOMENTE JSON válido.";
   const client = getGroqClient(apiKey);
   const res = await client.chat.completions.create({
     model: "meta-llama/llama-4-scout-17b-16e-instruct", max_tokens: 512,
@@ -165,6 +180,44 @@ export async function ocrGroqVisionJson(apiKey: string, buffer: Buffer, mimetype
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
   try { return JSON.parse(cleaned) as DocJsonResult; }
   catch { return null; }
+}
+
+// ── Claude Vision (Anthropic) — melhor extração de CPF/RG em FOTO de documento ──
+
+const _anthropicClients = new Map<string, any>();
+async function getAnthropicClient(apiKey: string): Promise<any> {
+  if (!_anthropicClients.has(apiKey)) {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    _anthropicClients.set(apiKey, new Anthropic({ apiKey }));
+  }
+  return _anthropicClients.get(apiKey)!;
+}
+
+export async function ocrClaudeVisionJson(apiKey: string, buffer: Buffer, mimetype: string): Promise<DocJsonResult | null> {
+  const imgMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mimetype) ? mimetype : "image/jpeg";
+  const prompt = "Analise este documento brasileiro e retorne APENAS um JSON válido (sem markdown, sem texto extra).\n" +
+    "Campos: tipo_documento (CNH|RG|CTPS|COMPROVANTE_ENDERECO|OUTRO), nome, cpf, rg, orgao_emissor_rg, " +
+    "data_nascimento, naturalidade, pis, numero_ctps, serie_ctps, endereco, bairro, cidade, uf, cep.\n" +
+    "REGRAS CRÍTICAS para CNH (incluindo CNH-e digital):\n" +
+    "- O CPF fica logo abaixo do nome com rótulo 'CPF' e tem EXATAMENTE 11 dígitos (formato XXX.XXX.XXX-XX). Se não tiver 11 dígitos após remover pontos e traços, retorne null para CPF.\n" +
+    "- O 'Nº Registro' da CNH NÃO é CPF nem RG — ignore.\n" +
+    "- O campo 'Doc. Identidade' / 'IDENTIDADE' / 'ID' na CNH é o RG — geralmente 7-9 dígitos.\n" +
+    "- CPF e RG NUNCA têm o mesmo valor. Se iguais, retorne null para ambos.\n" +
+    "- Use null para campos não encontrados ou ambíguos. JAMAIS invente valores.\n" +
+    "Retorne SOMENTE JSON válido.";
+  try {
+    const client = await getAnthropicClient(apiKey);
+    const res = await client.messages.create({
+      model: "claude-haiku-4-5-20251001", max_tokens: 512,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: imgMime, data: buffer.toString("base64") } },
+        { type: "text", text: prompt },
+      ]}],
+    });
+    const raw = (res.content?.[0]?.type === "text" ? res.content[0].text : "") ?? "";
+    const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    return JSON.parse(cleaned) as DocJsonResult;
+  } catch { return null; }
 }
 
 // ── Tesseract (subprocess fallback) ───────────────────────────────────────────

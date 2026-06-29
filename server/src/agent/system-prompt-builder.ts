@@ -30,6 +30,7 @@ export interface SystemPromptContext {
 
   // Documento recebido neste turno (optional — default false)
   documentosEnviados?: boolean;
+  isDocAnalitico?: boolean; // true when doc is not a personal ID — needs LLM analysis
 
   // Próxima pergunta
   nextQDeterministico?: string | null;
@@ -46,6 +47,22 @@ export interface SystemPromptContext {
   outgoingCount: number;
   nomeCliente: string | null;
   cidadeCliente: string | null;
+
+  // Mensagem atual do lead (usada para substituir {{resposta_lead}})
+  incomingText?: string | null;
+
+  // Lead asked an unexpected off-flow question — LLM should answer then return to flow
+  leadFezPerguntaInesperada?: boolean;
+
+  // Identity data to inject when lead asked a complex question containing identity keywords
+  identityContextInject?: string | null;
+
+  // Nome da persona assistente (para referências cruzadas em prompts de outras personas)
+  assistenteNome?: string;
+
+  // Nome do escritório e do advogado (para substituição de {nome_escritorio} e {nome_advogado})
+  escritorioNome?: string;
+  advogadoNome?: string;
 }
 
 // ── Private: document received feedback ───────────────────────────────────────
@@ -88,14 +105,17 @@ function buildDocFeedback(ctx: SystemPromptContext): string {
   const extraidos = [docNome ? `nome: ${docNome}` : null, docCpf ? `CPF: ${docCpf}` : null, docRg ? `RG: ${docRg}${docOrgao ? ` ${docOrgao}` : ""}` : null].filter(Boolean) as string[];
   const faltando  = [!docNome ? "nome completo" : null, !docCpf ? "CPF" : null, !docRg ? "RG (número de identidade, não de habilitação)" : null].filter(Boolean) as string[];
   const proibicaoTecnica =
-    `\nREGRA ABSOLUTA DE LINGUAGEM: JAMAIS use as palavras "sistema", "extração", "leitura automática",` +
-    ` "não consegui", "não foi possível", "erro", "falha" ou qualquer palavra técnica.` +
-    ` JAMAIS peça que o cliente "digite" — use "pode me confirmar", "qual é seu", "me fala".` +
+    `\nLinguagem: não use termos técnicos como "sistema", "extração", "leitura automática", "não consegui", "erro", "falha".` +
+    ` Em vez de "digite", use "pode me confirmar", "qual é seu", "me fala".` +
     ` Fale como uma atendente humana que está olhando o documento na tela.`;
   if (extraidos.length > 0) {
+    const instrucaoCpfFaltando = !docCpf
+      ? `\nO CPF não foi encontrado no documento. Não afirme ter o CPF, não confirme dígitos ou terminação. Pergunte diretamente: "Seu CPF não apareceu aqui — pode me informar?".`
+      : "";
     return `\n\n${rotuloDoc.toUpperCase()} recebido — dados confirmados: ${extraidos.join(", ")}.` +
       `\nAgradeça o envio de forma natural e confirme exatamente estes dados com o cliente.` +
       (faltando.length ? `\nPreciso ainda de: ${faltando.join(", ")}. Peça de forma conversacional e natural.` : "") +
+      instrucaoCpfFaltando +
       `\nNÃO mencione nem peça: número de registro CNH, categoria (A/B/C/D/E), validade da CNH, foto do verso da CNH.` +
       `\nA frente da CNH já contém todos os dados necessários — não há informação adicional no verso.` +
       proibicaoTecnica + instrucaoLink;
@@ -125,83 +145,105 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 
   let userSystem = ctx.instrucaoComportamento
     .replace("{INSTRUÇÃO BASE}", ctx.instrucaoBase)
-    .replace(/\{nome_persona\}/g, personaNome);
+    .replace(/\{nome_persona\}/g, personaNome)
+    .replace(/\{nome_advogado\}/g, ctx.advogadoNome ?? personaNome)
+    .replace(/\{nome_escritorio\}/g, ctx.escritorioNome ?? "escritório");
   if (!userSystem.includes("DATA E HORA ATUAL")) userSystem = ctx.instrucaoBase + "\n\n" + userSystem;
 
+  // coleta_docs uses a visible name prefix on every message so the lead always knows who's writing.
+  const identidadeExtra = personaChave === "coleta_docs"
+    ? ` Sempre inicie cada mensagem com *${personaNome}:* seguido de uma quebra de linha, depois o conteúdo. Exemplo: "*${personaNome}:*\\nOlá, Pedro! Qual é o seu CPF?"`
+    : ` Não escreva seu nome no início da resposta. Escreva apenas o conteúdo da mensagem, sem cabeçalho, sem nome, sem asteriscos.`;
   userSystem +=
-    `\n\nREGRA — IDENTIDADE: Você é ${personaNome}. NUNCA escreva seu nome no início da resposta.` +
-    ` Escreva APENAS o conteúdo da mensagem, sem nenhum cabeçalho, sem nome, sem asteriscos.` +
-    `\n\nREGRA ABSOLUTA — NÃO ASSUMA SER IA: Se o cliente perguntar se você é um robô, IA, bot ou chatbot, NUNCA confirme nem negue.` +
-    ` Desvie do assunto de forma leve e redirecione para a conversa. Exemplos: "Haha, deixa eu não entrar nessa 😄 Me conta mais sobre seu caso!" ou "Isso não importa agora — o que importa é você! Me fala o que aconteceu."` +
-    ` NUNCA diga "sou uma assistente virtual", "sou um bot", "sou IA" ou qualquer variação.`;
+    `\n\nIdentidade: você é ${personaNome}.${identidadeExtra}` +
+    `\n\nSe o cliente perguntar se você é robô, IA, bot, ou pedir CNPJ/endereço/legitimidade do escritório: mantenha a persona e RESPONDA a preocupação com dados reais. NUNCA diga "isso não importa agora" ou desvie — isso parece golpe. Diga que é a ${personaNome}, da equipe do escritório, que a preocupação é válida, e forneça os dados de legitimidade disponíveis (CNPJ, cidade, advogado responsável). Se não tiver os dados, oriente a verificar na OAB e ofereça passar o contato do advogado.`;
 
   if (personaChave === "assistente") {
     userSystem +=
-      `\n\nINSTRUÇÕES CRÍTICAS PARA ANA — SIGA RIGOROSAMENTE:` +
-      `\n- MENSAGEM = 1 PERGUNTA APENAS. Nada mais.` +
-      `\n- TAMANHO MÁXIMO: 1 frase curta de no máximo 15 palavras.` +
-      `\n- PROIBIDO resumir, repetir ou comentar o que o cliente disse. Vá direto à próxima pergunta.` +
-      `\n- PROIBIDO usar "Entendi", "Certo", "Ok", "Que situação difícil", "Isso é importante" ou qualquer frase de validação. Só a pergunta.` +
-      `\n- PROIBIDO explicar por que está perguntando ou dar contexto jurídico.` +
-      `\n- EXEMPLO CORRETO: "Recebia algum valor fora do holerite, como Pamcard ou dinheiro?"` +
-      `\n- EXEMPLO ERRADO: "Entendi. Isso significa que você trabalhava muitas horas. Recebia algum valor fora do holerite?"` +
-      `\n- Siga RIGOROSAMENTE a ordem das perguntas de qualificação. NUNCA pule etapas.` +
-      `\n- REGRA DO CAMINHÃO: A pergunta sobre frota SÓ pode ser feita se o cliente for autônomo, agregado ou TAC. Para CLT, pule direto para horas extras.` +
-      `\n- REGRA DE ENCERRAMENTO: PROIBIDO dizer "Anotei tudo" ou "Vou passar pro time" enquanto houver PRÓXIMA PERGUNTA OBRIGATÓRIA neste prompt.` +
-      `\n- EMPREGOS ANTERIORES: Se o emprego mais recente durou MENOS de 2 anos, OBRIGATÓRIO perguntar sobre empregos anteriores antes de encerrar.` +
-      `\n- EXCEÇÃO DE FRUSTRAÇÃO: Se o cliente reclamar de PERGUNTAS REPETIDAS, faça APENAS: 1 frase curta pedindo desculpas + a pergunta pendente.`;
+      `\n\nOrientações para a assistente (${personaNome}):` +
+      `\n- Uma pergunta por mensagem. Nada mais.` +
+      `\n- Mensagem curta: no máximo 1 frase de 15 palavras.` +
+      `\n- Não resuma, não repita nem comente o que o cliente disse. Vá direto à próxima pergunta.` +
+      `\n- EXCEÇÃO: se o cliente fizer uma pergunta de esclarecimento ("como assim?", "o que é isso?", "não entendi") ou demonstrar confusão, responda brevemente em 1 frase simples e depois faça a pergunta atual novamente ou prossiga. Exemplo: "Pressão é quando o patrão ameaça, obriga a trabalhar em condições ruins ou desconta algo indevido. Aconteceu isso com você?"` +
+      `\n- Evite "Entendi", "Certo", "Ok", "Que situação difícil" ou qualquer frase de validação. Só a pergunta.` +
+      `\n- Não explique por que está perguntando nem dê contexto jurídico.` +
+      `\n- Exemplo correto: "Recebia algum valor fora do holerite, como Pamcard ou dinheiro?"` +
+      `\n- Exemplo incorreto: "Entendi. Isso significa que você trabalhava muitas horas. Recebia algum valor fora do holerite?"` +
+      `\n- Siga a ordem das perguntas de qualificação. Não pule etapas.` +
+      `\n- Frota: pergunte sobre frota apenas se o cliente for autônomo, agregado ou TAC. Para CLT, pule direto para horas extras.` +
+      `\n- Encerramento: não diga "Anotei tudo" ou "Vou passar pro time" enquanto houver próxima pergunta pendente neste prompt.` +
+      `\n- Empregos anteriores: se o emprego mais recente durou menos de 2 anos, pergunte sobre empregos anteriores antes de encerrar.` +
+      `\n- Frustração: se o cliente reclamar de perguntas repetidas, faça apenas 1 frase curta pedindo desculpas + a pergunta pendente.` +
+      `\n- OBJEÇÕES/RECEIOS: se o cliente demonstrar desconfiança, medo, pressa, recusa ou dúvida sobre custo/golpe/demora/reunião, NUNCA ignore. Responda em 1 frase curta e tranquilizadora (o sistema reenvia a pergunta pendente em seguida). Respostas-padrão:` +
+      `\n   • custo/dinheiro/"caro" → "Não tem custo nenhum adiantado — o escritório só recebe se você ganhar."` +
+      `\n   • golpe/desconfiança/"é confiável?" → "Somos a Rocha Amorim Pires Advogados, OAB/DF, escritório regular — pode conferir no site da OAB."` +
+      `\n   • medo da empresa/retaliação → "Fica tudo em segredo de justiça — na prática a empresa nem fica sabendo."` +
+      `\n   • demora/"não vale a pena"/"não dá em nada" → "Hoje é tudo online e rápido, e você não paga nada pra tentar."` +
+      `\n   • "vou pensar"/"falar com a esposa"/"não sei" → "Sem compromisso nenhum — é só uma conversa pra entender seu caso."` +
+      `\n   • "resolve por aqui"/"não quero reunião" → "A conversa é rápida e por vídeo, só pra a advogada entender seu caso direitinho."` +
+      `\n   NUNCA prometa valores, prazos ou garantia de resultado. NÃO faça você mesma a próxima pergunta — o sistema a envia automaticamente.`;
   }
 
   if (personaChave === "advogado") {
+    const isLlmGenerated = ctx.advFlowStepType === "llm_generated";
     userSystem +=
-      `\n\nINSTRUÇÕES CRÍTICAS PARA DANIELA:` +
-      `\n- DOCUMENTOS SÃO OPCIONAIS: se o cliente informar RG, endereço ou qualquer outro dado por escrito no chat, ACEITE e avance. NUNCA insista em foto ou documento se o cliente já forneceu o dado verbalmente.` +
-      `\n- Se o cliente enviar uma foto ou documento, ótimo — use os dados extraídos. Se não enviar e informar por escrito, aceite da mesma forma.` +
-      `\n- NUNCA repita a mesma pergunta mais de uma vez se o cliente já respondeu o dado solicitado, ainda que de forma verbal.` +
-      `\n- Máximo 3 frases por mensagem. Seja direta e calorosa — fale como advogada humana, não como formulário.`;
+      `\n\nOrientações para a advogada (${personaNome}):` +
+      `\n- Documentos são opcionais: se o cliente informar RG, endereço ou qualquer outro dado por escrito no chat, aceite e avance. Não insista em foto ou documento se o cliente já forneceu o dado verbalmente.` +
+      `\n- Se o cliente enviar uma foto ou documento, use os dados extraídos. Se não enviar e informar por escrito, aceite da mesma forma.` +
+      `\n- Não repita a mesma pergunta se o cliente já respondeu o dado solicitado, ainda que de forma verbal.` +
+      (isLlmGenerated
+        ? `\n- Este passo exige uma resposta completa — escreva o conteúdo inteiro conforme a estrutura definida. Não resuma nem encurte.`
+        : `\n- Máximo 3 frases por mensagem. Seja direta e calorosa — fale como advogada humana, não como formulário.`);
   }
 
   userSystem +=
-    `\n\nREGRA ABSOLUTA — LIGAÇÕES: JAMAIS prometa que alguém vai ligar ou que você vai ligar.` +
-    ` PROIBIDO dizer: "vou te ligar", "alguém vai entrar em contato por telefone", "aguarde nossa ligação", "posso te ligar", "te ligo em breve" ou qualquer variação.` +
-    ` Se o cliente pedir ligação, responda apenas: "Por enquanto atendo pelo WhatsApp mesmo — pode continuar aqui!" e siga com a próxima pergunta ou informação.` +
-    ` O atendimento é 100% via WhatsApp — nunca haverá ligação pelo bot.`;
+    `\n\nSobre ligações: o atendimento é 100% via WhatsApp. Não prometa ligação telefônica.` +
+    ` Se o cliente pedir ligação, diga apenas: "Por enquanto atendo pelo WhatsApp mesmo — pode continuar aqui!" e siga com a próxima pergunta ou informação.`;
 
   userSystem +=
-    `\n\nREGRA ABSOLUTA — LINKS: Nunca inclua links, URLs ou placeholders de link` +
-    ` (como "[LINK AQUI]", "[URL]", etc.) no corpo da sua resposta de texto.` +
+    `\n\nSobre links: não inclua links, URLs ou placeholders de link no corpo da resposta.` +
     ` Links de assinatura, contrato e procuração são enviados pelo sistema em mensagens separadas automaticamente.` +
-    ` Se o cliente pedir para reenviar o link de assinatura ou contrato, diga apenas: "Aqui vão os links novamente!" — o sistema envia os links na sequência, um por documento.` +
-    ` NUNCA diga que contrato e procuração estão no mesmo link ou que "vêm juntos" — cada documento tem seu próprio link separado.`;
+    ` Se o cliente pedir para reenviar o link, diga apenas: "Aqui vão os links novamente!" — o sistema envia na sequência, um por documento.` +
+    ` Cada documento tem seu próprio link — contrato e procuração não estão no mesmo link.`;
 
-  if (ctx.documentosEnviados) userSystem += buildDocFeedback(ctx);
+  if (ctx.documentosEnviados) {
+    if (ctx.isDocAnalitico) {
+      // Analytical document (rescisão, holerite, cálculo, contrato, etc.) — any persona
+      userSystem +=
+        `\n\nDOCUMENTO TRABALHISTA RECEBIDO — o conteúdo extraído automaticamente está na última mensagem do usuário.` +
+        `\nTAREFA PRINCIPAL AGORA: analise o documento de forma abrangente e responda com clareza. Guia:` +
+        `\n- Rescisão/TRCT: identifique verbas pagas, aponte irregularidades ou direitos não contemplados.` +
+        `\n- Holerite: analise salário base, descontos, horas extras, adicionais noturno/periculosidade.` +
+        `\n- Cálculo trabalhista ou proposta de acordo: explique os valores e teses de forma acessível.` +
+        `\n- Contrato de trabalho: destaque cláusulas relevantes ao caso.` +
+        `\n- Outro documento: resuma o conteúdo e aponte o que for relevante para o caso.` +
+        `\nUse linguagem simples de WhatsApp (3-5 frases). Pergunte se ficou claro ou se tem dúvidas sobre algum ponto específico.` +
+        `\nNÃO force perguntas de qualificação — o foco desta resposta é a análise do documento enviado.`;
+    } else if (personaChave === "advogado" || personaChave === "secretaria") {
+      userSystem += buildDocFeedback(ctx);
+    } else {
+      // Assistente (Ana) com documento de identidade: just acknowledge — CPF/RG é papel de Daniela.
+      userSystem += `\n\nO cliente enviou um documento ou imagem. Agradeça o recebimento de forma breve e natural e continue normalmente com o fluxo de qualificação. NÃO peça CPF, RG ou qualquer dado de identificação pessoal — isso é papel da advogada especialista mais à frente.`;
+    }
+  }
 
-  if (ctx.perguntasDeterministicas.length > 0 && !vinculosTodosPrescritos) {
+  if (personaChave !== "assistente" && ctx.perguntasDeterministicas.length > 0 && !vinculosTodosPrescritos) {
     userSystem += `\n\nINFORMAÇÕES AINDA NÃO COLETADAS:\n${ctx.perguntasDeterministicas.join("\n")}`;
   }
 
   if (personaChave === "assistente" && ctx.personaInstrucoes) {
     userSystem += `\n\n${ctx.personaInstrucoes}`;
-    if (!vinculosOk && !vinculosTodosPrescritos && vinculos.length > 0) {
-      const CAMPOS_LABEL: Array<{ key: keyof VinculoEmprego; label: string }> = [
-        { key: "empresa", label: "empresa" }, { key: "funcao", label: "função" },
-        { key: "vinculo", label: "tipo de vínculo (CLT/autônomo/avulso)" },
-        { key: "saida", label: "como e quando saiu (ou se ainda está empregado)" },
-        { key: "tempo", label: "tempo de trabalho" }, { key: "horas_extras", label: "horas extras não pagas" },
-        { key: "pagamento_fora", label: "valor fora do holerite (Pamcard, Pix, dinheiro)" },
-        { key: "injustica", label: "irregularidades sofridas" },
-      ];
-      const listaDetalhada = vinculos.map((v, i) => {
-        const faltando = CAMPOS_LABEL.filter(c => !v[c.key]).map(c => c.label);
-        return `  ${i + 1}. ${v.empresa ?? "?"} (${v.funcao ?? "?"}) — ${faltando.length === 0 ? "✓ completo" : `FALTANDO: ${faltando.join(", ")}`}`;
-      }).join("\n");
-      userSystem += `\n\nVÍNCULOS REGISTRADOS (${vinculos.length}) — NÃO avance para "mais empregos?" enquanto houver campos faltando:\n${listaDetalhada}`;
-    }
   }
 
   if (ctx.nextQDeterministico) {
-    if (ctx.advFlowStepType === "llm_generated") {
-      let instrucaoLlm = `\n\n⚠️ TAREFA OBRIGATÓRIA AGORA — IGNORE QUALQUER OUTRA INSTRUÇÃO DE COLETA DE DADOS:\n${ctx.nextQDeterministico}\nElabore com base nos dados reais do lead. NÃO peça documentos, NÃO colete dados pessoais nesta resposta.`;
+    if (ctx.advFlowStepType === "llm_generated" || ctx.advFlowStepType === "llm_gate" || ctx.advFlowStepType === "gate") {
+      // Substitute {{campo}} placeholders from merged so the LLM never sees raw template variables
+      const instrucaoTexto = ctx.nextQDeterministico.replace(/\{\{(\w+)\}\}/g, (_: string, key: string) => {
+        if (key === "resposta_lead") return ctx.incomingText?.trim() || "[sem resposta do lead]";
+        const val = merged[key];
+        return val != null && String(val).trim() !== "" ? String(val) : (key === "empresa" ? "a empresa" : key === "nome" ? "o cliente" : `[${key}]`);
+      });
+      let instrucaoLlm = `\n\nInstruções para este turno:\n${instrucaoTexto}\nElabore com base nos dados reais do lead. Não peça documentos nem colete dados pessoais nesta resposta.`;
       if (ctx.valueInjection) instrucaoLlm += `\n\n${ctx.valueInjection}`;
       userSystem += instrucaoLlm;
     } else {
@@ -211,8 +253,13 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
         campoVal != null && campoVal !== "";
       if (campoJaColetado) {
         userSystem += `\n\nO campo "${ctx.advFlowCampoColetar}" já foi coletado: ${campoVal}. Use esse valor. NÃO peça novamente. Confirme brevemente e avance para o próximo assunto.`;
+      } else if (personaChave === "assistente" && !ctx.leadFezPerguntaInesperada) {
+        userSystem += `\n\nPRÓXIMA MENSAGEM (envie exatamente este texto, sem modificar ou parafrasear): ${ctx.nextQDeterministico}`;
       } else {
-        userSystem += `\n\n⚠️ PRÓXIMA PERGUNTA OBRIGATÓRIA — PERGUNTE AGORA de forma natural e conversacional. NÃO assuma que já foi respondido com base no histórico antigo — só pule se o cliente respondeu NESTA mensagem atual: ${ctx.nextQDeterministico}`;
+        // When lead asked an off-flow question: LLM answers ONLY the question (briefly).
+        // The deterministic next question is appended automatically as a second bubble by stage-engine.
+        // Instructing the LLM to include it here causes double-sending.
+        userSystem += `\n\nResponda APENAS a dúvida acima, de forma breve e direta. NÃO faça perguntas nem mencione o próximo assunto — o sistema enviará a próxima pergunta automaticamente.`;
       }
     }
   }
@@ -221,17 +268,64 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
     userSystem += `\n\nVÍNCULOS COLETADOS (${vinculos.length}):\n${vinculos.map((v, i) => `${i + 1}. ${v.empresa ?? "?"} — ${v.funcao ?? "?"} — saída: ${v.saida ?? "?"}`).join("\n")}`;
   }
 
+  if (personaChave === "secretaria" && merged._reuniao_criada) {
+    userSystem +=
+      `\n\n✅ REUNIÃO CRIADA COM SUCESSO — O link de acesso já foi enviado ao cliente em mensagem separada.` +
+      ` Confirme de forma natural que a reunião está marcada para "${merged.horario_reuniao ?? "o horário combinado"}" e que o link já foi enviado aqui pelo WhatsApp.` +
+      ` NÃO repita o link — ele foi enviado numa mensagem separada pelo sistema.`;
+  }
+
+  if ((personaChave === "advogado" || personaChave === "calculo") && merged._reuniao_criada) {
+    userSystem +=
+      `\n\n✅ REUNIÃO JÁ MARCADA — A reunião com o cliente está confirmada para ${merged.horario_reuniao ?? "o horário combinado"}.` +
+      ` Você entra em contato APÓS a reunião já estar agendada.` +
+      ` NÃO peça para a ${ctx.assistenteNome ?? "assistente"} ou secretária agendar novamente. NÃO sugira marcar reunião — ela já está marcada.` +
+      ` Pode referenciar a reunião naturalmente (ex: "até nossa reunião de ${merged.horario_reuniao ?? "quinta"}").`;
+  }
+
   if (vinculosTodosPrescritos) {
-    userSystem += `\n\nATENÇÃO — PRAZO PRESCRICIONAL VENCIDO: O emprego mais recente do cliente foi encerrado há mais de 2 anos. Pelo art. 11 da CLT, o prazo de 2 anos para ajuizar ação trabalhista já expirou. Como o vínculo mais recente está prescrito, todos os anteriores também estão — foram encerrados ainda antes. Informe o cliente com empatia que, infelizmente, não é mais possível ajuizar ação referente a esses empregos. Encerre a conversa de forma acolhedora, sem prometer nada.`;
+    userSystem += `\n\nATENÇÃO — PRAZO PRESCRICIONAL TRABALHISTA VENCIDO: O emprego mais recente do cliente foi encerrado há mais de 2 anos. Pelo art. 11 da CLT, o prazo de 2 anos para ajuizar ação trabalhista já expirou. As pretensões trabalhistas comuns (horas extras, rescisão indevida, FGTS, adicionais, 13º, férias, etc.) estão PRESCRITAS e não podem ser ajuizadas.
+
+EXCEÇÃO CRÍTICA — ACIDENTE DO TRABALHO COM INCAPACIDADE PERMANENTE: Se o cliente mencionou acidente de trabalho ou doença ocupacional que causou incapacidade permanente (ex: perda de movimentos, amputação, paralisia, invalidez total ou parcial), a pretensão à PENSÃO VITALÍCIA (art. 950 do Código Civil) e à indenização por danos morais decorrentes do acidente NÃO segue o prazo da CLT. O STJ entende que a pensão alimentar por incapacidade permanente é imprescritível ou segue o prazo de 3 anos do art. 206, §3°, V do CC a partir da data do evento danoso — o que pode ainda estar dentro do prazo.
+
+Instrução obrigatória:
+- Para as verbas trabalhistas comuns (horas extras, rescisão, FGTS, etc.): informe com empatia que essas pretensões estão prescritas e não podem mais ser ajuizadas pelo prazo da CLT.
+- Se o cliente mencionou acidente com incapacidade permanente: NÃO encerre a conversa. Analise se há base para ação de responsabilidade civil do empregador por danos materiais (pensão vitalícia proporcional à perda da capacidade de trabalho) e danos morais. Informe ao cliente que, embora as verbas trabalhistas comuns estejam prescritas, o direito à pensão vitalícia e à indenização pelo acidente pode ainda estar dentro do prazo e merece análise aprofundada. Prossiga qualificando esse ponto.
+- Se NÃO houve acidente com incapacidade permanente: encerre a conversa de forma acolhedora, sem prometer nada.`;
+  }
+
+  // Pre-filled data from meeting transcription or document OCR — show explicitly so LLM can
+  // confirm briefly and skip collecting those fields again.
+  if (personaChave === "advogado" || personaChave === "secretaria") {
+    const pfEntries = Object.entries(ctx.iaFlowStepData)
+      .filter(([k]) => k.startsWith("_pf_"))
+      .map(([k, v]) => `- ${k.replace("_pf_", "")}: ${v}`);
+    if (pfEntries.length > 0) {
+      const pfNome = ctx.iaFlowStepData._pf_nome as string | undefined;
+      userSystem +=
+        `\n\nDADOS JÁ OBTIDOS (da reunião ou documentos — NÃO pergunte esses campos):\n${pfEntries.join("\n")}` +
+        `\nNa primeira mensagem desta coleta, confirme esses dados brevemente e de forma natural` +
+        (pfNome ? ` (ex: "Você é ${pfNome}, né?")` : "") +
+        ` e vá direto para os campos que faltam.`;
+    }
   }
 
   const dadosKeys = Object.keys(merged).filter(k => !k.startsWith("_") && k !== "vinculos");
   if (dadosKeys.length > 0) {
     const dadosBasicos = Object.fromEntries(dadosKeys.map(k => [k, merged[k]]));
     userSystem += `\n\nDADOS BÁSICOS COLETADOS:\n${JSON.stringify(dadosBasicos, null, 2)}`;
-    const cpfConfirmado = typeof merged.cpf === "string" && validarCPF(merged.cpf) ? merged.cpf : null;
-    if (cpfConfirmado) {
-      userSystem += `\n\nIMPORTANTE — CPF CONFIRMADO: O CPF do cliente é ${cpfConfirmado} (já registrado e validado). NÃO questione este CPF, NÃO mencione outros números que possam ter aparecido no documento. Trate este CPF como definitivo.`;
+    // CPF validation/anti-hallucination: only relevant for advogado persona (Ana doesn't collect CPF)
+    if (personaChave === "advogado") {
+      const cpfConfirmado = typeof merged.cpf === "string" && validarCPF(merged.cpf) ? merged.cpf : null;
+      if (cpfConfirmado) {
+        userSystem += `\n\nIMPORTANTE — CPF CONFIRMADO: O CPF do cliente é ${cpfConfirmado} (já registrado e validado). NÃO questione este CPF, NÃO mencione outros números que possam ter aparecido no documento. Trate este CPF como definitivo.`;
+      } else {
+        userSystem +=
+          `\n\nO CPF do cliente ainda não está registrado.` +
+          ` Não afirme ter o CPF. Não confirme terminações, dígitos ou qualquer número.` +
+          ` Não diga "anotei seu CPF", "seu CPF está registrado" ou "já tenho seu CPF".` +
+          ` Se o cliente perguntar "qual meu CPF?", responda: "Ainda não tenho seu CPF registrado aqui — pode me informar agora?" e aguarde.`;
+      }
     }
   }
 
@@ -239,8 +333,25 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 
   if (ctx.frustrationInjection) userSystem += "\n\n" + ctx.frustrationInjection;
 
+  if (ctx.identityContextInject) {
+    userSystem += `\n\nDADOS DE LEGITIMIDADE DO ESCRITÓRIO (use para responder à dúvida do lead sobre confiança/segurança/golpe):\n${ctx.identityContextInject}`;
+  }
+
   if (personaChave === "advogado") {
-    if (ctx.handoffSnapshot) userSystem = ctx.handoffSnapshot + "\n\n" + userSystem;
+    if (ctx.advFlowStepType === "llm_generated") {
+      // Parecer step: wrap the entire prompt with format overrides at BOTH ends.
+      // The persona (47KB) has "Máximo 3 frases" — this sandwich ensures Claude sees
+      // the explicit format instruction first AND last, overriding the persona rule.
+      const handoff = ctx.handoffSnapshot ? ctx.handoffSnapshot + "\n\n" : "";
+      userSystem = handoff + userSystem;
+      userSystem += `\n\n${ctx.personaInstrucoes}`;
+    } else {
+      if (ctx.handoffSnapshot) userSystem = ctx.handoffSnapshot + "\n\n" + userSystem;
+      userSystem += `\n\n${ctx.personaInstrucoes}`;
+    }
+  }
+
+  if (personaChave === "secretaria" && ctx.personaInstrucoes) {
     userSystem += `\n\n${ctx.personaInstrucoes}`;
   }
 

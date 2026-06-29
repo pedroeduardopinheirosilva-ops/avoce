@@ -8,7 +8,7 @@
 
 import { extractCNHData, type CNHExtractorResult } from "./cnh-extractor.js";
 import {
-  ocrMistral, ocrMistralCNHAnnotation, ocrGroqVision, ocrGroqVisionJson,
+  ocrMistral, ocrMistralCNHAnnotation, ocrGroqVision, ocrGroqVisionJson, ocrClaudeVisionJson,
   ocrTesseract, pdfPrimeiraPagemParaJpeg,
 } from "./ocr-providers.js";
 import { validarCPF } from "./qualification-utils.js";
@@ -165,11 +165,18 @@ export function applyDocJsonToMerged(
     const val = docFixed[campo];
     if (!val) continue;
     if (campo === "cpf") {
-      if (validarCPF(val as string) && m.cpf !== val) { m.cpf = val; novosDocFields.cpf = val; }
+      if (validarCPF(val as string) && m.cpf !== val) {
+        m.cpf = val; novosDocFields.cpf = val;
+        m[`_pf_cpf`] = val; novosDocFields[`_pf_cpf`] = val;
+      }
     } else if (camposSempre.has(campo) || (isComprovante && camposEndereco.has(campo))) {
-      if (m[campo] !== val) { m[campo] = val; novosDocFields[campo] = val; }
+      if (m[campo] !== val) {
+        m[campo] = val; novosDocFields[campo] = val;
+        m[`_pf_${campo}`] = val; novosDocFields[`_pf_${campo}`] = val;
+      }
     } else if (!m[campo]) {
       m[campo] = val; novosDocFields[campo] = val;
+      m[`_pf_${campo}`] = val; novosDocFields[`_pf_${campo}`] = val;
     }
   }
 
@@ -183,23 +190,45 @@ export async function extractDocumentJson(
 ): Promise<DocJsonResult | null> {
   if (mimetype === "application/pdf") return extractDocFromPdf(keys, buffer);
 
-  // Image path: Mistral CNH annotation → Groq Vision JSON → null
+  // Image path (foto de documento): Claude Vision → Mistral CNH annotation → Groq Vision JSON → null.
+  // Normaliza subtipo + valida/troca CPF↔RG antes de devolver.
+  const normalize = (r: DocJsonResult | null): DocJsonResult | null => {
+    if (!r) return null;
+    if (r.tipo_documento === "CNH") r.subtipo = "CNH_FOTO";
+    if (r.cpf && !validarCPF(r.cpf)) {
+      if (r.rg && validarCPF(r.rg)) { [r.cpf, r.rg] = [r.rg, r.cpf]; }
+      else { r.cpf = null; }
+    }
+    return r;
+  };
+
+  // Claude Vision primeiro: melhor extração de CPF/RG em foto de CNH. Só aceita de imediato se trouxe
+  // CPF válido (o ponto fraco do Groq); senão guarda o parcial e tenta os outros provedores.
+  let claudeFallback: DocJsonResult | null = null;
+  if (keys.anthropicKey) {
+    const r = normalize(await ocrClaudeVisionJson(keys.anthropicKey, buffer, mimetype).catch(() => null));
+    if (r && r.cpf && validarCPF(r.cpf)) return r;
+    if (r && (r.nome || r.rg)) claudeFallback = r;
+  }
   if (keys.mistralKey) {
     const result = await ocrMistralCNHAnnotation(keys.mistralKey, buffer, mimetype).catch(() => null);
-    if (result && (result.nome || result.cpf || result.rg)) return result;
+    if (result && (result.nome || result.cpf || result.rg)) return normalize(result);
   }
   if (keys.groqKey) {
-    const result = await ocrGroqVisionJson(keys.groqKey, buffer, mimetype).catch(() => null);
-    if (result) {
-      if (result.tipo_documento === "CNH") result.subtipo = "CNH_FOTO";
-      if (result.cpf && !validarCPF(result.cpf)) {
-        if (result.rg && validarCPF(result.rg)) { [result.cpf, result.rg] = [result.rg, result.cpf]; }
-        else { result.cpf = null; }
-      }
-      return result;
-    }
+    const result = normalize(await ocrGroqVisionJson(keys.groqKey, buffer, mimetype).catch(() => null));
+    if (result && (result.cpf || result.nome || result.rg)) return result;
   }
-  return null;
+  // Nenhum trouxe CPF válido — devolve o melhor parcial do Claude (nome/RG/nascimento), se houve.
+  return claudeFallback;
+}
+
+function sanitizeOcrText(text: string): string {
+  // Remove lines with "Não disponível", "N/A", "?" for any field — prevents LLM hallucination
+  return text
+    .split("\n")
+    .filter(line => !/:\s*(n[aã]o\s*dispon[ií]vel|não\s*informado|n\/a|\?+)\s*$/i.test(line))
+    .join("\n")
+    .trim();
 }
 
 export async function extractMediaData(
@@ -227,11 +256,14 @@ export async function extractMediaData(
         if (parts.length > 0) return parts.join("\n\n");
       }
       if (mistralText) {
-        const clean = mistralText.replace(/!\[.*?\]\(.*?\)/g, "").trim();
+        const clean = sanitizeOcrText(mistralText.replace(/!\[.*?\]\(.*?\)/g, "").trim());
         if (clean.length > 30) return clean;
       }
     }
-    if (keys.groqKey && !isPdf) return ocrGroqVision(keys.groqKey, buffer, mimetype);
+    if (keys.groqKey && !isPdf) {
+      const groqResult = await ocrGroqVision(keys.groqKey, buffer, mimetype);
+      return groqResult ? sanitizeOcrText(groqResult) : null;
+    }
     return ocrTesseract(buffer, mimetype);
   } catch (e: any) {
     console.warn(`[DocExtract] Falha na extração (${mimetype}): ${e?.message}`);
