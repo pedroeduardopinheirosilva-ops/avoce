@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma } from "../db.js";
+import { whereEmitenteFilter, assertEmitenteAccess } from "./tenant-utils.js";
 
 const CATEGORIAS_RECEITA = ["Honorários Advocatícios", "Consultoria", "Êxito", "Mensalidade", "Outro"];
 const CATEGORIAS_DESPESA = ["Pessoal", "Aluguel", "Software", "Marketing", "Tributário", "Cartório", "Outro"];
@@ -18,7 +19,7 @@ export const financeiroRouter = router({
       tipo: z.enum(["receita", "despesa"]).optional(),
       emitenteId: z.string().optional(),
     }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const ano = input.ano ?? new Date().getFullYear();
       const mes = input.mes;
 
@@ -29,7 +30,9 @@ export const financeiroRouter = router({
         ? new Date(ano, mes, 0, 23, 59, 59)
         : new Date(ano, 11, 31, 23, 59, 59);
 
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const where: Record<string, unknown> = {
+        ...emitenteFilter,
         data: { gte: dataInicio, lte: dataFim },
       };
       if (input.tipo) where.tipo = input.tipo;
@@ -59,16 +62,17 @@ export const financeiroRouter = router({
 
   resumoAnual: authProc
     .input(z.object({ ano: z.number().int().optional() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const ano = input.ano ?? new Date().getFullYear();
       const meses = Array.from({ length: 12 }, (_, i) => i + 1);
+      const emitenteFilter = whereEmitenteFilter(ctx);
 
       const rows = await Promise.all(
         meses.map(async (mes) => {
           const dataInicio = new Date(ano, mes - 1, 1);
           const dataFim = new Date(ano, mes, 0, 23, 59, 59);
           const items = await prisma.lancamento.findMany({
-            where: { data: { gte: dataInicio, lte: dataFim } },
+            where: { ...emitenteFilter, data: { gte: dataInicio, lte: dataFim } },
             select: { tipo: true, valor: true },
           });
           const receita = items.filter(i => i.tipo === "receita").reduce((a, i) => a + Number(i.valor), 0);
@@ -91,8 +95,9 @@ export const financeiroRouter = router({
       pago: z.boolean().default(true),
       obs: z.string().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { data: dataStr, ...rest } = input;
+      if (rest.emitenteId) assertEmitenteAccess(ctx, rest.emitenteId);
       return prisma.lancamento.create({
         data: { ...rest, data: new Date(dataStr) },
         include: { emitente: { select: { id: true, nome: true } } },
@@ -110,8 +115,10 @@ export const financeiroRouter = router({
       pago: z.boolean().optional(),
       obs: z.string().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, data: dataStr, ...rest } = input;
+      const l = await prisma.lancamento.findUniqueOrThrow({ where: { id }, select: { emitenteId: true } });
+      if (l.emitenteId) assertEmitenteAccess(ctx, l.emitenteId);
       return prisma.lancamento.update({
         where: { id },
         data: { ...rest, data: dataStr ? new Date(dataStr) : undefined },
@@ -121,7 +128,10 @@ export const financeiroRouter = router({
 
   deletar: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const { id } = input;
+      const l = await prisma.lancamento.findUniqueOrThrow({ where: { id }, select: { emitenteId: true } });
+      if (l.emitenteId) assertEmitenteAccess(ctx, l.emitenteId);
       return prisma.lancamento.delete({ where: { id: input.id } });
     }),
 });

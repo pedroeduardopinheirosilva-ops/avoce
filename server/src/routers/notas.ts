@@ -1,26 +1,32 @@
 import { z }                from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma }           from "../db.js";
-import { emitirNfse, cancelarNfse, consultarNfse, type EmpresaConfig } from "../lib/nfse.js";
+import { whereEmitenteFilter, assertEmitenteAccess } from "./tenant-utils.js";
+import { emitirNfse, cancelarNfse, consultarNfse, providerMunicipio, type EmpresaConfig } from "../lib/nfse.js";
 import { certPathForEmpresa } from "../upload.js";
 import { renderTemplate }   from "../lib/template.js";
-import { enviarEmailNfse }  from "../lib/email.js";
+import { gerarCobrancaParaContrato } from "../lib/gerar-cobranca.js";
+import { fieldDecrypt }     from "../lib/field-crypto.js";
 
 async function getCfg(emitenteId: string): Promise<EmpresaConfig> {
   const emp = await prisma.empresaEmitente.findUniqueOrThrow({ where: { id: emitenteId } });
   const certPath = certPathForEmpresa(emitenteId);
   return {
-    cnpj:                   emp.cnpj,
-    inscricaoMunicipal:     emp.inscricaoMunicipal,
+    cnpj:                    emp.cnpj,
+    inscricaoMunicipal:      emp.inscricaoMunicipal,
     certPath,
-    certPass:               emp.certPass ?? process.env[`CERT_PASS_${emitenteId}`] ?? process.env.CERT_PASS_DEFAULT ?? "",
-    aliquotaIss:            emp.aliquotaIss,
-    itemListaServico:       emp.itemListaServico,
-    codTributacao:          emp.codTributacao,
-    codigoServicoNacional:  emp.codigoServicoNacional ?? undefined,
-    codigoNbs:              emp.codigoNbs ?? undefined,
-    regimeTributacao:       emp.regimeTributacao ?? undefined,
-    simplesNacional:        emp.regime,
+    certPass:                fieldDecrypt(emp.certPass) || process.env[`CERT_PASS_${emitenteId}`] || process.env.CERT_PASS_DEFAULT || "",
+    aliquotaIss:             emp.aliquotaIss,
+    itemListaServico:        emp.itemListaServico,
+    codTributacao:           emp.codTributacao,
+    codigoServicoNacional:   emp.codigoServicoNacional ?? undefined,
+    codigoNbs:               emp.codigoNbs ?? undefined,
+    regimeTributacao:        emp.regimeTributacao ?? undefined,
+    simplesNacional:         emp.regime,
+    nfseProvider:            ((emp as any).nfseProvider as "el_vdc" | "issnet_df" | null) ?? undefined,
+    codigoMunicipioEmitente: emp.codigoMunicipio ?? undefined,
+    codigoCnae:              (emp as any).codigoCnae ?? undefined,
+    tpAmb:                   ((emp as any).nfseTpAmb as "1" | "2" | null) ?? undefined,
   };
 }
 
@@ -34,8 +40,10 @@ export const notaRouter = router({
       page:        z.number().int().default(1),
       pageSize:    z.number().int().default(20),
     }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const where = {
+        ...emitenteFilter,
         ...(input.emitenteId  ? { emitenteId: input.emitenteId }   : {}),
         ...(input.contratoId  ? { contratoId: input.contratoId }   : {}),
         ...(input.status      ? { status: input.status }           : {}),
@@ -45,7 +53,7 @@ export const notaRouter = router({
         prisma.notaFiscal.findMany({
           where,
           include: {
-            emitente: { select: { id: true, nome: true } },
+            emitente: { select: { id: true, nome: true, nfseProvider: true } },
             contrato: { select: { id: true, descricaoServico: true, tomador: { select: { nome: true } } } },
           },
           orderBy: { criadoEm: "desc" },
@@ -59,11 +67,12 @@ export const notaRouter = router({
 
   emitir: authProc
     .input(z.object({ contratoId: z.string(), competencia: z.string().optional() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const contrato = await prisma.contrato.findUniqueOrThrow({
         where:   { id: input.contratoId },
         include: { emitente: true, tomador: true },
       });
+      assertEmitenteAccess(ctx, contrato.emitenteId);
 
       // Contratos suspensos ainda podem ter NFS-e emitida manualmente
 
@@ -92,9 +101,10 @@ export const notaRouter = router({
       try {
         const cfg = await getCfg(contrato.emitenteId);
 
-        // Calcular vencimento com base no diaVencimento do contrato
+        // Calcular vencimento com base no diaVencimento do contrato (clampado ao último dia do mês)
         const dtVenc = new Date();
-        dtVenc.setDate(contrato.diaVencimento);
+        const _ultimoDia1 = new Date(dtVenc.getFullYear(), dtVenc.getMonth() + 1, 0).getDate();
+        dtVenc.setDate(Math.min(contrato.diaVencimento, _ultimoDia1));
         const vencimento = dtVenc.toISOString().slice(0, 10);
 
         // Renderizar templates
@@ -118,14 +128,14 @@ export const notaRouter = router({
             endereco:        contrato.tomador.endereco ?? "Endereço não informado",
             numero:          contrato.tomador.numero ?? "S/N",
             bairro:          contrato.tomador.bairro ?? "Centro",
-            cidade:          contrato.tomador.cidade ?? "Vitória da Conquista",
-            codigoMunicipio: contrato.tomador.codigoMunicipio ?? "2933307",
-            uf:              contrato.tomador.uf ?? "BA",
-            cep:             contrato.tomador.cep ?? "45000000",
+            cidade:          contrato.tomador.cidade ?? contrato.emitente.cidade ?? "",
+            codigoMunicipio: contrato.tomador.codigoMunicipio ?? providerMunicipio(cfg),
+            uf:              contrato.tomador.uf ?? contrato.emitente.uf ?? "",
+            cep:             contrato.tomador.cep ?? "00000000",
             email:           contrato.tomador.email ?? undefined,
           },
           competencia:      `${yyyy}-${mm}`,
-          issRetido:        contrato.issRetido,
+          issRetido:        contrato.issRetido || contrato.tomador.issRetido,
           itemListaServico: contrato.itemListaServico ?? undefined,
           codigoNbs:        contrato.codigoNbs ?? undefined,
           retirIr:          contrato.retirIr,
@@ -146,36 +156,6 @@ export const notaRouter = router({
           },
         });
 
-        // Enviar por e-mail (assíncrono — não bloqueia nem reverte em caso de falha)
-        const smtpEmp = contrato.emitente.smtpHost && contrato.emitente.smtpUser ? {
-          host:   contrato.emitente.smtpHost,
-          port:   contrato.emitente.smtpPort ?? 587,
-          secure: contrato.emitente.smtpSecure,
-          user:   contrato.emitente.smtpUser,
-          pass:   contrato.emitente.smtpPass ?? "",
-          from:   contrato.emitente.smtpFrom ?? contrato.emitente.smtpUser,
-        } : null;
-        enviarEmailNfse({
-          numero:       result.numero,
-          competencia,
-          valor:        contrato.valor,
-          discriminacao: discriminacaoRendered,
-          linkNfse:     result.linkNfse ?? undefined,
-          codigoVerif:  result.codigoVerif ?? undefined,
-          emitente: {
-            nome:        contrato.emitente.nome,
-            nomeFantasia: contrato.emitente.nomeFantasia,
-            cnpj:        contrato.emitente.cnpj,
-            email:       contrato.emitente.email,
-            smtp:        smtpEmp,
-          },
-          tomador: {
-            nome:    contrato.tomador.nome,
-            cpfCnpj: contrato.tomador.cpfCnpj,
-            email:   contrato.tomador.email,
-          },
-        }).catch(console.error);
-
         return notaAtualizada;
       } catch (err) {
         await prisma.notaFiscal.update({
@@ -194,119 +174,141 @@ export const notaRouter = router({
       competencia: z.string().regex(/^\d{2}\/\d{4}$/),
       contratoIds: z.array(z.string()).min(1).max(100),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { competencia, contratoIds } = input;
       const [mm, yyyy] = competencia.split("/");
 
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const contratos = await prisma.contrato.findMany({
-        where: { id: { in: contratoIds }, ativo: true },
+        where: { id: { in: contratoIds }, ativo: true, ...emitenteFilter },
         include: { emitente: true, tomador: true },
       });
 
+      type NfseStatus = "EMITIDA" | "PULADA" | "ERRO" | "NAO_APLICAVEL";
+      type CobStatus  = "GERADA"  | "PULADA" | "ERRO";
       type ResultItem = {
-        contratoId: string;
-        tomador:    string;
-        emitente:   string;
-        valor:      number;
-        status:     "EMITIDA" | "PULADO" | "ERRO";
-        numero?:    string;
-        erroMsg?:   string;
+        contratoId:  string;
+        tomador:     string;
+        emitente:    string;
+        valor:       number;
+        nfseStatus:  NfseStatus;
+        cobStatus:   CobStatus;
+        nfseNumero?: string;
+        erroNfse?:   string;
+        erroCob?:    string;
       };
 
       const resultados: ResultItem[] = [];
 
       for (const contrato of contratos) {
-        // Verifica se já emitida neste mês
-        const jaExiste = await prisma.notaFiscal.findFirst({
-          where: { contratoId: contrato.id, competencia, status: { in: ["EMITIDA", "PENDENTE"] } },
-        });
-        if (jaExiste) {
-          resultados.push({
-            contratoId: contrato.id,
-            tomador:    contrato.tomador.nome,
-            emitente:   contrato.emitente.nome,
-            valor:      contrato.valor,
-            status:     "PULADO",
-            numero:     jaExiste.numero ?? undefined,
-          });
-          continue;
-        }
+        const nfseAoFaturar = (contrato as any).nfseAoFaturar !== false;
 
-        const nota = await prisma.notaFiscal.create({
-          data: { contratoId: contrato.id, emitenteId: contrato.emitenteId, competencia, valor: contrato.valor, status: "PENDENTE" },
+        // Calcular vencimento clampado ao último dia do mês
+        const dtVenc   = new Date();
+        const ultimoDia = new Date(dtVenc.getFullYear(), dtVenc.getMonth() + 1, 0).getDate();
+        dtVenc.setDate(Math.min(contrato.diaVencimento, ultimoDia));
+        const vencimento = dtVenc.toISOString().slice(0, 10);
+
+        // Verificar se já existe cobrança neste mês (critério universal de "já faturado")
+        const jaTemCobranca = await prisma.cobranca.findFirst({
+          where: { contratoId: contrato.id, competencia },
         });
 
-        try {
-          const cfg = await getCfg(contrato.emitenteId);
+        let nfseStatus: NfseStatus = "NAO_APLICAVEL";
+        let cobStatus:  CobStatus  = "PULADA";
+        let nfseNumero: string | undefined;
+        let erroNfse:   string | undefined;
+        let erroCob:    string | undefined;
 
-          const dtVenc = new Date();
-          dtVenc.setDate(contrato.diaVencimento);
-          const vencimento = dtVenc.toISOString().slice(0, 10);
-
-          const templateVars = {
-            competencia, vencimento, valor: contrato.valor,
-            emitente: contrato.emitente.nomeFantasia || contrato.emitente.nome,
-            tomador:  contrato.tomador.nome,
-            servico:  contrato.nomeServico ?? undefined,
-          };
-          const discriminacaoRendered = renderTemplate(contrato.descricaoServico, templateVars);
-
-          const result = await emitirNfse(contrato.emitenteId, cfg, {
-            valor:            contrato.valor,
-            discriminacao:    discriminacaoRendered,
-            tomador: {
-              nome:            contrato.tomador.nome,
-              cpfCnpj:         contrato.tomador.cpfCnpj,
-              inscMunicipal:   contrato.tomador.inscMunicipal ?? undefined,
-              endereco:        contrato.tomador.endereco ?? "Endereço não informado",
-              numero:          contrato.tomador.numero ?? "S/N",
-              bairro:          contrato.tomador.bairro ?? "Centro",
-              cidade:          contrato.tomador.cidade ?? "Vitória da Conquista",
-              codigoMunicipio: contrato.tomador.codigoMunicipio ?? "2933307",
-              uf:              contrato.tomador.uf ?? "BA",
-              cep:             contrato.tomador.cep ?? "45000000",
-              email:           contrato.tomador.email ?? undefined,
-            },
-            competencia:      `${yyyy}-${mm}`,
-            issRetido:        contrato.issRetido,
-            itemListaServico: contrato.itemListaServico ?? undefined,
-            codigoNbs:        contrato.codigoNbs ?? undefined,
-            retirIr:          contrato.retirIr,
-            retirCsll:        contrato.retirCsll,
-            retirPis:         contrato.retirPis,
-            retirCofins:      contrato.retirCofins,
+        // ── NFS-e ──────────────────────────────────────────────────────────────
+        if (nfseAoFaturar) {
+          const jaEmitida = await prisma.notaFiscal.findFirst({
+            where: { contratoId: contrato.id, competencia, status: { in: ["EMITIDA", "PENDENTE"] } },
           });
 
-          await prisma.notaFiscal.update({
-            where: { id: nota.id },
-            data: { status: "EMITIDA", numero: result.numero, codigoVerif: result.codigoVerif,
-                    xmlRetorno: result.xmlRetorno, linkNfse: result.linkNfse, emitidoEm: new Date() },
-          });
-
-          // E-mail assíncrono
-          const smtpEmp = contrato.emitente.smtpHost && contrato.emitente.smtpUser ? {
-            host: contrato.emitente.smtpHost, port: contrato.emitente.smtpPort ?? 587,
-            secure: contrato.emitente.smtpSecure, user: contrato.emitente.smtpUser,
-            pass: contrato.emitente.smtpPass ?? "", from: contrato.emitente.smtpFrom ?? contrato.emitente.smtpUser,
-          } : null;
-          enviarEmailNfse({
-            numero: result.numero, competencia, valor: contrato.valor, discriminacao: discriminacaoRendered,
-            linkNfse: result.linkNfse ?? undefined, codigoVerif: result.codigoVerif ?? undefined,
-            emitente: { nome: contrato.emitente.nome, nomeFantasia: contrato.emitente.nomeFantasia,
-                        cnpj: contrato.emitente.cnpj, email: contrato.emitente.email, smtp: smtpEmp },
-            tomador:  { nome: contrato.tomador.nome, cpfCnpj: contrato.tomador.cpfCnpj, email: contrato.tomador.email },
-          }).catch(e => console.error(`[Lote] Email falhou ${contrato.id}:`, e));
-
-          resultados.push({ contratoId: contrato.id, tomador: contrato.tomador.nome,
-                            emitente: contrato.emitente.nome, valor: contrato.valor,
-                            status: "EMITIDA", numero: result.numero });
-        } catch (err) {
-          const erroMsg = (err instanceof Error ? err.message : String(err)).slice(0, 500);
-          await prisma.notaFiscal.update({ where: { id: nota.id }, data: { status: "ERRO", erroMsg } });
-          resultados.push({ contratoId: contrato.id, tomador: contrato.tomador.nome,
-                            emitente: contrato.emitente.nome, valor: contrato.valor,
-                            status: "ERRO", erroMsg });
+          if (jaEmitida) {
+            nfseStatus = "PULADA";
+            nfseNumero = jaEmitida.numero ?? undefined;
+          } else {
+            const nota = await prisma.notaFiscal.create({
+              data: { contratoId: contrato.id, emitenteId: contrato.emitenteId, competencia, valor: contrato.valor, status: "PENDENTE" },
+            });
+            try {
+              const cfg = await getCfg(contrato.emitenteId);
+              const templateVars = {
+                competencia, vencimento, valor: contrato.valor,
+                emitente: contrato.emitente.nomeFantasia || contrato.emitente.nome,
+                tomador:  contrato.tomador.nome,
+                servico:  contrato.nomeServico ?? undefined,
+              };
+              const discriminacaoRendered = renderTemplate(contrato.descricaoServico, templateVars);
+              const result = await emitirNfse(contrato.emitenteId, cfg, {
+                valor:            contrato.valor,
+                discriminacao:    discriminacaoRendered,
+                tomador: {
+                  nome:            contrato.tomador.nome,
+                  cpfCnpj:         contrato.tomador.cpfCnpj,
+                  inscMunicipal:   contrato.tomador.inscMunicipal ?? undefined,
+                  endereco:        contrato.tomador.endereco ?? "Endereço não informado",
+                  numero:          contrato.tomador.numero ?? "S/N",
+                  bairro:          contrato.tomador.bairro ?? "Centro",
+                  cidade:          contrato.tomador.cidade ?? contrato.emitente.cidade ?? "",
+                  codigoMunicipio: contrato.tomador.codigoMunicipio ?? providerMunicipio(cfg),
+                  uf:              contrato.tomador.uf ?? contrato.emitente.uf ?? "",
+                  cep:             contrato.tomador.cep ?? "00000000",
+                  email:           contrato.tomador.email ?? undefined,
+                },
+                competencia:      `${yyyy}-${mm}`,
+                issRetido:        contrato.issRetido || contrato.tomador.issRetido,
+                itemListaServico: contrato.itemListaServico ?? undefined,
+                codigoNbs:        contrato.codigoNbs ?? undefined,
+                retirIr:          contrato.retirIr,
+                retirCsll:        contrato.retirCsll,
+                retirPis:         contrato.retirPis,
+                retirCofins:      contrato.retirCofins,
+              });
+              await prisma.notaFiscal.update({
+                where: { id: nota.id },
+                data:  { status: "EMITIDA", numero: result.numero, codigoVerif: result.codigoVerif,
+                         xmlRetorno: result.xmlRetorno, linkNfse: result.linkNfse, emitidoEm: new Date() },
+              });
+              nfseStatus = "EMITIDA";
+              nfseNumero = result.numero;
+            } catch (err) {
+              const msg = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+              await prisma.notaFiscal.update({ where: { id: nota.id }, data: { status: "ERRO", erroMsg: msg } });
+              nfseStatus = "ERRO";
+              erroNfse   = msg;
+            }
+          }
         }
+
+        // ── Cobrança ───────────────────────────────────────────────────────────
+        const gerarCob = (contrato as any).gerarCobrancaAuto !== false &&
+                         (contrato as any).metodoCobr !== "NENHUM" &&
+                         (contrato as any).metodoCobr !== "ALVARA";
+
+        if (!gerarCob) {
+          cobStatus = "PULADA";
+        } else if (jaTemCobranca) {
+          cobStatus = "PULADA";
+        } else {
+          try {
+            await gerarCobrancaParaContrato(contrato, competencia, vencimento);
+            cobStatus = "GERADA";
+          } catch (err) {
+            erroCob  = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+            cobStatus = "ERRO";
+          }
+        }
+
+        resultados.push({
+          contratoId: contrato.id,
+          tomador:    contrato.tomador.nome,
+          emitente:   contrato.emitente.nome,
+          valor:      contrato.valor,
+          nfseStatus, cobStatus, nfseNumero, erroNfse, erroCob,
+        });
       }
 
       return resultados;
@@ -314,8 +316,12 @@ export const notaRouter = router({
 
   cancelar: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
-      const nota = await prisma.notaFiscal.findUniqueOrThrow({ where: { id: input.id } });
+    .mutation(async ({ input, ctx }) => {
+      const nota = await prisma.notaFiscal.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true, status: true, numero: true, contratoId: true, competencia: true },
+      });
+      assertEmitenteAccess(ctx, nota.emitenteId);
       if (nota.status !== "EMITIDA") throw new Error("Apenas notas emitidas podem ser canceladas");
       if (!nota.numero) throw new Error("Nota sem número");
 
@@ -344,8 +350,12 @@ export const notaRouter = router({
 
   consultar: authProc
     .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
-      const nota = await prisma.notaFiscal.findUniqueOrThrow({ where: { id: input.id } });
+    .query(async ({ input, ctx }) => {
+      const nota = await prisma.notaFiscal.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true, numero: true },
+      });
+      assertEmitenteAccess(ctx, nota.emitenteId);
       if (!nota.numero) throw new Error("Nota sem número emitido");
       const cfg = await getCfg(nota.emitenteId);
       return consultarNfse(cfg, nota.numero);
@@ -353,9 +363,10 @@ export const notaRouter = router({
 
   // Verifica todas as notas EMITIDAS no E&L e marca como CANCELADA as que foram canceladas na prefeitura.
   // Cancela também as cobranças (PIX/boleto) vinculadas ao mesmo contrato e competência.
-  sincronizarCanceladas: authProc.mutation(async () => {
+  sincronizarCanceladas: authProc.mutation(async ({ ctx }) => {
+    const emitenteFilter = whereEmitenteFilter(ctx);
     const notas = await prisma.notaFiscal.findMany({
-      where:   { status: "EMITIDA", numero: { not: null } },
+      where:   { status: "EMITIDA", numero: { not: null }, ...emitenteFilter },
       include: { emitente: true },
     });
 
@@ -415,13 +426,14 @@ export const notaRouter = router({
     return { total: notas.length, canceladas, erros, resultados };
   }),
 
-  dashboard: authProc.query(async () => {
+  dashboard: authProc.query(async ({ ctx }) => {
+    const emitenteFilter = whereEmitenteFilter(ctx);
     const [total, emitidas, erros, valorAgg] = await Promise.all([
-      prisma.notaFiscal.count(),
-      prisma.notaFiscal.count({ where: { status: "EMITIDA" } }),
-      prisma.notaFiscal.count({ where: { status: "ERRO" } }),
+      prisma.notaFiscal.count({ where: emitenteFilter }),
+      prisma.notaFiscal.count({ where: { ...emitenteFilter, status: "EMITIDA" } }),
+      prisma.notaFiscal.count({ where: { ...emitenteFilter, status: "ERRO" } }),
       prisma.notaFiscal.aggregate({
-        where:  { status: "EMITIDA" },
+        where:  { ...emitenteFilter, status: "EMITIDA" },
         _sum:   { valor: true },
       }),
     ]);

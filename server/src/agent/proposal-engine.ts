@@ -1,6 +1,7 @@
 import { prisma } from "../db.js";
 import { sendText, sendDocument } from "../services/evolution.js";
 import { getEvolutionConfig, type EvolutionConfig } from "./message-handler.js";
+import { moverDealParaStage } from "./transition-engine.js";
 
 export async function criarPropostaAutomatica(
   projetoId: string,
@@ -16,6 +17,7 @@ export async function criarPropostaAutomatica(
     const propostaConfigs = await prisma.iaProjetoConfig.findMany({
       where: { projetoId, categoria: "proposta" },
     });
+    console.log(`[Proposta] projetoId=${projetoId} | configs carregados: ${propostaConfigs.map(c => c.chave).join(", ")}`);
     const getProp = (k: string) => propostaConfigs.find((c) => c.chave === k)?.valor ?? "";
 
     if (getProp("proposta_ativo") !== "true") return;
@@ -62,8 +64,16 @@ export async function criarPropostaAutomatica(
       return;
     }
 
-    // 3. Find or create Tomador
-    let tomador = await prisma.tomador.findUnique({ where: { cpfCnpj: cpfCliente.replace(/\D/g, "") } });
+    // 3. Find or create Tomador (scoped to deal.empresaId — Empresa tenant, not EmpresaEmitente)
+    const cpfNormalizado = cpfCliente.replace(/\D/g, "");
+    const tomadorEmpresaId = (deal as any).empresaId as string | null;
+    if (!tomadorEmpresaId) {
+      console.warn(`[Proposta] deal ${dealId} sem empresaId — tomador não criado`);
+      return;
+    }
+    let tomador = await (prisma.tomador as any).findFirst({
+      where: { cpfCnpj: cpfNormalizado, empresaId: tomadorEmpresaId },
+    });
     const normalizeEc = (s: string) => s.toLowerCase().trim().normalize("NFD").replace(/[̀-ͯ]/g, "");
     const ecMap: Record<string, string> = {
       solteiro: "solteiro", solteira: "solteiro", "solteiro(a)": "solteiro",
@@ -94,7 +104,7 @@ export async function criarPropostaAutomatica(
     };
     if (!tomador) {
       tomador = await prisma.tomador.create({
-        data: { cpfCnpj: cpfCliente.replace(/\D/g, ""), ...tomadorData },
+        data: { cpfCnpj: cpfNormalizado, empresaId: tomadorEmpresaId, ...tomadorData },
       });
       console.log(`[Proposta] Tomador criado: ${tomador.id} (${nomeCliente})`);
     } else {
@@ -152,12 +162,14 @@ export async function criarPropostaAutomatica(
       .replace(/\{\{honorariosExito\}\}/gi,     `${honorariosPerc}%`)
       .replace(/\{\{honorariosExitoPerc\}\}/gi, honorariosPerc);
 
-    // 7. Collect template IDs for contract/procuracao generation
+    // 7. Collect template IDs for contract/procuracao/atestado generation
     const templatesGerar: string[] = [];
-    const contratoTemplateId  = getProp("proposta_template_contrato_id");
+    const contratoTemplateId   = getProp("proposta_template_contrato_id");
     const procuracaoTemplateId = getProp("proposta_template_procuracao_id");
+    const atestadoTemplateId   = getProp("proposta_template_atestado_id");
     if (contratoTemplateId)   templatesGerar.push(contratoTemplateId);
     if (procuracaoTemplateId) templatesGerar.push(procuracaoTemplateId);
+    if (atestadoTemplateId)   templatesGerar.push(atestadoTemplateId);
 
     // 8. Create Proposta record
     const titulo = `Proposta — ${nomeCliente}`;
@@ -351,6 +363,9 @@ export async function criarPropostaAutomatica(
         },
       }).catch(() => {});
       console.log(`[Proposta] Proposta ${proposta.id} enviada via WhatsApp para ${phone}`);
+      // Contrato enviado para assinatura → mover card para "Aguardando Assinatura".
+      // Troca persona p/ advogado (evita re-disparo do fluxo coleta_docs/Nelson).
+      await moverDealParaStage(dealId, "aguardando_assinatura", "advogado");
     } else {
       console.warn(`[Proposta] Proposta ${proposta.id} criada mas NADA enviado ao cliente ${phone}`);
     }

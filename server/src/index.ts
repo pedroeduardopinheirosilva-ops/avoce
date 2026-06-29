@@ -7,9 +7,9 @@ import { appRouter }        from "./routers/index.js";
 import type { Context }     from "./routers/index.js";
 import { prisma }           from "./db.js";
 import { salvarCertificado, salvarLogo, LOGOS_DIR, certPathForEmpresa } from "./upload.js";
-import { createReadStream, existsSync, readFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { writeFile }                               from "node:fs/promises";
-import { join, resolve }                           from "node:path";
+import { join, resolve, extname, basename }        from "node:path";
 import { iniciarCron, emitirContratosDoDia, gerarCobrancasDoDia } from "./cron.js";
 import { getCronHealthSnapshot } from "./agent/cron-tracker.js";
 import { initBankingCron } from "./modules/banking/cron/banking.cron.js";
@@ -25,10 +25,21 @@ import bcrypt               from "bcryptjs";
 
 const PORT = parseInt(process.env.PORT ?? "8470");
 
-const app = Fastify({ logger: true, maxParamLength: 5000 });
+// ── Startup validation ────────────────────────────────────────────────────────
+if (!process.env.JWT_SECRET) {
+  throw new Error("[BOOT] JWT_SECRET é obrigatório. Configure no ecosystem.config.cjs");
+}
+if (!process.env.PAKT_WEBHOOK_SECRET) {
+  throw new Error("[BOOT] PAKT_WEBHOOK_SECRET é obrigatório. Configure no ecosystem.config.cjs");
+}
+
+const app = Fastify({ logger: true, maxParamLength: 5000, bodyLimit: 10_485_760 });
 
 await app.register(cors, {
-  origin: true,
+  origin: [
+    "https://avoce.capium.com.br",
+    /^http:\/\/localhost(:\d+)?$/,
+  ],
   credentials: true,
 });
 
@@ -46,21 +57,27 @@ await app.register(fastifyTRPCPlugin, {
   trpcOptions: {
     router: appRouter,
     createContext: ({ req }: { req: FastifyRequest }): Context => ({ req }),
+    onError: ({ error, path }: { error: Error; path: string | undefined }) => {
+      console.error(`[tRPC-ERR] ${path ?? "?"}:`, error.message);
+    },
   },
 });
 
 // ── Upload de certificado ─────────────────────────────────────────────────────
 
 app.post("/api/cert/:empresaId", async (req, reply) => {
-  const auth  = req.headers.authorization ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
-  } catch {
-    return reply.status(401).send({ error: "Não autorizado" });
-  }
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { empresaId } = req.params as { empresaId: string };
+
+  // Verify user can access this emitente
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id: empresaId }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
 
   const parts = req.parts();
   let fileBuffer: Buffer | null = null;
@@ -89,12 +106,17 @@ app.post("/api/cert/:empresaId", async (req, reply) => {
 // ── Upload de logo da empresa ─────────────────────────────────────────────────
 
 app.post("/api/logo/:empresaId", async (req, reply) => {
-  const auth  = req.headers.authorization ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
-  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { empresaId } = req.params as { empresaId: string };
+
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id: empresaId }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
   let fileBuffer: Buffer | null = null;
   let mimetype = "image/jpeg";
 
@@ -132,12 +154,89 @@ app.get("/api/logo/:empresaId", async (req, reply) => {
 
 // ── Upload de timbrado da empresa ─────────────────────────────────────────────
 
+// ── Mídia de apresentação das personas (foto/vídeo enviado ao lead na intro) ──
+
+const PERSONAS_MIDIA_DIR = resolve("./personas-midia");
+mkdirSync(PERSONAS_MIDIA_DIR, { recursive: true });
+
+const MIME_EXT: Record<string, string> = {
+  "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+  "image/webp": "webp", "image/gif": "gif",
+  "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+};
+const EXT_MIME: Record<string, string> = {
+  jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif",
+  mp4: "video/mp4", mov: "video/quicktime", webm: "video/webm",
+};
+
+app.post("/api/ia-persona-midia/:personaId", async (req, reply) => {
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
+
+  const { personaId } = req.params as { personaId: string };
+  let fileBuffer: Buffer | null = null;
+  let mimeType = "image/jpeg";
+
+  for await (const part of req.parts()) {
+    if (part.type === "file") {
+      mimeType = part.mimetype || "image/jpeg";
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileBuffer = Buffer.concat(chunks);
+    }
+  }
+  if (!fileBuffer) return reply.status(400).send({ error: "Arquivo não enviado" });
+
+  const tipo = mimeType.startsWith("video/") ? "video" : "image";
+  const ext = MIME_EXT[mimeType] ?? (tipo === "video" ? "mp4" : "jpg");
+
+  // Delete old file for this persona if it exists
+  const existing = await prisma.iaPersona.findUnique({ where: { id: personaId }, select: { midiaApresentacaoPath: true } });
+  if (existing?.midiaApresentacaoPath) {
+    try { unlinkSync(existing.midiaApresentacaoPath); } catch {}
+  }
+
+  const filePath = join(PERSONAS_MIDIA_DIR, `${personaId}.${ext}`);
+  await writeFile(filePath, fileBuffer);
+  await prisma.iaPersona.update({ where: { id: personaId }, data: { midiaApresentacaoPath: filePath, midiaApresentacaoTipo: tipo } });
+  return reply.send({ ok: true, tipo });
+});
+
+// Serve saved incoming audio messages (auth required — token in query or header)
+const AUDIO_DIR_SERVE = resolve(process.env.AUDIO_DIR ?? "./audio");
+app.get("/api/audio/:filename", async (req, reply) => {
+  const auth  = req.headers.authorization ?? (req.query as any).token ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  try { jwt.verify(token, process.env.JWT_SECRET!); } catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const { filename } = req.params as { filename: string };
+  const safe = filename.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const filePath = join(AUDIO_DIR_SERVE, safe);
+  if (!existsSync(filePath)) return reply.status(404).send({ error: "Não encontrado" });
+  reply.type(safe.endsWith(".mp3") ? "audio/mpeg" : "audio/ogg");
+  return reply.send(createReadStream(filePath));
+});
+
+// Serve publicly (no auth) — Evolution API fetches this URL to send to WhatsApp
+app.get("/api/ia-persona-midia/:personaId", async (req, reply) => {
+  const { personaId } = req.params as { personaId: string };
+  const persona = await prisma.iaPersona.findUnique({
+    where: { id: personaId },
+    select: { midiaApresentacaoPath: true },
+  });
+  if (!persona?.midiaApresentacaoPath || !existsSync(persona.midiaApresentacaoPath)) {
+    return reply.status(404).send({ error: "Não encontrado" });
+  }
+  const ext = persona.midiaApresentacaoPath.split(".").pop()?.toLowerCase() ?? "jpg";
+  reply.type(EXT_MIME[ext] ?? "application/octet-stream");
+  return reply.send(createReadStream(persona.midiaApresentacaoPath));
+});
+
 // ── Consulta CNPJ via ListaCNPJ interno ───────────────────────────────────────
 
 app.get("/api/cnpj-lookup/:cnpj", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { cnpj } = req.params as { cnpj: string };
@@ -194,12 +293,17 @@ const TIMBRADOS_EMPRESA_DIR = join(LOGOS_DIR, "../timbrados-empresa");
 try { mkdirSync(TIMBRADOS_EMPRESA_DIR, { recursive: true }); } catch {}
 
 app.post("/api/empresa/:id/timbrado", async (req, reply) => {
-  const auth  = req.headers.authorization ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
-  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { id } = req.params as { id: string };
+
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
   let fileBuffer: Buffer | null = null;
   let ext = "png";
 
@@ -227,12 +331,18 @@ app.post("/api/empresa/:id/timbrado", async (req, reply) => {
 });
 
 app.delete("/api/empresa/:id/timbrado", async (req, reply) => {
-  const auth  = req.headers.authorization ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
-  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { id } = req.params as { id: string };
+
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
+
   await prisma.empresaEmitente.update({ where: { id }, data: { timbradoPath: null } as any });
   return reply.send({ ok: true });
 });
@@ -243,7 +353,7 @@ app.get("/api/cobranca/:id/boleto.pdf", async (req, reply) => {
   const auth  = (req.headers.authorization ?? "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.query as Record<string, string>).token ?? "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -328,7 +438,7 @@ app.get("/api/cobranca/:id/html", async (req, reply) => {
   const auth  = (req.headers.authorization ?? "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.query as Record<string, string>).token ?? "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -525,18 +635,13 @@ app.post("/api/proposta/:token/aceitar", async (req, reply) => {
 app.post("/api/pakt-webhook", {
   config: { rawBody: true },
 }, async (req, reply) => {
-  const webhookSecret = process.env.PAKT_WEBHOOK_SECRET;
-
-  // Verificar assinatura HMAC se o secret estiver configurado
-  if (webhookSecret) {
-    const { createHmac } = await import("node:crypto");
-    const sig      = (req.headers["x-pakt-signature"] as string) ?? "";
-    const body     = (req as any).rawBody ?? JSON.stringify(req.body);
-    const expected = "sha256=" + createHmac("sha256", webhookSecret).update(body).digest("hex");
-    if (sig !== expected) {
-      app.log.warn("[PAKT-Webhook] Assinatura inválida");
-      return reply.status(401).send({ error: "Invalid signature" });
-    }
+  const { createHmac } = await import("node:crypto");
+  const sig      = (req.headers["x-pakt-signature"] as string) ?? "";
+  const body     = (req as any).rawBody ?? JSON.stringify(req.body);
+  const expected = "sha256=" + createHmac("sha256", process.env.PAKT_WEBHOOK_SECRET!).update(body).digest("hex");
+  if (sig !== expected) {
+    app.log.warn("[PAKT-Webhook] Assinatura inválida");
+    return reply.status(401).send({ error: "Invalid signature" });
   }
 
   const payload = req.body as { event: string; documentId: string; data: any };
@@ -591,6 +696,24 @@ app.post("/api/pakt-webhook", {
 
         app.log.info(`[PAKT-Webhook] Proposta ${proposta.id} marcada como ACEITA via PAKT doc ${documentId}`);
 
+        // Assinatura concluída → mover card para "Aguardando Documentos" (comprobatórios p/ ajuizar)
+        ;(async () => {
+          try {
+            const tomador = await prisma.tomador.findUnique({ where: { id: proposta.tomadorId } });
+            const contato = tomador?.cpfCnpj
+              ? await prisma.crmContato.findFirst({ where: { cpf: tomador.cpfCnpj } })
+              : null;
+            if (!contato) return;
+            const deal = await prisma.crmDeal.findFirst({
+              where: { contatoId: contato.id, pipelineId: "pipeline_c3_comercial", status: "aberto" },
+              orderBy: { criadoEm: "desc" },
+            });
+            if (!deal) return;
+            const { moverDealParaStage } = await import("./agent/transition-engine.js");
+            await moverDealParaStage(deal.id, "docs_comprobatorios", "advogado");
+          } catch (e) { app.log.error({ err: e }, "[PAKT-Webhook] Falha ao mover card pós-assinatura"); }
+        })();
+
         // Executar em sequência: contrato → e-mail confirmação
         // (documentos já foram gerados no momento do envio da proposta)
         ;(async () => {
@@ -640,7 +763,7 @@ app.get("/api/proposta/:id/pdf-assinado", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -664,7 +787,7 @@ app.get("/api/documento-gerado/:id/pdf", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -686,7 +809,7 @@ app.get("/api/documento-gerado/:id/docx", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -704,6 +827,143 @@ app.get("/api/documento-gerado/:id/docx", async (req, reply) => {
   return reply.send(createReadStream((doc as any).docxPath));
 });
 
+// ── Deal Anexos — download único ou ZIP ──────────────────────────────────────
+
+app.get("/api/deal-anexos/:id/download", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
+  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+
+  const { id } = req.params as { id: string };
+  const anexo = await prisma.dealAnexo.findUnique({ where: { id } });
+  if (!anexo) return reply.status(404).send({ error: "Não encontrado" });
+  if (!existsSync(anexo.caminhoArquivo)) return reply.status(404).send({ error: "Arquivo não encontrado no disco" });
+
+  reply.header("Content-Type", anexo.mimetype || "application/octet-stream");
+  reply.header("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(anexo.nomeArquivo)}`);
+  return reply.send(createReadStream(anexo.caminhoArquivo));
+});
+
+app.post("/api/deal-anexos/download-zip", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
+  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+
+  const { ids } = req.body as { ids: string[] };
+  if (!Array.isArray(ids) || ids.length === 0) return reply.status(400).send({ error: "ids obrigatório" });
+
+  const anexos = await prisma.dealAnexo.findMany({ where: { id: { in: ids } } });
+  const existentes = anexos.filter(a => existsSync(a.caminhoArquivo));
+  if (existentes.length === 0) return reply.status(404).send({ error: "Nenhum arquivo encontrado no disco" });
+
+  const archiver = (await import("archiver")).default;
+  const archive  = archiver("zip", { zlib: { level: 6 } });
+
+  reply.header("Content-Type", "application/zip");
+  reply.header("Content-Disposition", `attachment; filename="documentos.zip"`);
+  reply.raw.writeHead(200, {
+    "Content-Type": "application/zip",
+    "Content-Disposition": `attachment; filename="documentos.zip"`,
+  });
+  archive.pipe(reply.raw);
+
+  const seen = new Map<string, number>();
+  for (const a of existentes) {
+    let nome = a.nomeArquivo;
+    const count = seen.get(nome) ?? 0;
+    if (count > 0) {
+      const dot = nome.lastIndexOf(".");
+      nome = dot >= 0 ? `${nome.slice(0, dot)}_${count}${nome.slice(dot)}` : `${nome}_${count}`;
+    }
+    seen.set(a.nomeArquivo, count + 1);
+    archive.file(a.caminhoArquivo, { name: nome });
+  }
+
+  await archive.finalize();
+});
+
+// ── Deal Anexos — upload manual + delete ─────────────────────────────────────
+
+app.post("/api/deal-anexos/:dealId/upload", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
+  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+
+  const { dealId } = req.params as { dealId: string };
+  const data = await req.file();
+  if (!data) return reply.status(400).send({ error: "Nenhum arquivo enviado" });
+
+  const buffer = await data.toBuffer();
+  const mimetype = data.mimetype || "application/octet-stream";
+  const originalName = data.filename || "arquivo";
+
+  const UPLOADS_BASE = process.env.UPLOADS_DIR ?? "/opt/avoce/uploads";
+  const dir = join(UPLOADS_BASE, "deals", dealId);
+  mkdirSync(dir, { recursive: true });
+
+  const ext = extname(originalName).replace(".", "") || "bin";
+  const baseName = basename(originalName, extname(originalName)).replace(/[^a-zA-Z0-9_-]/g, "_");
+  const filename = `${Date.now()}_${baseName}.${ext}`;
+  const filePath = join(dir, filename);
+  writeFileSync(filePath, buffer);
+
+  // OCR async (fire-and-forget)
+  const isOcrAble = mimetype.startsWith("image/") || mimetype === "application/pdf";
+  let ocrTexto: string | null = null;
+  let tipoDocumento = "OUTRO";
+  let dadosExtraidos: Record<string, unknown> | null = null;
+
+  if (isOcrAble) {
+    try {
+      const deal = await prisma.crmDeal.findUnique({ where: { id: dealId }, select: { projetoId: true } });
+      if (deal?.projetoId) {
+        const { extractDocumentJson, extractMediaData } = await import("./agent/doc-extractor.js");
+        const ocrCfgs   = await prisma.iaProjetoConfig.findMany({ where: { projetoId: deal.projetoId, categoria: "ocr" } });
+        const mistralKey = ocrCfgs.find(c => c.chave === "ocr_mistral_api_key")?.valor ?? "";
+        const groqRow    = await prisma.iaLlmProvedor.findFirst({ where: { projetoId: deal.projetoId, ativo: true, provider: "groq" }, orderBy: { ordem: "asc" } });
+        const groqKey    = groqRow?.apiKey ?? "";
+        const anthropicRow = await prisma.iaLlmProvedor.findFirst({ where: { projetoId: deal.projetoId, ativo: true, provider: "anthropic" }, orderBy: { ordem: "asc" } });
+        const anthropicKey = anthropicRow?.apiKey ?? "";
+        const [extracted, docJson] = await Promise.all([
+          extractMediaData({ groqKey, mistralKey }, buffer, mimetype).catch(() => null),
+          extractDocumentJson({ groqKey, mistralKey, anthropicKey }, buffer, mimetype).catch(() => null),
+        ]);
+        if (extracted) ocrTexto = `[Documento recebido — dados extraídos]\n${extracted}`;
+        if (docJson && docJson.tipo_documento !== "OUTRO") {
+          tipoDocumento = docJson.tipo_documento;
+          dadosExtraidos = docJson as unknown as Record<string, unknown>;
+        }
+      }
+    } catch {}
+  }
+
+  const anexo = await prisma.dealAnexo.create({
+    data: { dealId, nomeArquivo: originalName, mimetype, tamanho: buffer.length, caminhoArquivo: filePath, ocrTexto, tipoDocumento, dadosExtraidos: dadosExtraidos as any ?? undefined },
+    select: { id: true, nomeArquivo: true, mimetype: true, tamanho: true, tipoDocumento: true, dadosExtraidos: true, criadoEm: true },
+  });
+
+  return reply.send(anexo);
+});
+
+app.delete("/api/deal-anexos/:id", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
+  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+
+  const { id } = req.params as { id: string };
+  const anexo = await prisma.dealAnexo.findUnique({ where: { id } });
+  if (!anexo) return reply.status(404).send({ error: "Não encontrado" });
+
+  await prisma.dealAnexo.delete({ where: { id } });
+  try { if (existsSync(anexo.caminhoArquivo)) unlinkSync(anexo.caminhoArquivo); } catch {}
+
+  return reply.send({ ok: true });
+});
+
 // ── Upload de timbrado para template de documento ────────────────────────────
 
 const TIMBRADOS_DIR = join(LOGOS_DIR, "../timbrados");
@@ -712,7 +972,7 @@ try { mkdirSync(TIMBRADOS_DIR, { recursive: true }); } catch {}
 app.post("/api/template-documento/:id/timbrado", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { id } = req.params as { id: string };
@@ -747,7 +1007,7 @@ app.post("/api/template-documento/:id/timbrado", async (req, reply) => {
 app.delete("/api/template-documento/:id/timbrado", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { id } = req.params as { id: string };
@@ -760,7 +1020,7 @@ app.delete("/api/template-documento/:id/timbrado", async (req, reply) => {
 app.get("/api/template-documento/:id/preview.pdf", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.query as any).token ?? "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { id } = req.params as { id: string };
@@ -821,12 +1081,18 @@ const CONTRATOS_DIR = join(LOGOS_DIR, "../contratos");
 try { mkdirSync(CONTRATOS_DIR, { recursive: true }); } catch {}
 
 app.post("/api/contrato/:id/upload-assinado", async (req, reply) => {
-  const auth  = req.headers.authorization ?? "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
-  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { id } = req.params as { id: string };
+
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const c = await prisma.contrato.findUnique({ where: { id }, include: { emitente: { select: { empresaId: true } } } });
+    if (!c || !canAccessEmpresa(payload, c.emitente.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
+
   let fileBuffer: Buffer | null = null;
   let filename = "contrato.pdf";
 
@@ -864,7 +1130,7 @@ app.post("/api/contrato/:id/upload-assinado", async (req, reply) => {
 app.get("/api/contrato/:id/assinado.pdf", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : (req.query as any).token ?? "";
-  try { jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret"); }
+  try { jwt.verify(token, process.env.JWT_SECRET!); }
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { id } = req.params as { id: string };
@@ -910,16 +1176,7 @@ app.post("/api/whatsapp/webhook", async (req, reply) => {
   });
 
   if (!config?.projetoId) {
-    // Try to find by any active project (single-project mode)
-    const anyConfig = await prisma.iaProjetoConfig.findFirst({
-      where: { chave: "evolution_instancia" },
-    });
-    if (!anyConfig?.projetoId) {
-      app.log.warn(`[WA-Webhook] Instância desconhecida: "${instanceName}". Configure em Config IA.`);
-      return reply.send({ ok: true });
-    }
-    const { projetoId } = anyConfig;
-    await processMessages(body, projetoId, app);
+    app.log.warn(`[WA-Webhook] Instância desconhecida: "${instanceName}". Configure evolution_instancia em Config IA.`);
     return reply.send({ ok: true });
   }
 
@@ -943,7 +1200,7 @@ setInterval(() => {
 // Processing mutex (_phoneProcessingPromise): if new messages arrive while an LLM call is in
 // flight for this phone, they wait for the current call to finish before firing. This prevents
 // concurrent LLM calls for the same conversation when Evolution API delivers webhooks with delay.
-const DEBOUNCE_MS = 15000; // 15-second quiet window — carreteiros type slowly on mobile
+const DEBOUNCE_MS = 4000; // 4-second quiet window to accumulate rapid multi-message bursts
 const _phoneDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; msgs: any[]; projetoId: string }>();
 const _phoneProcessingPromise = new Map<string, Promise<void>>();
 
@@ -1002,6 +1259,19 @@ function debounceForPhone(
         }
       }
 
+      // Send early typing indicator (fire-and-forget) so user sees feedback before LLM responds.
+      // Critical for reasoning models (DeepSeek v4-pro) that take 10-45s to respond.
+      void (async () => {
+        try {
+          const [{ getEvolutionConfig }, { sendTyping }] = await Promise.all([
+            import("./agent/stage-engine.js"),
+            import("./services/evolution.js"),
+          ]);
+          const evoConfig = await getEvolutionConfig(pid);
+          if (evoConfig) await sendTyping(evoConfig, phone, 45_000);
+        } catch { /* non-critical */ }
+      })();
+
       // Process only the last message (triggers LLM with full accumulated history)
       try {
         await processIncomingMessage(pid, msgs[msgs.length - 1]);
@@ -1015,9 +1285,92 @@ function debounceForPhone(
   }, DEBOUNCE_MS);
 }
 
+// Saves outgoing messages sent directly from WhatsApp or Evolution manager (fromMe: true).
+// Dedup strategy:
+//   1. evolutionMessageId unique index — catches Avoce-UI manual messages (we save evolutionMessageId after sendText)
+//   2. Content match in last 30s — catches IA messages (saved before sending, without evolutionMessageId)
+async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
+  try {
+    const msgId: string | undefined = msg.key?.id;
+    const phone: string = (msg.key.remoteJid as string).replace(/@.*/, "");
+
+    // 1. Dedup by evolutionMessageId (Avoce UI messages already saved)
+    if (msgId) {
+      const dup = await prisma.crmMensagemWhatsapp.findFirst({ where: { evolutionMessageId: msgId } });
+      if (dup) return;
+    }
+
+    // 2. Extract message text
+    const m = msg.message ?? {};
+    const rawText: string | null =
+      m.conversation ??
+      m.extendedTextMessage?.text ??
+      (m.audioMessage ? "[Áudio]" :
+      m.imageMessage ? "[Imagem]" :
+      m.documentMessage ? "[Documento]" : null);
+    if (!rawText) return;
+
+    // 3. Find deal for this contact+project
+    const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
+    if (!contato) return;
+
+    const deal = await prisma.crmDeal.findFirst({
+      where: { contatoId: contato.id, projetoId, status: "aberto" },
+      orderBy: { criadoEm: "desc" },
+    });
+    if (!deal) return;
+
+    // 4. Content dedup — IA saves messages before sending (without evolutionMessageId).
+    //    Strip *Name*\n prefix that Evolution wraps around sent text, then check for recent match.
+    const stripped = rawText.replace(/^\*[^*\n]+\*\n/, "").slice(0, 80);
+    const recentDup = await prisma.crmMensagemWhatsapp.findFirst({
+      where: {
+        dealId: deal.id,
+        direcao: "out",
+        enviadaEm: { gte: new Date(Date.now() - 30_000) },
+        conteudo: { contains: stripped.slice(0, 60) },
+      },
+    });
+    if (recentDup) return;
+
+    // 5. Resolve SDR name from deal.iaPausadaPor, or extract from *Name*\n prefix
+    let remetente = "Atendente";
+    const prefixMatch = rawText.match(/^\*([^*\n]+)\*\n/);
+    if (prefixMatch) {
+      remetente = prefixMatch[1]; // use the bolded name embedded in the message
+    } else if (deal.iaPausadaPor) {
+      const u = await prisma.usuario.findUnique({ where: { id: deal.iaPausadaPor }, select: { nome: true } });
+      if (u) remetente = u.nome;
+    }
+
+    await prisma.crmMensagemWhatsapp.create({
+      data: {
+        dealId:             deal.id,
+        contatoId:          contato.id,
+        direcao:            "out",
+        tipo:               "text",
+        conteudo:           rawText,
+        remetente,
+        evolutionMessageId: msgId ?? null,
+      },
+    });
+
+    if (msgId) _processedMsgIds.set(msgId, Date.now());
+    app.log.info(`[WA-Webhook] fromMe salvo: ${phone} (${remetente})`);
+  } catch (err: any) {
+    // P2002 = unique constraint violation (evolutionMessageId) — race condition, safe to ignore
+    if (err?.code !== "P2002") {
+      app.log.warn({ err }, `[WA-Webhook] Erro ao salvar fromMe de ${msg?.key?.remoteJid}`);
+    }
+  }
+}
+
 async function processMessages(body: any, projetoId: string, app: any) {
   const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId } });
   if (!projeto?.ativo) return;
+
+  const { getModoColeta } = await import("./agent/conversational-dispatch.js");
+  const modoColeta = await getModoColeta(projetoId);
 
   const data = body?.data ?? body;
 
@@ -1039,13 +1392,15 @@ async function processMessages(body: any, projetoId: string, app: any) {
 
   for (const msg of messages) {
     if (!msg?.key?.remoteJid) continue;
-    if (msg.key.fromMe) continue;
     // Skip status broadcasts
     if (msg.key.remoteJid === "status@broadcast") continue;
 
-    // Dedup: skip if this message ID was already processed recently.
-    // When key.id is missing, synthesize a stable ID from phone + content hash
-    // so that two identical webhook fires in different workers still deduplicate.
+    if (msg.key.fromMe) {
+      // Capture outgoing messages sent directly from WhatsApp/Evolution manager
+      void saveFromMeMessage(projetoId, msg, app);
+      continue;
+    }
+
     const phone = (msg.key.remoteJid as string).replace(/@.*/, "");
     let msgId = msg.key?.id as string | undefined;
     if (!msgId) {
@@ -1060,45 +1415,23 @@ async function processMessages(body: any, projetoId: string, app: any) {
     }
     _processedMsgIds.set(msgId, Date.now());
 
-    // Early-persist: save message to DB immediately before the 15s debounce so that
-    // a PM2 OOM restart doesn't permanently lose the message. The full processIncomingMessage
-    // will update content with richer text (audio transcription, OCR) after the debounce.
-    // Non-fatal: if contact/deal don't exist yet (new lead) this is skipped gracefully.
-    void (async () => {
-      try {
-        const m = msg.message ?? {};
-        const earlyText: string | null =
-          (m as any).conversation ??
-          (m as any).extendedTextMessage?.text ??
-          ((m as any).audioMessage ? "[Áudio]" :
-          (m as any).imageMessage ? "[Imagem]" :
-          (m as any).documentMessage ? "[Documento]" : null);
-        if (!earlyText) return;
-        const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
-        if (!contato) return; // new lead — let processIncomingMessage handle it
-        const deal = await prisma.crmDeal.findFirst({
-          where: { contatoId: contato.id, projetoId, status: "aberto" },
-          orderBy: { criadoEm: "desc" },
-        });
-        if (!deal) return;
-        await prisma.crmMensagemWhatsapp.create({
-          data: {
-            dealId: deal.id,
-            contatoId: contato.id,
-            direcao: "in",
-            remetente: phone,
-            tipo: "text",
-            conteudo: earlyText,
-            evolutionMessageId: msgId,
-          },
-        });
-        app.log.info(`[WA-Webhook] Early-persist: msg ${msgId} salva antes do debounce`);
-      } catch {
-        // P2002 = already exists, other errors = non-fatal
-      }
-    })();
+    // Assistente Interno: mensagens de usuários na whitelist (Usuario.whatsapp)
+    // têm prioridade e não entram no fluxo do CRM / stage-engine.
+    const teamUser = await (prisma as any).usuario.findFirst({
+      where: { whatsapp: phone, ativo: true },
+      select: { id: true },
+    });
+    if (teamUser) {
+      const { processAssistenteInterno } = await import("./agent/assistente-interno.js");
+      void processAssistenteInterno(projetoId, phone, msg, app).catch((e) =>
+        app.log.error({ err: e }, "[AssistenteInterno] Erro não tratado"),
+      );
+      continue;
+    }
 
-    debounceForPhone(phone, msg, projetoId, processIncomingMessage, app);
+    if (processIncomingMessage) {
+      debounceForPhone(phone, msg, projetoId, processIncomingMessage, app);
+    }
   }
 }
 
@@ -1108,7 +1441,7 @@ app.post("/api/cron/executar", async (req, reply) => {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
+    jwt.verify(token, process.env.JWT_SECRET!);
   } catch {
     return reply.status(401).send({ error: "Não autorizado" });
   }
@@ -1120,7 +1453,9 @@ app.post("/api/cron/executar", async (req, reply) => {
 
 // ── Agent health check (Sprint 4) ────────────────────────────────────────────
 
-app.get("/api/agent/health", async (_req, reply) => {
+app.get("/api/agent/health", async (req, reply) => {
+  const user = verifyJwt(req as any);
+  if (!user) return reply.status(401).send({ error: "Não autorizado" });
   const now = new Date();
   const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
   const since30m = new Date(now.getTime() - 30 * 60 * 1000);
@@ -1230,7 +1565,9 @@ app.get("/api/agent/health", async (_req, reply) => {
 
 // ── Admin agent dashboard (Sprint 4) ─────────────────────────────────────────
 
-app.get("/admin/agent-dashboard", async (_req, reply) => {
+app.get("/admin/agent-dashboard", async (req, reply) => {
+  const user = verifyJwt(req as any);
+  if (!user) return reply.status(401).send({ error: "Não autorizado" });
   const now = new Date();
   const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
@@ -1383,19 +1720,28 @@ app.get("/admin/agent-dashboard", async (_req, reply) => {
 
 // ── Banking — OFX / CSV import (multipart) ────────────────────────────────────
 
-function verifyJwt(req: FastifyRequest): boolean {
+function verifyJwt(req: FastifyRequest): { userId: string; empresaId?: string; role?: string } | null {
   const auth  = req.headers.authorization ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
-    jwt.verify(token, process.env.JWT_SECRET ?? "avoce_secret");
-    return true;
+    return jwt.verify(token, process.env.JWT_SECRET!) as any;
   } catch {
-    return false;
+    return null;
   }
 }
 
-app.post("/banking/import/ofx", async (req, reply) => {
-  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+/**
+ * Check if the authenticated user can access data belonging to a given empresaId.
+ * Admin with no empresaId sees everything. Regular users must match empresaId.
+ */
+function canAccessEmpresa(user: { empresaId?: string; role?: string }, targetEmpresaId: string | null | undefined): boolean {
+  if (user.role === "admin" && !user.empresaId) return true;
+  return !!user.empresaId && user.empresaId === targetEmpresaId;
+}
+
+app.post("/api/banking/import/ofx", async (req, reply) => {
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   let emitenteId    = "";
   let bankAccountId = "";
@@ -1415,6 +1761,14 @@ app.post("/banking/import/ofx", async (req, reply) => {
     return reply.status(400).send({ error: "Campos obrigatórios: emitenteId, bankAccountId, file" });
   }
 
+  // Verify user can access this emitente
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id: emitenteId }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
+  }
+
   try {
     const result = await ofxImportService.importOfx(emitenteId, bankAccountId, fileContent);
     return reply.send({ ok: true, ...result });
@@ -1423,7 +1777,7 @@ app.post("/banking/import/ofx", async (req, reply) => {
   }
 });
 
-app.post("/banking/import/csv/preview", async (req, reply) => {
+app.post("/api/banking/import/csv/preview", async (req, reply) => {
   if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
 
   let fileContent = "";
@@ -1445,8 +1799,9 @@ app.post("/banking/import/csv/preview", async (req, reply) => {
   }
 });
 
-app.post("/banking/import/csv", async (req, reply) => {
-  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+app.post("/api/banking/import/csv", async (req, reply) => {
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   let emitenteId    = "";
   let bankAccountId = "";
@@ -1466,6 +1821,14 @@ app.post("/banking/import/csv", async (req, reply) => {
 
   if (!emitenteId || !bankAccountId || !fileContent || !mappingRaw) {
     return reply.status(400).send({ error: "Campos obrigatórios: emitenteId, bankAccountId, mapping, file" });
+  }
+
+  // Verify user can access this emitente
+  const globalAdmin = payload.role === "admin" && !payload.empresaId;
+  if (!globalAdmin) {
+    const emp = await prisma.empresaEmitente.findUnique({ where: { id: emitenteId }, select: { empresaId: true } });
+    if (!emp || !canAccessEmpresa(payload, emp.empresaId))
+      return reply.status(403).send({ error: "Acesso negado" });
   }
 
   let mapping: import("./modules/banking/services/ofx-import.service.js").CsvMapping;
@@ -1518,7 +1881,8 @@ const RAP_REENG_STAGES = [
 ];
 
 app.post("/api/reengajamento/importar-json", async (req, reply) => {
-  if (!verifyJwt(req)) return reply.status(401).send({ error: "Não autorizado" });
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   let fileContent = "";
   let projetoId = "";
@@ -1643,7 +2007,7 @@ app.post("/api/reengajamento/importar-json", async (req, reply) => {
         if (!phone) continue;
         if (!contatoByPhone.has(phone)) {
           const nome = d.nome_extraido || d.contato_nome || `Lead ${phone}`;
-          novosContatos.push({ nome, whatsapp: waFull(phone) });
+          novosContatos.push({ nome, whatsapp: waFull(phone), ...(payload.empresaId ? { empresaId: payload.empresaId } : {}) });
         }
       }
 
@@ -1700,6 +2064,7 @@ app.post("/api/reengajamento/importar-json", async (req, reply) => {
               status: "aberto",
               fonteLead: "Bot RAP",
               projetoId: projetoId || undefined,
+              empresaId: payload.empresaId ?? undefined,
               iaAtiva: true,
               iaPersonaChave: persona,
               iaStageChave: stageChave,
@@ -1740,7 +2105,11 @@ async function ensureAdmin() {
   const count = await prisma.usuario.count();
   if (count === 0) {
     const adminEmail = process.env.ADMIN_EMAIL ?? "admin@capium.com.br";
-    const adminSenha = process.env.ADMIN_SENHA ?? "avoce@2025";
+    if (!process.env.ADMIN_SENHA) {
+      console.error("[SETUP] ADMIN_SENHA não configurada — defina no ecosystem.config.cjs antes do primeiro boot");
+      throw new Error("ADMIN_SENHA é obrigatória no primeiro boot");
+    }
+    const adminSenha = process.env.ADMIN_SENHA;
     const hash = await bcrypt.hash(adminSenha, 10);
     await prisma.usuario.create({
       data: { email: adminEmail, senha: hash, nome: "Administrador" },
@@ -1781,6 +2150,385 @@ async function seedReengPipeline() {
   }
 }
 
+// ── VoIP — áudio da ligação enviado pelo browser (MediaRecorder) ─────────────
+
+app.post("/api/ligacao/:id/audio", async (req, reply) => {
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
+
+  const { id: ligacaoId } = req.params as { id: string };
+
+  const ligacao = await prisma.crmLigacao.findUnique({
+    where: { id: ligacaoId },
+    include: { deal: { select: { projetoId: true, empresaId: true } } },
+  });
+  if (!ligacao) return reply.status(404).send({ error: "Ligação não encontrada" });
+
+  // Read audio blob from multipart
+  const parts = req.parts();
+  let audioBuffer: Buffer | null = null;
+  let audioMime = "audio/webm";
+
+  for await (const part of parts) {
+    if (part.type === "file" && part.fieldname === "audio") {
+      audioMime = part.mimetype || "audio/webm";
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      audioBuffer = Buffer.concat(chunks);
+    }
+  }
+
+  if (!audioBuffer || audioBuffer.length < 1000) {
+    return reply.status(400).send({ error: "Áudio inválido ou muito curto" });
+  }
+
+  reply.send({ ok: true }); // respond immediately, process async
+
+  void (async () => {
+    try {
+      // Resolve Groq API key
+      const projetoId = ligacao.deal?.projetoId;
+      const empresaId = ligacao.deal?.empresaId ?? payload.empresaId;
+      let groqKey = "";
+
+      if (projetoId) {
+        const groqRow = await prisma.iaLlmProvedor.findFirst({
+          where: { projetoId, ativo: true, provider: "groq" }, orderBy: { ordem: "asc" },
+        });
+        groqKey = groqRow?.apiKey ?? "";
+        if (!groqKey) {
+          const ac = await prisma.iaProjetoConfig.findFirst({
+            where: { projetoId, categoria: "audio", chave: "audio_api_key" },
+          });
+          groqKey = ac?.valor ?? "";
+        }
+      }
+
+      if (!groqKey && empresaId) {
+        // Fallback: find any active Groq key for this empresa
+        const projetoRow = await prisma.iaProjeto.findFirst({
+          where: { empresaId, ativo: true },
+          select: { id: true },
+        });
+        if (projetoRow) {
+          const groqRow = await prisma.iaLlmProvedor.findFirst({
+            where: { projetoId: projetoRow.id, ativo: true, provider: "groq" },
+            orderBy: { ordem: "asc" },
+          });
+          groqKey = groqRow?.apiKey ?? "";
+          if (!groqKey) {
+            const ac = await prisma.iaProjetoConfig.findFirst({
+              where: { projetoId: projetoRow.id, categoria: "audio", chave: "audio_api_key" },
+            });
+            groqKey = ac?.valor ?? "";
+          }
+        }
+      }
+
+      if (!groqKey) {
+        app.log.warn(`[VoIP audio] Groq API key não encontrada para ligação ${ligacaoId}`);
+        return;
+      }
+
+      const { transcribeAudio } = await import("./services/whisper.js");
+      const transcResult = await transcribeAudio(audioBuffer!, audioMime, groqKey, "whisper-large-v3-turbo", "groq");
+      if (!transcResult.ok || !transcResult.text) {
+        app.log.warn(`[VoIP audio] Transcrição falhou: ${transcResult.error}`);
+        return;
+      }
+      const transcricao = transcResult.text;
+
+      // Generate summary via LLM if projeto available
+      let resumo = "";
+      if (projetoId) {
+        try {
+          const { callLlm } = await import("./agent/llm.js");
+          const llmResult = await callLlm({
+            projetoId,
+            systemPrompt: "Você é um assistente jurídico. Resuma a ligação em 3 linhas objetivas: o que foi discutido, decisão tomada e próximo passo.",
+            messages: [{ role: "user", content: `Transcrição:\n\n${transcricao}` }],
+            maxTokens: 200,
+          });
+          resumo = llmResult.content;
+        } catch {}
+      }
+
+      await prisma.crmLigacao.update({
+        where: { id: ligacaoId },
+        data: { transcricao, resumo: resumo || null },
+      });
+
+      if (resumo) {
+        await prisma.crmNota.create({
+          data: {
+            dealId:   ligacao.dealId,
+            conteudo: `📞 Ligação (${Math.floor((ligacao.duracao ?? 0) / 60)}min)\n\n${resumo}`,
+          },
+        });
+      }
+
+      app.log.info(`[VoIP audio] ${ligacaoId} — ${transcricao.length} chars transcritos`);
+    } catch (err) {
+      app.log.error(`[VoIP audio] Erro: ${err}`);
+    }
+  })();
+});
+
+// ── VoIP — pós-chamada (chamado pelo script avoce-post-call.sh no Asterisk) ───
+
+app.post("/api/voip/post-call", async (req, reply) => {
+  // Aceita tanto JWT de usuário quanto X-Asterisk-Key para chamadas do Asterisk
+  const asteriskKey = req.headers["x-asterisk-key"] as string | undefined;
+  const validAsteriskKey = process.env.ASTERISK_POST_CALL_KEY;
+  if (!asteriskKey || !validAsteriskKey || asteriskKey !== validAsteriskKey) {
+    const user = verifyJwt(req as any);
+    if (!user) return reply.status(401).send({ error: "Não autorizado" });
+  }
+  const { ligacaoId, uniqueid, duration } = req.body as {
+    ligacaoId?: string;
+    uniqueid?: string;
+    duration?: number;
+  };
+
+  if (!ligacaoId) return reply.status(400).send({ error: "ligacaoId obrigatório" });
+
+  const ligacao = await prisma.crmLigacao.findUnique({
+    where: { id: ligacaoId },
+    include: { deal: { select: { projetoId: true } } },
+  });
+  if (!ligacao) return reply.status(404).send({ error: "Ligação não encontrada" });
+
+  // Atualiza status e duração imediatamente
+  await prisma.crmLigacao.update({
+    where: { id: ligacaoId },
+    data: {
+      status:          "ENCERRADA",
+      duracao:         duration ?? null,
+      encerradaEm:     new Date(),
+      asteriskUniqueId: uniqueid ?? ligacao.asteriskUniqueId,
+    },
+  });
+
+  // Processo assíncrono: transcrição + resumo + nota
+  void (async () => {
+    try {
+      const wavPath = `/var/spool/asterisk/monitor/${uniqueid}.wav`;
+      const { readFile } = await import("node:fs/promises");
+      const wavBuffer = await readFile(wavPath).catch(() => null);
+      if (!wavBuffer) {
+        app.log.warn(`[VoIP] WAV não encontrado: ${wavPath}`);
+        return;
+      }
+
+      // Upload para MinIO
+      const { uploadBuffer, getPresignedUrl, BUCKET_CALLS } = await import("./lib/minio.js");
+      const minioKey = `${ligacaoId}/${uniqueid}.wav`;
+      await uploadBuffer(BUCKET_CALLS, minioKey, wavBuffer, "audio/wav");
+      await prisma.crmLigacao.update({ where: { id: ligacaoId }, data: { gravacaoMinio: minioKey } });
+
+      // Transcrição via Groq Whisper
+      const { transcribeAudio } = await import("./services/whisper.js");
+      const projetoId = ligacao.deal.projetoId;
+      let groqKey = "";
+      if (projetoId) {
+        const groqRow = await prisma.iaLlmProvedor.findFirst({
+          where: { projetoId, ativo: true, provider: "groq" }, orderBy: { ordem: "asc" },
+        });
+        groqKey = groqRow?.apiKey ?? "";
+        if (!groqKey) {
+          const ac = await prisma.iaProjetoConfig.findFirst({ where: { projetoId, categoria: "audio", chave: "audio_api_key" } });
+          groqKey = ac?.valor ?? "";
+        }
+      }
+
+      if (!groqKey) {
+        app.log.warn(`[VoIP] Groq API key não encontrada para projeto ${projetoId}`);
+        return;
+      }
+
+      const transcResult = await transcribeAudio(wavBuffer, "audio/wav", groqKey, "whisper-large-v3-turbo", "groq");
+      if (!transcResult.ok || !transcResult.text) {
+        app.log.warn(`[VoIP] Transcrição falhou: ${transcResult.error}`);
+        return;
+      }
+      const transcricao = transcResult.text;
+
+      // Resumo via LLM
+      let resumo = "";
+      if (projetoId) {
+        try {
+          const { callLlm } = await import("./agent/llm.js");
+          const llmResult = await callLlm({
+            projetoId,
+            systemPrompt: "Você é um assistente jurídico. Resuma a ligação em 3 linhas objetivas: o que foi discutido, decisão tomada e próximo passo. Seja direto e conciso.",
+            messages: [{ role: "user", content: `Transcrição da ligação:\n\n${transcricao}` }],
+            maxTokens: 200,
+          });
+          resumo = llmResult.content;
+        } catch (e) {
+          app.log.warn(`[VoIP] Resumo LLM falhou: ${e}`);
+        }
+      }
+
+      await prisma.crmLigacao.update({
+        where: { id: ligacaoId },
+        data: { transcricao, resumo: resumo || null },
+      });
+
+      // Nota automática no deal
+      if (resumo) {
+        await prisma.crmNota.create({
+          data: {
+            dealId:   ligacao.dealId,
+            conteudo: `📞 Ligação encerrada (${Math.floor((duration ?? 0) / 60)}min)\n\n${resumo}`,
+          },
+        });
+      }
+
+      app.log.info(`[VoIP] Ligação ${ligacaoId} processada — ${transcricao.length} chars transcritos`);
+    } catch (err) {
+      app.log.error(`[VoIP] Erro ao processar gravação: ${err}`);
+    }
+  })();
+
+  return reply.send({ ok: true });
+});
+
+// ── Meta OAuth ────────────────────────────────────────────────────────────────
+
+const META_APP_ID_DEFAULT = "1489010436254797";
+const META_SCOPES = "ads_management,pages_manage_posts,instagram_basic,instagram_content_publish,ads_read";
+
+async function getMktConfig(projetoId: string, chave: string): Promise<string | null> {
+  const r = await prisma.mktConfig.findUnique({ where: { projetoId_chave: { projetoId, chave } } });
+  return r?.valor ?? null;
+}
+
+async function setMktConfig(projetoId: string, chave: string, valor: string, tipo: string, categoria: string) {
+  await prisma.mktConfig.upsert({
+    where: { projetoId_chave: { projetoId, chave } },
+    update: { valor, tipo, categoria },
+    create: { projetoId, chave, valor, tipo, categoria },
+  });
+}
+
+app.get("/api/meta/oauth/start", async (req, reply) => {
+  const { projetoId } = req.query as { projetoId?: string };
+  if (!projetoId) return reply.status(400).send("projetoId obrigatório");
+  const appId = (await getMktConfig(projetoId, "meta_app_id")) || META_APP_ID_DEFAULT;
+  const baseUrl = process.env.APP_BASE_URL ?? "https://avoce.capium.com.br";
+  const redirectUri = encodeURIComponent(`${baseUrl}/api/meta/oauth/callback`);
+  const url = `https://www.facebook.com/v19.0/dialog/oauth?client_id=${appId}&redirect_uri=${redirectUri}&scope=${META_SCOPES}&response_type=code&state=${projetoId}`;
+  return reply.redirect(url);
+});
+
+app.get("/api/meta/oauth/callback", async (req, reply) => {
+  const { code, state: projetoId, error } = req.query as { code?: string; state?: string; error?: string };
+  const baseUrl = process.env.APP_BASE_URL ?? "https://avoce.capium.com.br";
+  if (error || !code || !projetoId) {
+    return reply.redirect(`${baseUrl}/?mkt_meta_erro=${encodeURIComponent(error ?? "cancelado")}`);
+  }
+  try {
+    const appId = (await getMktConfig(projetoId, "meta_app_id")) || META_APP_ID_DEFAULT;
+    const appSecret = await getMktConfig(projetoId, "meta_app_secret");
+    if (!appSecret) return reply.redirect(`${baseUrl}/?mkt_meta_erro=app_secret_nao_configurado`);
+
+    const redirectUri = encodeURIComponent(`${baseUrl}/api/meta/oauth/callback`);
+
+    // Troca code por token de curta duração
+    const shortResp = await fetch(`https://graph.facebook.com/v19.0/oauth/access_token?client_id=${appId}&redirect_uri=${redirectUri}&client_secret=${appSecret}&code=${code}`);
+    const shortData = await shortResp.json() as any;
+    if (!shortData.access_token) throw new Error(shortData.error?.message ?? "token curto inválido");
+
+    // Troca por long-lived token (~60 dias)
+    const llResp = await fetch(`https://graph.facebook.com/oauth/access_token?grant_type=fb_exchange_token&client_id=${appId}&client_secret=${appSecret}&fb_exchange_token=${shortData.access_token}`);
+    const llData = await llResp.json() as any;
+    if (!llData.access_token) throw new Error(llData.error?.message ?? "long-lived token inválido");
+
+    const expiresIn = llData.expires_in ?? 5184000;
+    const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString().split("T")[0];
+
+    await setMktConfig(projetoId, "meta_access_token", llData.access_token, "senha", "meta");
+    await setMktConfig(projetoId, "meta_token_expira", expiresAt, "texto", "meta");
+
+    return reply.redirect(`${baseUrl}/?mkt_meta_ok=1&projeto=${projetoId}`);
+  } catch (err: any) {
+    console.error("[Meta OAuth]", err);
+    return reply.redirect(`${baseUrl}/?mkt_meta_erro=${encodeURIComponent(err.message ?? "erro")}`);
+  }
+});
+
+// ── Reunião — transcrição automática de chunk de áudio ────────────────────────
+// Aceita áudio do browser (MediaRecorder) e transcreve via Whisper.
+// Auth: ?token=<tokenConvidado> (guest) ou Authorization: Bearer <jwt> (admin).
+app.post("/api/reuniao/:id/transcricao-chunk", async (req, reply) => {
+  const { id } = req.params as { id: string };
+
+  let fileBuffer: Buffer | null = null;
+  let audioMime = "audio/webm";
+  const parts = req.parts();
+  for await (const part of parts) {
+    if (part.type === "file") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileBuffer = Buffer.concat(chunks);
+      audioMime = part.mimetype || "audio/webm";
+    }
+  }
+  if (!fileBuffer || fileBuffer.length < 1000) {
+    return reply.status(400).send({ error: "Áudio vazio ou muito curto" });
+  }
+
+  // Auth: token de convidado na querystring ou Bearer JWT no header
+  const tokenParam = (req.query as any).token as string | undefined;
+  const sessao = await prisma.sessaoReuniao.findUnique({ where: { id }, select: { id: true, tokenConvidado: true, dealId: true, transcricao: true } });
+  if (!sessao) return reply.status(404).send({ error: "Reunião não encontrada" });
+
+  if (tokenParam) {
+    if (sessao.tokenConvidado !== tokenParam) return reply.status(403).send({ error: "Token inválido" });
+  } else {
+    // Basic Bearer check (any valid JWT from the app is enough)
+    const auth = (req.headers.authorization ?? "").replace("Bearer ", "").trim();
+    if (!auth) return reply.status(401).send({ error: "Não autenticado" });
+    try {
+      jwt.verify(auth, process.env.JWT_SECRET!);
+    } catch {
+      return reply.status(401).send({ error: "Token inválido" });
+    }
+  }
+
+  // Get Whisper API key — try deal's project first, then any project
+  let groqKey = "";
+  if (sessao.dealId) {
+    const deal = await prisma.crmDeal.findUnique({ where: { id: sessao.dealId }, select: { projetoId: true } });
+    if (deal?.projetoId) {
+      const cfg = await prisma.iaProjetoConfig.findFirst({ where: { projetoId: deal.projetoId, categoria: "audio", chave: "audio_api_key" } });
+      groqKey = cfg?.valor ?? "";
+    }
+  }
+  if (!groqKey) {
+    const cfg = await prisma.iaProjetoConfig.findFirst({ where: { categoria: "audio", chave: "audio_api_key" } });
+    groqKey = cfg?.valor ?? "";
+  }
+  if (!groqKey) return reply.status(500).send({ error: "audio_api_key não configurada" });
+
+  const { transcribeAudio } = await import("./services/whisper.js");
+  const result = await transcribeAudio(fileBuffer, audioMime, groqKey, "whisper-large-v3-turbo", "groq");
+  if (!result.ok || !result.text?.trim()) {
+    return reply.send({ ok: false, text: "" });
+  }
+
+  const chunk = result.text.trim();
+  const atual = sessao.transcricao ?? "";
+  await prisma.sessaoReuniao.update({
+    where: { id },
+    data: { transcricao: atual + (atual ? "\n" : "") + chunk },
+  });
+
+  console.log(`[Reunião] Chunk transcrito sessaoId=${id} chars=${chunk.length}`);
+  return reply.send({ ok: true, text: chunk });
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 async function start() {
@@ -1789,10 +2537,19 @@ async function start() {
   await seedReengPipeline();
   iniciarCron();
   initBankingCron();
+  import("./lib/minio.js").then(m => m.ensureBuckets()).catch(e => console.warn("[MinIO] init falhou:", e));
 
   await app.listen({ port: PORT, host: "0.0.0.0" });
   console.log(`[API] Rodando na porta ${PORT}`);
 }
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[FATAL] Unhandled promise rejection:", reason, "at:", promise);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err);
+});
 
 start().catch((err) => {
   console.error(err);

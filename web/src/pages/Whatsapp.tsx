@@ -1,5 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useSearchParams } from "react-router-dom";
 import { trpc } from "../lib/trpc";
+import { useVoip } from "../contexts/VoipContext";
+import { DealModal, type Deal, type Stage } from "./Crm";
 
 type Conversa = {
   id: string;
@@ -8,6 +11,7 @@ type Conversa = {
   iaStageChave: string | null;
   iaPersonaChave: string | null;
   ultimoContatoEm: string | null;
+  sdrNome: string | null;
   contato: { id: string; nome: string; whatsapp: string | null } | null;
   mensagens: {
     id: string;
@@ -26,6 +30,8 @@ type Mensagem = {
   personaChave: string | null;
   remetente: string | null;
   enviadaEm: string;
+  midiaUrl?: string | null;
+  evolutionMessageId?: string | null;
 };
 
 type NotifLog = {
@@ -73,17 +79,85 @@ function formatWhatsApp(text: string, stripPrefix = false) {
 
 type SidebarTab = "conversas" | "notificacoes";
 
+function MessageBubble({ msg, senderLabel, isOut }: {
+  msg: Mensagem; senderLabel: string | null; isOut: boolean;
+}) {
+  const tipo = msg.tipo;
+  const conteudo = msg.conteudo ?? "";
+
+  if (tipo === "audio") {
+    const midiaUrl = (msg as any).midiaUrl ?? null;
+    const token = localStorage.getItem("token") ?? "";
+    const audioSrc = midiaUrl ? `${midiaUrl}?token=${encodeURIComponent(token)}` : null;
+    return (
+      <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
+        {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {audioSrc ? (
+          <audio controls src={audioSrc} className="w-full max-w-[240px] my-1" style={{ height: 32 }} />
+        ) : (
+          <p className={`text-xs opacity-75 mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{isOut ? "🔊 Áudio enviado" : "🎤 Áudio"}</p>
+        )}
+        {conteudo && <div className={`text-sm whitespace-pre-wrap mt-1 ${isOut ? "text-indigo-100" : "text-gray-600"} italic`} dangerouslySetInnerHTML={{ __html: formatWhatsApp(conteudo, false) }} />}
+      </div>
+    );
+  }
+
+  if (tipo === "image") {
+    const src = (msg as any).midiaUrl ?? null;
+    return (
+      <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
+        {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {src
+          ? <img src={src} alt="imagem" className="rounded max-w-full max-h-52 object-contain" />
+          : <p className="text-sm">🖼️ {conteudo || "Imagem"}</p>}
+      </div>
+    );
+  }
+
+  if (tipo === "document" || tipo === "video") {
+    const icon = tipo === "video" ? "🎥" : "📎";
+    const src = (msg as any).midiaUrl ?? null;
+    return (
+      <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
+        {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {src
+          ? <a href={src} target="_blank" rel="noopener noreferrer" className="text-sm underline">{icon} {conteudo || "Arquivo"}</a>
+          : <p className="text-sm">{icon} {conteudo || "Arquivo"}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
+      {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+      <div className="text-sm whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: formatWhatsApp(conteudo, isOut && !!senderLabel) }} />
+    </div>
+  );
+}
+
 export default function WhatsappPage() {
+  const [searchParams] = useSearchParams();
   const [projetoId, setProjetoId] = useState<string | null>(null);
-  const [dealId, setDealId] = useState<string | null>(null);
+  const [dealId, setDealId] = useState<string | null>(searchParams.get("dealId"));
   const [notifDestino, setNotifDestino] = useState<string | null>(null);
   const [manualMsg, setManualMsg] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("conversas");
+  const [isRecording, setIsRecording] = useState(false);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false);
+  const [isSendingFile, setIsSendingFile] = useState(false);
+  const [showNovaConversa, setShowNovaConversa] = useState(false);
+  const [editDealOpen, setEditDealOpen] = useState(false);
+  const { ligar, callStatus } = useVoip();
+  const [novaConvForm, setNovaConvForm] = useState({ whatsapp: "", nome: "", mensagem: "" });
   const bottomRef = useRef<HTMLDivElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<BlobPart[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const projetos = trpc.ia.listProjetos.useQuery();
   const conversas = trpc.ia.listConversas.useQuery(
-    { projetoId: projetoId ?? undefined },
+    {},
     { refetchInterval: 10_000 }
   );
   const mensagens = trpc.ia.getMensagens.useQuery(
@@ -95,12 +169,48 @@ export default function WhatsappPage() {
     { enabled: !!projetoId && sidebarTab === "notificacoes", refetchInterval: 15_000 }
   );
 
-  const togglePausa = trpc.ia.toggleIaPausa.useMutation({ onSuccess: () => conversas.refetch() });
+  const dealDaLista = (conversas.data as unknown as Conversa[] | undefined)?.find((d) => d.id === dealId);
+  // Fallback: fetch deal directly when navigated from CRM (deal may have no messages yet)
+  const dealById = trpc.crm.getDeal.useQuery(
+    { id: dealId ?? "" },
+    { enabled: !!dealId && !dealDaLista && conversas.isFetched }
+  );
+  const dealAtual = dealDaLista ?? (dealById.data as unknown as Conversa | undefined);
+
+  const togglePausa = trpc.ia.toggleIaPausa.useMutation({
+    onSuccess: () => { conversas.refetch(); dealById.refetch(); },
+  });
   const sendManual = trpc.ia.sendMensagemManual.useMutation({
     onSuccess: () => { setManualMsg(""); mensagens.refetch(); },
+    onError: (err) => alert("Erro ao enviar: " + err.message),
   });
 
-  const dealAtual = (conversas.data as unknown as Conversa[] | undefined)?.find((d) => d.id === dealId);
+  const sendAudio = trpc.ia.sendAudioManual.useMutation({
+    onSuccess: () => mensagens.refetch(),
+    onError: (err) => alert("Erro ao enviar áudio: " + err.message),
+    onSettled: () => setIsProcessingAudio(false),
+  });
+
+  const sendArquivo = trpc.ia.sendArquivoManual.useMutation({
+    onSuccess: () => mensagens.refetch(),
+    onSettled: () => setIsSendingFile(false),
+    onError: (err) => alert("Erro ao enviar arquivo: " + err.message),
+  });
+
+  const iniciarNovaConversa = trpc.ia.iniciarNovaConversa.useMutation({
+    onSuccess: (res) => {
+      setDealId(res.dealId);
+      setSidebarTab("conversas");
+      setShowNovaConversa(false);
+      setNovaConvForm({ whatsapp: "", nome: "", mensagem: "" });
+      conversas.refetch();
+    },
+  });
+  const dealPipelineId = (dealAtual as any)?.stage?.pipelineId as string | undefined;
+  const editStages = trpc.crm.listStages.useQuery(
+    { pipelineId: dealPipelineId ?? "" },
+    { enabled: editDealOpen && !!dealPipelineId }
+  );
 
   // Agrupar logs por destinatário
   const allLogs = (notifLogs.data as unknown as NotifLog[] | undefined) ?? [];
@@ -134,6 +244,76 @@ export default function WhatsappPage() {
     sendManual.mutate({ dealId, conteudo: manualMsg.trim() });
   }
 
+  async function toggleRecording() {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      mediaRecorderRef.current = null;
+      setIsRecording(false);
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      alert("Gravação de áudio não suportada neste navegador. Use Chrome ou Firefox.");
+      return;
+    }
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      alert("Sem permissão para gravar áudio. Verifique as permissões do navegador.");
+      return;
+    }
+    try {
+      const mr = new MediaRecorder(stream);
+      const mimeType = mr.mimeType;
+      audioChunksRef.current = [];
+      mr.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+      mr.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        if (!dealId) return;
+        const blob = new Blob(audioChunksRef.current, { type: mimeType || "audio/webm" });
+        try {
+          const base64 = await new Promise<string>((res, rej) => {
+            const reader = new FileReader();
+            reader.onloadend = () => res((reader.result as string).split(",")[1]);
+            reader.onerror = rej;
+            reader.readAsDataURL(blob);
+          });
+          setIsProcessingAudio(true);
+          const clean = (mimeType || "audio/webm").split(";")[0];
+          sendAudio.mutate({ dealId, audioBase64: base64, mimeType: clean });
+        } catch (e2) {
+          console.error("Erro ao processar áudio:", e2);
+          alert("Erro ao processar áudio.");
+        }
+      };
+      mr.start();
+      mediaRecorderRef.current = mr;
+      setIsRecording(true);
+    } catch (e) {
+      stream.getTracks().forEach((t) => t.stop());
+      console.error("Erro ao iniciar gravação:", e);
+      alert("Erro ao iniciar gravação: " + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!dealId || !e.target.files?.[0]) return;
+    const file = e.target.files[0];
+    e.target.value = "";
+    const MAX = 20 * 1024 * 1024;
+    if (file.size > MAX) { alert("Arquivo muito grande (máx 20 MB)."); return; }
+    try {
+      const base64 = await new Promise<string>((res, rej) => {
+        const reader = new FileReader();
+        reader.onloadend = () => res((reader.result as string).split(",")[1]);
+        reader.onerror = rej;
+        reader.readAsDataURL(file);
+      });
+      setIsSendingFile(true);
+      sendArquivo.mutate({ dealId, arquivoBase64: base64, mimeType: file.type, fileName: file.name });
+    } catch { alert("Erro ao ler arquivo."); }
+  }, [dealId, sendArquivo]);
+
   // Ao trocar de aba, limpa seleção do outro tipo
   function handleTabChange(tab: SidebarTab) {
     setSidebarTab(tab);
@@ -142,6 +322,7 @@ export default function WhatsappPage() {
   }
 
   const showNotifConv = sidebarTab === "notificacoes" && !!notifDestino;
+  const isLoadingDeal = sidebarTab === "conversas" && !!dealId && !dealAtual && (dealById.isLoading || conversas.isLoading || conversas.isFetching);
   const showLeadConv = sidebarTab === "conversas" && !!dealId && !!dealAtual;
 
   return (
@@ -149,19 +330,16 @@ export default function WhatsappPage() {
       {/* Sidebar */}
       <div className="w-72 bg-white border-r flex flex-col">
         <div className="p-4 border-b">
-          <h1 className="text-lg font-bold text-gray-800">WhatsApp IA</h1>
-
-          {projetos.data && (projetos.data as { id: string; nome: string }[]).length > 1 && (
-            <select
-              value={projetoId ?? ""}
-              onChange={(e) => { setProjetoId(e.target.value); setDealId(null); setNotifDestino(null); }}
-              className="mt-2 w-full text-sm border rounded px-2 py-1"
-            >
-              {(projetos.data as { id: string; nome: string }[]).map((p) => (
-                <option key={p.id} value={p.id}>{p.nome}</option>
-              ))}
-            </select>
-          )}
+          <div className="flex items-center justify-between">
+            <h1 className="text-lg font-bold text-gray-800">WhatsApp IA</h1>
+            {projetoId && (
+              <button onClick={() => setShowNovaConversa(true)}
+                title="Nova Conversa"
+                className="w-7 h-7 flex items-center justify-center rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 text-lg leading-none">
+                +
+              </button>
+            )}
+          </div>
 
           <div className="flex mt-3 gap-1">
             <button
@@ -200,7 +378,7 @@ export default function WhatsappPage() {
                       </div>
                       <div className="flex items-center gap-1 mt-0.5">
                         <span className={`text-xs px-1.5 py-0.5 rounded-full ${deal.iaAtiva ? "bg-green-100 text-green-700" : "bg-yellow-100 text-yellow-700"}`}>
-                          {deal.iaAtiva ? "IA" : "Humano"}
+                          {deal.iaAtiva ? "IA" : (deal.sdrNome ? deal.sdrNome.split(" ")[0] : "Humano")}
                         </span>
                         {deal.iaStageChave && <span className="text-xs text-gray-400 truncate">{deal.iaStageChave.replace(/_/g, " ")}</span>}
                       </div>
@@ -255,7 +433,16 @@ export default function WhatsappPage() {
             <div>
               <p className="font-semibold text-gray-800">{dealAtual.contato?.nome ?? dealAtual.titulo}</p>
               <div className="flex items-center gap-2 text-xs text-gray-500">
-                <span>{dealAtual.contato?.whatsapp}</span>
+                {dealAtual.contato?.whatsapp && (
+                  <button
+                    onClick={() => ligar(dealAtual.contato!.whatsapp!)}
+                    className="underline text-green-400 hover:text-green-200 font-medium"
+                    title="Ligar via VoIP"
+                  >
+                    📞 {dealAtual.contato.whatsapp}
+                    {callStatus === "ringing" || callStatus === "in_call" ? " 🔔" : ""}
+                  </button>
+                )}
                 {dealAtual.iaStageChave && <><span>·</span><span className="capitalize">{dealAtual.iaStageChave.replace(/_/g, " ")}</span></>}
                 {dealAtual.iaPersonaChave && (
                   <><span>·</span>
@@ -265,30 +452,64 @@ export default function WhatsappPage() {
                 )}
               </div>
             </div>
-            <button
-              onClick={handleTogglePausa}
-              disabled={togglePausa.isLoading}
-              className={`px-4 py-2 rounded-lg text-sm font-medium ${dealAtual.iaAtiva ? "bg-yellow-100 text-yellow-800 hover:bg-yellow-200" : "bg-green-100 text-green-800 hover:bg-green-200"}`}
-            >
-              {dealAtual.iaAtiva ? "Assumir Conversa" : "Devolver para IA"}
-            </button>
+            <div className="flex items-center gap-2">
+              {!dealAtual.iaAtiva && dealAtual.sdrNome && (
+                <span className="text-xs text-yellow-700 bg-yellow-50 border border-yellow-200 px-2 py-1 rounded-lg">
+                  Assumido por <strong>{dealAtual.sdrNome}</strong>
+                </span>
+              )}
+              <div className="relative flex items-center">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Buscar mensagem..."
+                  className="pl-8 pr-3 py-1.5 text-sm border rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-300 w-44"
+                />
+                <span className="absolute left-2 text-gray-400 text-xs">🔍</span>
+                {searchQuery && (
+                  <button onClick={() => setSearchQuery("")} className="absolute right-2 text-gray-400 hover:text-gray-600 text-xs">✕</button>
+                )}
+              </div>
+              <button
+                onClick={() => setEditDealOpen(true)}
+                title="Editar Deal"
+                className="px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
+              >
+                ✏️ Editar Deal
+              </button>
+              <button
+                onClick={handleTogglePausa}
+                disabled={togglePausa.isLoading}
+                className={`px-4 py-2 rounded-lg text-sm font-medium ${dealAtual.iaAtiva ? "bg-yellow-100 text-yellow-800 hover:bg-yellow-200" : "bg-green-100 text-green-800 hover:bg-green-200"}`}
+              >
+                {dealAtual.iaAtiva ? "Assumir Conversa" : "Devolver para IA"}
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
             {mensagens.isLoading && <p className="text-center text-gray-400">Carregando...</p>}
-            {(mensagens.data as Mensagem[] | undefined)?.map((msg) => {
+            {searchQuery && (
+              <p className="text-xs text-center text-gray-400 py-1">
+                {(mensagens.data as Mensagem[] | undefined)?.filter(m => (m.conteudo ?? "").toLowerCase().includes(searchQuery.toLowerCase())).length ?? 0} resultado(s) para "{searchQuery}"
+              </p>
+            )}
+            {(mensagens.data as Mensagem[] | undefined)
+              ?.filter(msg => !searchQuery || (msg.conteudo ?? "").toLowerCase().includes(searchQuery.toLowerCase()))
+              .map((msg) => {
+              const isOut = msg.direcao === "out";
               let senderLabel: string | null = null;
-              if (msg.direcao === "out") {
+              if (isOut) {
                 senderLabel = msg.remetente ?? (msg.personaChave ? (PERSONA_NAMES[msg.personaChave] ?? msg.personaChave) : null);
               } else {
                 senderLabel = dealAtual?.contato?.nome ?? null;
               }
               return (
-                <div key={msg.id} className={`flex ${msg.direcao === "out" ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${msg.direcao === "out" ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
-                    {senderLabel && <p className={`text-xs font-semibold mb-1 ${msg.direcao === "out" ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
-                    <div className="text-sm whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: formatWhatsApp(msg.conteudo ?? "", msg.direcao === "out" && !!senderLabel) }} />
-                    <p className={`text-xs mt-1 ${msg.direcao === "out" ? "text-indigo-200" : "text-gray-400"}`}>{formatTime(msg.enviadaEm)}</p>
+                <div key={msg.id} className={`flex ${isOut ? "justify-end" : "justify-start"}`}>
+                  <div>
+                    <MessageBubble msg={msg} senderLabel={senderLabel} isOut={isOut} />
+                    <p className={`text-xs mt-1 ${isOut ? "text-right text-indigo-400" : "text-gray-400"}`}>{formatTime(msg.enviadaEm)}</p>
                   </div>
                 </div>
               );
@@ -297,12 +518,41 @@ export default function WhatsappPage() {
           </div>
 
           {!dealAtual.iaAtiva ? (
-            <form onSubmit={handleSend} className="bg-white border-t px-4 py-3 flex gap-2">
+            <form onSubmit={handleSend} className="bg-white border-t px-4 py-3 flex gap-2 items-center">
+              <input ref={fileInputRef} type="file" className="hidden"
+                accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt"
+                onChange={handleFileSelect} />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isSendingFile || sendManual.isLoading}
+                title="Enviar arquivo"
+                className={`w-10 h-10 flex items-center justify-center rounded-full text-lg transition-all ${
+                  isSendingFile ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                }`}
+              >
+                {isSendingFile ? "⏳" : "📎"}
+              </button>
               <input value={manualMsg} onChange={(e) => setManualMsg(e.target.value)} placeholder="Mensagem como humano..."
                 className="flex-1 border rounded-full px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-300" />
-              <button type="submit" disabled={sendManual.isLoading || !manualMsg.trim()}
+              <button
+                type="button"
+                onClick={toggleRecording}
+                disabled={isProcessingAudio || sendManual.isLoading}
+                title={isRecording ? "Parar e enviar áudio" : "Gravar áudio"}
+                className={`w-10 h-10 flex items-center justify-center rounded-full text-lg transition-all ${
+                  isRecording
+                    ? "bg-red-500 text-white animate-pulse shadow-lg"
+                    : isProcessingAudio
+                    ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                    : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+                }`}
+              >
+                {isProcessingAudio ? "⏳" : isRecording ? "⏹" : "🎤"}
+              </button>
+              <button type="submit" disabled={(sendManual.isLoading || (sendManual as any).isPending) || !manualMsg.trim()}
                 className="bg-indigo-600 text-white px-5 py-2 rounded-full text-sm font-medium hover:bg-indigo-700 disabled:opacity-50">
-                Enviar
+                {sendManual.isLoading ? "..." : "Enviar"}
               </button>
             </form>
           ) : (
@@ -341,13 +591,99 @@ export default function WhatsappPage() {
         </div>
       )}
 
+      {/* Loading deal */}
+      {isLoadingDeal && !showLeadConv && !showNotifConv && (
+        <div className="flex-1 flex items-center justify-center text-gray-400">
+          <p className="text-sm">Carregando conversa...</p>
+        </div>
+      )}
+
       {/* Empty state */}
-      {!showLeadConv && !showNotifConv && (
+      {!showLeadConv && !showNotifConv && !isLoadingDeal && (
         <div className="flex-1 flex items-center justify-center text-gray-400">
           <div className="text-center">
             <p className="text-5xl mb-3">💬</p>
             <p className="text-lg font-medium">Selecione uma conversa</p>
             <p className="text-sm mt-1">Conversas e notificações do WhatsApp aparecem aqui</p>
+            {projetoId && (
+              <button onClick={() => setShowNovaConversa(true)}
+                className="mt-4 text-sm bg-indigo-600 text-white px-5 py-2 rounded-full hover:bg-indigo-700">
+                + Nova Conversa
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Modal editar deal */}
+      {editDealOpen && dealAtual && dealPipelineId && (
+        <DealModal
+          deal={dealAtual as unknown as Deal}
+          stages={(editStages.data as unknown as Stage[]) ?? []}
+          pipelineId={dealPipelineId}
+          onClose={() => setEditDealOpen(false)}
+          onSaved={() => { setEditDealOpen(false); conversas.refetch(); }}
+        />
+      )}
+
+      {/* Modal nova conversa */}
+      {showNovaConversa && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center">
+          <div className="bg-white rounded-xl p-6 w-96 shadow-xl">
+            <h3 className="font-semibold text-gray-800 mb-4">Nova Conversa</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">WhatsApp (com código do país) *</label>
+                <input
+                  value={novaConvForm.whatsapp}
+                  onChange={e => setNovaConvForm(f => ({ ...f, whatsapp: e.target.value }))}
+                  placeholder="5561999999999"
+                  className="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-300"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Nome do contato (opcional)</label>
+                <input
+                  value={novaConvForm.nome}
+                  onChange={e => setNovaConvForm(f => ({ ...f, nome: e.target.value }))}
+                  placeholder="Ex: João Silva"
+                  className="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-300"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Mensagem inicial *</label>
+                <textarea
+                  value={novaConvForm.mensagem}
+                  onChange={e => setNovaConvForm(f => ({ ...f, mensagem: e.target.value }))}
+                  rows={3}
+                  placeholder="Olá! Meu nome é..."
+                  className="w-full border rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-300 resize-none"
+                />
+              </div>
+            </div>
+            <div className="flex gap-2 mt-5">
+              <button onClick={() => { setShowNovaConversa(false); setNovaConvForm({ whatsapp: "", nome: "", mensagem: "" }); }}
+                className="flex-1 border rounded-lg py-2 text-sm text-gray-600">
+                Cancelar
+              </button>
+              <button
+                onClick={() => {
+                  if (!projetoId || !novaConvForm.whatsapp.trim() || !novaConvForm.mensagem.trim()) return;
+                  iniciarNovaConversa.mutate({
+                    projetoId,
+                    whatsapp: novaConvForm.whatsapp.trim(),
+                    nomeContato: novaConvForm.nome.trim() || undefined,
+                    mensagem: novaConvForm.mensagem.trim(),
+                  });
+                }}
+                disabled={!novaConvForm.whatsapp.trim() || !novaConvForm.mensagem.trim() || iniciarNovaConversa.isLoading}
+                className="flex-1 bg-indigo-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-indigo-700 disabled:opacity-50">
+                {iniciarNovaConversa.isLoading ? "Enviando..." : "Enviar"}
+              </button>
+            </div>
+            {iniciarNovaConversa.error && (
+              <p className="text-xs text-red-600 mt-2">{(iniciarNovaConversa.error as any)?.message}</p>
+            )}
           </div>
         </div>
       )}

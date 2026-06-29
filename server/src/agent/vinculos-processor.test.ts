@@ -4,6 +4,9 @@ import { processVinculos } from "./vinculos-processor.js";
 vi.mock("./qualification.js", () => ({
   tryExtractVinculo: vi.fn(),
   checkVinculoPrazo: vi.fn(),
+  // vinculos-processor agora importa também os derivadores de data de saída
+  deriveDataSaida: vi.fn(() => null),
+  deriveDataSaidaFromText: vi.fn(() => null),
 }));
 
 import { tryExtractVinculo, checkVinculoPrazo } from "./qualification.js";
@@ -165,7 +168,11 @@ describe("processVinculos", () => {
       expect(result.mergedUpdates._vinculos_ok).toBe(true);
     });
 
-    it("semMaisEmpregos + maisEmpregosPerguntado = false + tempo < 24m → vinculos_ok setado (trusted negation) + negado flag", async () => {
+    // Comportamento atual: a "trusted negation" foi removida. Quando semMaisEmpregos chega
+    // ANTES de a pergunta mais_empregos ter sido feita (maisEmpregosPerguntado=false), o
+    // processor NÃO fecha a coleta nem seta _mais_empregos_negado — a pergunta será feita
+    // normalmente no próximo turno (negação implícita do LLM não é confiável).
+    it("semMaisEmpregos + maisEmpregosPerguntado = false → NÃO fecha nem seta negado (negação implícita ignorada)", async () => {
       const vinculo = completeVinculo({ tempo: "10 meses" });
       mockTryExtract.mockResolvedValue({
         ...emptyResult(),
@@ -181,12 +188,11 @@ describe("processVinculos", () => {
         maisEmpregosPerguntado: false,
       });
 
-      // Lead explicitly denied more employers — trust it regardless of maisEmpregosPerguntado
-      expect(result.state.vinculosOk).toBe(true);
-      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
+      expect(result.state.vinculosOk).toBe(false);
+      expect(result.mergedUpdates._mais_empregos_negado).toBeUndefined();
     });
 
-    it("flag = false + tempo >= 24m → vinculos_ok setado normalmente", async () => {
+    it("flag = false + tempo >= 24m → ainda assim NÃO fecha (pergunta não foi feita)", async () => {
       const vinculo = completeVinculo({ tempo: "3 anos" });
       mockTryExtract.mockResolvedValue({
         ...emptyResult(),
@@ -202,7 +208,8 @@ describe("processVinculos", () => {
         maisEmpregosPerguntado: false,
       });
 
-      expect(result.state.vinculosOk).toBe(true);
+      // Fechamento com 1 vínculo só ocorre via semMaisEmpregos COM maisEmpregosPerguntado=true
+      expect(result.state.vinculosOk).toBe(false);
     });
   });
 
@@ -248,7 +255,10 @@ describe("processVinculos", () => {
       expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
     });
 
-    it("cenário 4 — semMaisEmpregos com maisEmpregosPerguntado=false e negação explícita → negado setado", async () => {
+    it("cenário 4 — semMaisEmpregos com maisEmpregosPerguntado=false → negado NÃO é setado (aguarda pergunta)", async () => {
+      // Comportamento atual: a flag _mais_empregos_negado só é setada quando a pergunta
+      // mais_empregos foi explicitamente feita (maisEmpregosPerguntado=true). Negação
+      // implícita detectada pelo LLM antes da pergunta não fecha a coleta.
       const vinculo = completeVinculo();
       mockTryExtract.mockResolvedValue({ ...emptyResult(), semMaisEmpregos: true, updatedVinculos: [vinculo] });
 
@@ -260,8 +270,8 @@ describe("processVinculos", () => {
         maisEmpregosPerguntado: false,
       });
 
-      expect(result.mergedUpdates._mais_empregos_negado).toBe(true);
-      expect(result.state.vinculosOk).toBe(true);
+      expect(result.mergedUpdates._mais_empregos_negado).toBeUndefined();
+      expect(result.state.vinculosOk).toBe(false);
     });
   });
 
@@ -282,7 +292,11 @@ describe("processVinculos", () => {
       };
     }
 
-    it("2 vínculos com mínimo + _mais_empregos_perguntado=true → auto-fecha", async () => {
+    it("2 vínculos com v2 incompleto + _mais_empregos_perguntado=true → NÃO auto-fecha (exige todosCompletos)", async () => {
+      // Comportamento atual: o auto-close parcial foi removido — o auto-close exige
+      // 2+ vínculos TODOS completos (todosCompletos). Vínculo anterior só com o mínimo
+      // (sem horas_extras/pagamento_fora/injustica) não fecha mais a coleta aqui;
+      // o fechamento por impaciência é tratado via _q_skipped (mais_empregos 2× sem resposta).
       const v1 = vinculoPrincipal();
       const v2 = vinculoAnteriorMinimo();
       mockTryExtract.mockResolvedValue({ ...emptyResult(), updatedVinculos: [v1, v2] });
@@ -295,8 +309,8 @@ describe("processVinculos", () => {
         maisEmpregosPerguntado: true,
       });
 
-      expect(result.state.vinculosOk).toBe(true);
-      expect(result.mergedUpdates._vinculos_ok).toBe(true);
+      expect(result.state.vinculosOk).toBe(false);
+      expect(result.mergedUpdates._vinculos_ok).toBeUndefined();
     });
 
     it("2 vínculos com mínimo mas _mais_empregos_perguntado=false → NÃO auto-fecha", async () => {

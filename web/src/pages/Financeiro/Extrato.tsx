@@ -190,7 +190,7 @@ function ImportStatementModal({ emitenteId, bankAccountId, onClose, onImported }
       formData.append("bankAccountId", bankAccountId);
       if (tab === "CSV") formData.append("mapping", JSON.stringify(csvMapping));
 
-      const endpoint = tab === "OFX" ? "/banking/import/ofx" : "/banking/import/csv";
+      const endpoint = tab === "OFX" ? "/api/banking/import/ofx" : "/api/banking/import/csv";
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
@@ -397,9 +397,9 @@ export default function Extrato() {
   const lastSync = syncLogs?.[0];
 
   return (
-    <div className="p-8">
+    <div className="p-4 md:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Extrato Bancário</h1>
           {lastSync && (
@@ -498,8 +498,8 @@ export default function Extrato() {
           Carregando...
         </div>
       ) : (
-        <div className="bg-white border border-gray-200 rounded-xl overflow-hidden">
-          <table className="w-full text-sm">
+        <div className="bg-white border border-gray-200 rounded-xl overflow-x-auto">
+          <table className="w-full text-sm min-w-[560px]">
             <thead className="bg-gray-50 border-b border-gray-200">
               <tr>
                 <th className="text-left px-4 py-3 text-xs font-medium text-gray-500 uppercase">Data</th>

@@ -4,7 +4,7 @@
  * Returns mergedUpdates patch + notasParaCriar so the caller can persist both.
  */
 
-import { tryExtractVinculo, checkVinculoPrazo } from "./qualification.js";
+import { tryExtractVinculo, checkVinculoPrazo, deriveDataSaida, deriveDataSaidaFromText } from "./qualification.js";
 import { syncVinculosFromFlat } from "./qualification-utils.js";
 import type { VinculoEmprego, VinculosState } from "./types.js";
 
@@ -14,6 +14,7 @@ export interface VinculosProcessorInput {
   text: string | null;
   history: Array<{ direcao: string; conteudo?: string | null }>;
   maisEmpregosPerguntado: boolean;
+  personaLlmChave?: string | null;
 }
 
 export interface VinculosProcessorResult {
@@ -32,10 +33,26 @@ function todosCompletos(arr: VinculoEmprego[]): boolean {
 }
 
 function parseMesesTempo(s: string): number {
-  let t = 0;
-  const ma = s.match(/(\d+)\s*an/i); if (ma) t += parseInt(ma[1]) * 12;
-  const mm = s.match(/(\d+)\s*m[eê]/i); if (mm) t += parseInt(mm[1]);
-  return t;
+  if (!s) return 0;
+  const t = s.toLowerCase();
+  let meses = 0;
+  const ma  = t.match(/(\d+(?:[,.]\d+)?)\s*an/i);
+  const mm  = t.match(/(\d+(?:[,.]\d+)?)\s*m[eê]/i);
+  const ms  = t.match(/(\d+(?:[,.]\d+)?)\s*semana/i);
+  const md  = t.match(/(\d+(?:[,.]\d+)?)\s*dia/i);
+  if (ma) meses += Math.round(parseFloat(ma[1].replace(",", ".")) * 12);
+  if (mm) meses += Math.floor(parseFloat(mm[1].replace(",", ".")));
+  if (ms && !ma && !mm) meses += Math.round(parseFloat(ms[1].replace(",", ".")) / 4.3);
+  if (md && !ma && !mm && !ms) meses += parseFloat(md[1].replace(",", ".")) / 30;
+  // Intervalo de anos: "de 2020 até janeiro de 2026", "2021 a 2025", "de 2019 a 2023"
+  if (!ma && !mm && !ms && !md) {
+    const yr = t.match(/\b((?:19|20)\d{2})\b[^.]{0,60}?\b((?:19|20)\d{2})\b/);
+    if (yr) {
+      const y1 = parseInt(yr[1]), y2 = parseInt(yr[2]);
+      if (y2 > y1 && (y2 - y1) < 50) meses = (y2 - y1) * 12;
+    }
+  }
+  return meses;
 }
 
 function computeDelta(
@@ -51,7 +68,7 @@ function computeDelta(
 }
 
 export async function processVinculos(input: VinculosProcessorInput): Promise<VinculosProcessorResult> {
-  const { projetoId, merged, text, history, maisEmpregosPerguntado } = input;
+  const { projetoId, merged, text, history, maisEmpregosPerguntado, personaLlmChave = null } = input;
   const w: Record<string, unknown> = { ...merged };
   const notas: string[] = [];
 
@@ -59,17 +76,27 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
   let vinculosOk = w._vinculos_ok === true;
   const vinculosTodosPrescritos = w._vinculos_todos_prescritos === true;
 
-  // Seed vinculos[0] from flat fields when array is empty
+  // Seed vinculos[0] from flat fields when array is empty.
+  // empresa_recente is preferred but not required — seed with partial data when available
+  // so the vinculos flow can advance to saida/tempo/etc. even if empresa was skipped.
   if (vinculos.length === 0 && !vinculosOk && !vinculosTodosPrescritos) {
-    const empresaSeed = (w.empresa_principal ?? w.empresa_recente) as string | undefined;
-    if (empresaSeed) {
+    const empresaSeed   = (w.empresa_principal ?? w.empresa_recente) as string | undefined;
+    const funcaoSeed    = (w.funcao_recente as string | undefined)     ?? undefined;
+    const vinculoSeed   = (w.vinculo_recente as string | undefined)    ?? undefined;
+    const saidaSeed     = (w.saida_recente as string | undefined)      ?? undefined;
+    const tempoSeed     = (w.tempo_recente as string | undefined)      ?? undefined;
+    const dataSaidaSeed = (w.data_saida_recente as string | undefined) ?? undefined;
+    // BUG-004 FIX: require empresa for seeding — a partial entry with only vinculo/funcao
+    // conflicts with the LLM extraction that creates a complete vinculos[1] for the same job.
+    const hasSomeData   = !!empresaSeed;
+    if (hasSomeData) {
       const seeded: VinculoEmprego = {
         ordem: 1, empresa: empresaSeed,
-        funcao:         (w.funcao_recente as string | undefined)     ?? undefined,
-        vinculo:        (w.vinculo_recente as string | undefined)    ?? undefined,
-        saida:          (w.saida_recente as string | undefined)      ?? undefined,
-        tempo:          (w.tempo_recente as string | undefined)      ?? undefined,
-        data_saida:     (w.data_saida_recente as string | undefined) ?? undefined,
+        funcao:      funcaoSeed,
+        vinculo:     vinculoSeed,
+        saida:       saidaSeed,
+        tempo:       tempoSeed,
+        data_saida:  dataSaidaSeed,
         horas_extras: undefined, pagamento_fora: undefined, injustica: undefined,
         frota: w.frota_recente != null ? String(w.frota_recente) : w.frota != null ? String(w.frota) : undefined,
       };
@@ -87,12 +114,13 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
   if (!vinculosOk && text) {
     try {
       const historiaTexto = history.slice(-20)
-        .map(m => `${m.direcao === "out" ? "Ana" : "Cliente"}: ${m.conteudo ?? ""}`)
+        .map(m => `${m.direcao === "out" ? "Assistente" : "Cliente"}: ${m.conteudo ?? ""}`)
         .join("\n");
 
       const extraido = await tryExtractVinculo(
         projetoId, text, vinculos, historiaTexto,
         w._mais_empregos_confirmado === true, maisEmpregosPerguntado,
+        personaLlmChave,
       );
 
       const vinculosAtuais = extraido.updatedVinculos;
@@ -102,18 +130,47 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
       }
 
       if (extraido.semMaisEmpregos) {
-        w._mais_empregos_negado = true;
-        if (todosCompletos(vinculosAtuais)) {
-          w._vinculos_ok = true;
-        } else {
-          // Minimum viability: lead denied more employers — close if empresa+vinculo+saida present
-          const temVinculoValido = vinculosAtuais.some(v => v.empresa && v.vinculo && v.saida);
-          if (temVinculoValido) w._vinculos_ok = true;
+        // If there's also a new vinculo (lead said "before X I worked at Y, that's all" in one
+        // message), add the vinculo first so it's counted when deciding whether to close.
+        if (extraido.vinculo) {
+          if (!extraido.vinculo.data_saida) {
+            const derivada = deriveDataSaida(extraido.vinculo) ?? deriveDataSaidaFromText(text);
+            if (derivada) extraido.vinculo.data_saida = derivada;
+          }
+          const dentroPrazo = await checkVinculoPrazo(projetoId, extraido.vinculo, personaLlmChave);
+          if (dentroPrazo) {
+            vinculosAtuais.push({ ...extraido.vinculo, ordem: vinculosAtuais.length + 1 });
+            delete w._mais_empregos_confirmado;
+            notas.push(
+              `[IA] Vínculo ${vinculosAtuais.length} (+ fechamento): ${extraido.vinculo.empresa ?? "?"} — ` +
+              `saída: ${extraido.vinculo.saida ?? extraido.vinculo.data_saida ?? "?"}`,
+            );
+          }
         }
+
+        if (maisEmpregosPerguntado) {
+          // Question was explicitly asked — honor the denial and close vinculos collection.
+          w._mais_empregos_negado = true;
+          if (todosCompletos(vinculosAtuais)) {
+            w._vinculos_ok = true;
+          } else {
+            // Minimum viability: lead denied more employers — close if empresa+vinculo+saida present
+            const temVinculoValido = vinculosAtuais.some(v => v.empresa && v.vinculo && v.saida);
+            if (temVinculoValido) w._vinculos_ok = true;
+          }
+        }
+        // If !maisEmpregosPerguntado: LLM saw an implicit denial before the question was asked.
+        // Do NOT close — the question will be asked on the next turn normally.
         w.vinculos = vinculosAtuais;
 
       } else if (extraido.vinculo) {
-        const dentroPrazo = await checkVinculoPrazo(projetoId, extraido.vinculo);
+        if (!extraido.vinculo.data_saida) {
+          // Campos extraídos primeiro; fallback no texto bruto do turno (o turno que cria
+          // o vínculo fala dele — extração flash às vezes descarta o ano).
+          const derivada = deriveDataSaida(extraido.vinculo) ?? deriveDataSaidaFromText(text);
+          if (derivada) extraido.vinculo.data_saida = derivada;
+        }
+        const dentroPrazo = await checkVinculoPrazo(projetoId, extraido.vinculo, personaLlmChave);
         if (!dentroPrazo) {
           if (vinculosAtuais.length === 0) {
             w._vinculos_ok = true;
@@ -133,7 +190,9 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
         }
 
       } else if (extraido.confirmouMaisEmpregos) {
-        if (todosCompletos(vinculosAtuais)) {
+        // Honor confirmation even if vinculos[0] is incomplete — "melhor qualificação parcial que nada"
+        const temEmpresa = vinculosAtuais.length > 0 && !!vinculosAtuais[0]?.empresa;
+        if (maisEmpregosPerguntado || todosCompletos(vinculosAtuais) || temEmpresa) {
           w._mais_empregos_confirmado = true;
         }
         w.vinculos = vinculosAtuais;
@@ -141,8 +200,12 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
       } else {
         // Enrichment only — retroactive prescricao check on v0 if data_saida arrived
         const v0 = vinculosAtuais[0];
+        if (v0 && !v0.data_saida) {
+          const derivada = deriveDataSaida(v0);
+          if (derivada) v0.data_saida = derivada;
+        }
         if (v0?.data_saida && !w._vinculos_todos_prescritos) {
-          const dentroPrazaEnriq = await checkVinculoPrazo(projetoId, v0);
+          const dentroPrazaEnriq = await checkVinculoPrazo(projetoId, v0, personaLlmChave);
           if (!dentroPrazaEnriq) {
             w._vinculos_ok = true;
             w._vinculos_todos_prescritos = true;
@@ -186,21 +249,39 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
         notas.push(`[IA] Recovery seed vinculos[1]: ${empresaAnteriorFlat}`);
       }
 
-      // Auto-close: 2+ complete vinculos, or 1 complete after mais_empregos was asked
-      if (!w._vinculos_ok && todosCompletos(vinculosAtuais) &&
-          (vinculosAtuais.length >= 2 || maisEmpregosPerguntado)) {
-        w._vinculos_ok = true;
-        w.vinculos = vinculosAtuais;
+      // Auto-close: 2+ complete vinculos only.
+      // Single-vínculo close when lead denies more jobs is handled above by the
+      // semMaisEmpregos branch (sets _vinculos_ok directly). Do NOT auto-close here
+      // with 1 vínculo just because the question was asked (old maisEmpregosPerguntado
+      // condition) — that fired before the lead answered and caused the parecer to omit
+      // the second employer.
+      if (!w._vinculos_ok && todosCompletos(vinculosAtuais) && vinculosAtuais.length >= 2) {
+        // RECONHECIMENTO DE VÍNCULO: "informal"/"sem registro"/"PJ forçado" (pejotização) NÃO
+        // descartam — motorista subordinado sem carteira tem vínculo reconhecível. Só é não-CLT
+        // quem tem autonomia real: dono do caminhão (autônomo/agregado/TAC), cooperado, avulso, app.
+        const NON_CLT_CLOSE = /autônomo|autonomo|avulso|cooperado|agregado|\btac\b/i;
+        // Só fechar se há pelo menos 1 vínculo CLT com tempo suficiente (mín. 2 meses)
+        const algumCltValido = vinculosAtuais.some(v =>
+          v.vinculo != null &&
+          !NON_CLT_CLOSE.test(String(v.vinculo)) &&
+          parseMesesTempo(String(v.tempo ?? "")) >= 2
+        );
+        const maisEmpregosNegado = w._mais_empregos_negado === true || w.tem_emprego_anterior === false;
+        if (algumCltValido || maisEmpregosNegado) {
+          w._vinculos_ok = true;
+          w.vinculos = vinculosAtuais;
+        }
+        // Se não tem vínculo válido E mais_empregos não foi negado: NÃO fechar.
       }
 
-      // Auto-close (partial): lead confirmed all vinculos with minimum fields,
-      // mais_empregos was already asked and confirmed. Handles leads who go quiet
-      // on secondary fields (horas_extras, pagamento_fora, injustica) of older vinculos.
-      if (!w._vinculos_ok && w._mais_empregos_perguntado === true && vinculosAtuais.length >= 2) {
-        const todosTemMinimo = vinculosAtuais.every(
-          (v: VinculoEmprego) => v.empresa && v.vinculo && v.saida,
-        );
-        if (todosTemMinimo) {
+
+      // Auto-close when mais_empregos question was asked 2× without answer (added to _q_skipped).
+      // "Melhor qualificação incompleta que nada" — don't block the flow waiting indefinitely.
+      const qSkippedArr = (merged._q_skipped as string[] | undefined) ?? [];
+      if (!w._vinculos_ok && qSkippedArr.some(c => c.startsWith("mais_empregos"))) {
+        const temMinimo = vinculosAtuais.some((v: VinculoEmprego) => v.empresa && (v.vinculo || v.saida));
+        if (temMinimo) {
+          w._mais_empregos_negado = true;
           w._vinculos_ok = true;
           w.vinculos = vinculosAtuais;
         }
@@ -212,6 +293,19 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
 
     vinculos = Array.isArray(w.vinculos) ? (w.vinculos as VinculoEmprego[]) : vinculos;
     vinculosOk = w._vinculos_ok === true;
+  }
+
+  // 7b-extra: Sync e_clt from vinculos → merged so gates disparam sem esperar extractQualificacaoData.
+  // Regra: só marca e_clt=false quando há AUTONOMIA REAL e nenhum vínculo reconhecível.
+  // RECONHECIMENTO DE VÍNCULO: "informal"/"sem registro"/"PJ forçado" (pejotização) NÃO contam
+  // como não-CLT — motorista subordinado sem carteira qualifica (a invalidade é só app/dono do
+  // caminhão/cooperado/avulso). Só seta e_clt se ainda não foi definido.
+  if (!w._vinculos_ok && vinculos.length > 0 && (w.e_clt === undefined || w.e_clt === null)) {
+    const NON_CLT_RE = /autônomo|autonomo|avulso|cooperado|agregado|\btac\b|transportador\s+autonomo/i;
+    const CLT_RE     = /clt|carteira/i;
+    const algumClt     = vinculos.some(v => v.vinculo && CLT_RE.test(String(v.vinculo)));
+    const algumNaoClt  = vinculos.some(v => v.vinculo && NON_CLT_RE.test(String(v.vinculo)));
+    if (algumNaoClt && !algumClt) { w.e_clt = false; }
   }
 
   // 7c. Sync vinculos[0/1] → flat fields when _vinculos_ok is set

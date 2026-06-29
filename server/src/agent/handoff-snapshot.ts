@@ -10,7 +10,7 @@ function formatCpf(cpf: string): string {
   return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
 }
 
-export function buildHandoffSnapshot(merged: Record<string, unknown>): string {
+export function buildHandoffSnapshot(merged: Record<string, unknown>, advogadoNome: string = "a Dra. Daniela"): string {
   const fatos: string[] = [];
 
   if (merged.nome) fatos.push(`Nome: ${merged.nome}`);
@@ -61,11 +61,32 @@ export function buildHandoffSnapshot(merged: Record<string, unknown>): string {
     if (merged.injustica) fatos.push(`Irregularidade: ${merged.injustica}`);
   }
 
+  // Build explicit "already answered" list to prevent re-asking
+  const jaRespondido: string[] = [];
+  if (merged.nome || merged.nome_completo) jaRespondido.push("nome completo");
+  if (merged.cpf) jaRespondido.push("CPF");
+  if (merged.rg) jaRespondido.push("RG");
+  if (merged.data_nascimento) jaRespondido.push("data de nascimento");
+  if (merged.endereco) jaRespondido.push("endereço");
+  if (merged.estado_civil) jaRespondido.push("estado civil");
+  if (merged.nacionalidade || merged.naturalidade) jaRespondido.push("nacionalidade");
+  if (Array.isArray(merged.vinculos) && merged.vinculos.length > 0) {
+    (merged.vinculos as any[]).forEach((v, i) => {
+      if (v.empresa) jaRespondido.push(`empresa ${i + 1} (${v.empresa})`);
+    });
+  } else {
+    if (merged.empresa_recente || merged.empresa_principal) jaRespondido.push("empresa");
+  }
+
+  const proibicaoStr = jaRespondido.length > 0
+    ? `\nREGRA ABSOLUTA — PROIBIDO REPERGUNTAR: Os seguintes dados já foram coletados e NÃO devem ser solicitados novamente: ${jaRespondido.join(", ")}. Se o cliente informar algo que já está registrado, apenas confirme de forma natural e avance.`
+    : "";
+
   return [
-    "=== DADOS JÁ COLETADOS PELA ANA (NÃO REPERGUNTAR) ===",
+    "=== DADOS JÁ COLETADOS PELA ASSISTENTE (NÃO REPERGUNTAR) ===",
     fatos.join("\n"),
     "=== FIM DOS DADOS COLETADOS ===",
-    "Você é a Dra. Daniela. Esses dados já foram coletados — confirme-os naturalmente quando útil, mas NÃO faça perguntas que já têm resposta acima.",
+    `Você é ${advogadoNome}. Esses dados já foram coletados — confirme-os naturalmente quando útil, mas NÃO faça perguntas que já têm resposta acima.${proibicaoStr}`,
   ].join("\n");
 }
 

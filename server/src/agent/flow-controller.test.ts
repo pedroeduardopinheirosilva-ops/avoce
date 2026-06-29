@@ -77,10 +77,11 @@ describe("getNextPreVinculosQuestion", () => {
 });
 
 describe("advanceAdvogadoFlow", () => {
-  it("returns { nextQuestion: null } when no steps configured", async () => {
+  it("returns { nextQuestion: null, nextStepChave: '__done__' } when no steps configured", async () => {
     const deal = { id: "d1", iaFlowStepChave: null, iaFlowStepData: null, qualificacao: {} };
     const result = await advanceAdvogadoFlow("proj-1", deal, "", 0);
-    expect(result).toEqual({ nextQuestion: null });
+    // Sem steps configurados o flow é considerado concluído ("__done__").
+    expect(result).toEqual({ nextQuestion: null, nextStepChave: "__done__" });
   });
 
   it("returns { nextQuestion: null } when step is __done__", async () => {

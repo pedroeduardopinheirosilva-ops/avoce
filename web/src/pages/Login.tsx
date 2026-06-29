@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { trpc } from "../lib/trpc";
+import { queryClient } from "../main";
 import { AvoceLockup } from "../components/Logo";
 
 export default function LoginPage() {
@@ -12,6 +13,7 @@ export default function LoginPage() {
   const login = trpc.auth.login.useMutation({
     onSuccess: (data) => {
       localStorage.setItem("avoce_token", data.token);
+      queryClient.clear();
       navigate("/dashboard");
     },
     onError: (e) => setErro(e.message),

@@ -108,7 +108,7 @@ export function gerarBoletoHtml(p: BoletoHtmlParams): string {
   ];
 
   const logo = p.beneficiario.sicoobLogo
-    ? `<img src="${p.beneficiario.sicoobLogo}" style="height:50px;width:auto;" alt="Sicoob">`
+    ? `<img src="${p.beneficiario.sicoobLogo}" style="display:block;height:44px;width:auto;" alt="Sicoob">`
     : `<span style="font-size:24pt;font-weight:900;color:#00833e;font-style:italic;">&#9650; SICOOB</span>`;
 
   const benefLine2 = [
@@ -146,7 +146,7 @@ export function gerarBoletoHtml(p: BoletoHtmlParams): string {
   .hdr-cod{padding:4px 14px;border-right:3px solid #000;display:flex;align-items:center;
            font-size:22pt;font-weight:900;white-space:nowrap;}
   .hdr-linha{flex:1;padding:4px 10px;display:flex;align-items:center;justify-content:flex-end;
-             font-family:monospace;font-size:11pt;font-weight:bold;letter-spacing:1.5px;
+             font-family:monospace;font-size:9pt;font-weight:bold;letter-spacing:0;
              white-space:nowrap;overflow:hidden;}
   @media print{body{margin:0;}.no-print{display:none!important;}}
   .print-btn{position:fixed;bottom:20px;right:20px;background:#004a5c;color:#fff;border:none;

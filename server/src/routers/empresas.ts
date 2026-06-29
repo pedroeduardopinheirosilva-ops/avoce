@@ -1,19 +1,28 @@
 import { z }                        from "zod";
 import { router, authProc }         from "./trpc.js";
 import { prisma }                   from "../db.js";
+import { whereEmitenteFilter, assertEmitenteAccess, canAccessEmitente } from "./tenant-utils.js";
 import nodemailer                   from "nodemailer";
 import { existsSync, readFileSync } from "node:fs";
 import { certPathForEmpresa }       from "../upload.js";
 import { extrairMetaCert }          from "../lib/nfse.js";
+import { fieldEncrypt, fieldDecrypt } from "../lib/field-crypto.js";
 
 export const empresaRouter = router({
-  listar: authProc.query(async () => {
-    return prisma.empresaEmitente.findMany({ orderBy: { nome: "asc" } });
+  listar: authProc.query(async ({ ctx }) => {
+    const where = ctx.emitentesAcessiveis === null
+      ? (ctx.role === "admin" && !ctx.empresaId ? {} : { empresaId: ctx.empresaId })
+      : (ctx.emitentesAcessiveis.length === 0 ? { id: "__none__" } : { id: { in: ctx.emitentesAcessiveis } });
+    return prisma.empresaEmitente.findMany({
+      where,
+      orderBy: { nome: "asc" },
+    });
   }),
 
   obter: authProc
     .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.id);
       return prisma.empresaEmitente.findUniqueOrThrow({ where: { id: input.id } });
     }),
 
@@ -41,6 +50,8 @@ export const empresaRouter = router({
       codigoServicoNacional:    z.string().optional().nullable(),
       codigoNbs:                z.string().optional().nullable(),
       regimeTributacao:         z.string().optional().nullable(),
+      nfseProvider:             z.enum(["el_vdc", "issnet_df"]).optional().nullable(),
+      codigoCnae:               z.string().optional().nullable(),
       smtpHost:           z.string().optional().nullable(),
       smtpPort:           z.number().int().optional().nullable(),
       smtpSecure:         z.boolean().optional(),
@@ -48,8 +59,11 @@ export const empresaRouter = router({
       smtpPass:           z.string().optional().nullable(),
       smtpFrom:           z.string().optional().nullable(),
     }))
-    .mutation(async ({ input }) => {
-      return prisma.empresaEmitente.create({ data: input });
+    .mutation(async ({ input, ctx }) => {
+      const data: any = { ...input, empresaId: ctx.empresaId ?? undefined };
+      if (data.smtpPass) data.smtpPass = fieldEncrypt(data.smtpPass);
+      if (data.certPass) data.certPass = fieldEncrypt(data.certPass);
+      return prisma.empresaEmitente.create({ data });
     }),
 
   atualizar: authProc
@@ -76,6 +90,8 @@ export const empresaRouter = router({
       codigoServicoNacional:    z.string().optional().nullable(),
       codigoNbs:                z.string().optional().nullable(),
       regimeTributacao:         z.string().optional().nullable(),
+      nfseProvider:             z.enum(["el_vdc", "issnet_df"]).optional().nullable(),
+      codigoCnae:               z.string().optional().nullable(),
       ativo:              z.boolean().optional(),
       smtpHost:           z.string().optional().nullable(),
       smtpPort:           z.number().int().optional().nullable(),
@@ -98,42 +114,58 @@ export const empresaRouter = router({
       // Faturamento automático
       faturamentoAutoAtivo:     z.boolean().optional(),
       diaEmissaoNfse:           z.number().int().min(1).max(28).optional().nullable(),
+      // VoIP
+      voipDid:           z.string().optional().nullable(),
+      voipDid2:          z.string().optional().nullable(),
+      voipDid3:          z.string().optional().nullable(),
+      voipAsteriskWss:   z.string().optional().nullable(),
+      voipDid1Label:     z.string().optional().nullable(),
+      voipDid2Label:     z.string().optional().nullable(),
+      voipDid3Label:     z.string().optional().nullable(),
+      voipSipExtension:  z.string().optional().nullable(),
+      voipSipPassword:   z.string().optional().nullable(),
+      voipSipDomain:     z.string().optional().nullable(),
     }))
-    .mutation(async ({ input }) => {
-      const { id, ...data } = input;
+    .mutation(async ({ input, ctx }) => {
+      const { id, ...data }: any = input;
+      assertEmitenteAccess(ctx, id);
+      if (data.smtpPass) data.smtpPass = fieldEncrypt(data.smtpPass);
+      if (data.certPass) data.certPass = fieldEncrypt(data.certPass);
       return prisma.empresaEmitente.update({ where: { id }, data });
     }),
 
   salvarSenhaCert: authProc
     .input(z.object({ id: z.string(), certPass: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.id);
       const certPath = certPathForEmpresa(input.id);
       if (!existsSync(certPath)) throw new Error("Certificado não encontrado. Faça o upload do arquivo .p12 primeiro.");
 
       const buf = readFileSync(certPath);
-      extrairMetaCert(buf, input.certPass); // lança se senha errada
+      extrairMetaCert(buf, input.certPass);
 
-      process.env[`CERT_PASS_${input.id}`] = input.certPass;
+      process.env[`CERT_PASS_${input.id}`] = input.certPass; // plaintext for runtime use
       return prisma.empresaEmitente.update({
         where: { id: input.id },
-        data:  { certPass: input.certPass },
+        data:  { certPass: fieldEncrypt(input.certPass) },
       });
     }),
 
   testarSmtp: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.id);
       const emp = await prisma.empresaEmitente.findUniqueOrThrow({ where: { id: input.id } });
       if (!emp.smtpHost || !emp.smtpUser) throw new Error("SMTP não configurado para esta empresa");
 
       const port   = emp.smtpPort ?? 587;
-      const secure = port === 465;            // SSL direto só na 465; 587 usa STARTTLS
+      const secure = emp.smtpSecure;
       const transporter = nodemailer.createTransport({
         host:       emp.smtpHost,
         port,
         secure,
         requireTLS: !secure,
-        auth:       { user: emp.smtpUser, pass: emp.smtpPass ?? "" },
+        auth:       { user: emp.smtpUser, pass: fieldDecrypt(emp.smtpPass) },
         tls:        { rejectUnauthorized: false },
       });
 
@@ -156,7 +188,8 @@ export const empresaRouter = router({
 
   excluir: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.id);
       // soft delete
       return prisma.empresaEmitente.update({
         where: { id: input.id },
@@ -166,7 +199,8 @@ export const empresaRouter = router({
 
   estatisticas: authProc
     .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.id);
       const [totalContratos, totalNotas, notasEmitidas] = await Promise.all([
         prisma.contrato.count({ where: { emitenteId: input.id, ativo: true } }),
         prisma.notaFiscal.count({ where: { emitenteId: input.id } }),

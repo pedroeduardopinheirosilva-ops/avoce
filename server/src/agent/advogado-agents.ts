@@ -1,19 +1,18 @@
 /**
- * Advogado Agents — 2 focused sub-agents for Daniela's flow.
+ * Advogado Agents — focused sub-agents for Daniela's flow.
  *
  * Phase "autoridade":
- *   apresentacao → parecer → valor_estimado → explicar_processo
- *   Goal: establish legal authority, deliver the opinion, build trust.
+ *   apresentacao → parecer → contorno_objecao → explicar_processo → confirmacao_final
+ *   Goal: establish authority, deliver opinion (NO values), invite to meeting.
  *
- * Phase "coleta":
- *   cpf → nome_completo → ... → envio_contrato → confirmacao_final
- *   Goal: collect personal data one field at a time, then send contract.
+ * Phase "coleta": coleta_docs flow (Ana) handles all personal data collection.
  *
- * Phase detection is now DB-driven (IaFlowStep.fase column), cached 60s per project.
+ * Phase detection is DB-driven (IaFlowStep.fase column), cached 60s per project.
  */
 
 import { prisma } from "../db.js";
 import type { VinculoEmprego, AdvogadoPhase, AdvogadoAgentContext, AdvogadoAgentResult } from "./types.js";
+import { getPersonaNomeExibicao } from "./transition-engine.js";
 
 // Re-export for backward compat — callers should migrate to types.ts
 export type { AdvogadoPhase, AdvogadoAgentContext, AdvogadoAgentResult };
@@ -56,84 +55,95 @@ export async function detectAdvogadoPhase(
 
 export async function runAdvogadoAgent(ctx: AdvogadoAgentContext): Promise<AdvogadoAgentResult> {
   const phase = await detectAdvogadoPhase(ctx.projetoId, ctx.iaFlowStepChave);
+  const secretariaNome = await getPersonaNomeExibicao(ctx.projetoId, "secretaria");
   const systemInstructions = phase === "autoridade"
-    ? buildAutoridadeInstructions(ctx)
+    ? buildAutoridadeInstructions(ctx, secretariaNome)
     : buildColetaInstructions(ctx);
   return { phase, systemInstructions };
 }
 
 // ── Agente de Autoridade ───────────────────────────────────────────────────────
 
-const COMPLEMENTO_STEPS = new Set(["comp_salario", "comp_jornada", "comp_fgts", "comp_carteira"]);
-
-function buildAutoridadeInstructions(ctx: AdvogadoAgentContext): string {
+function buildAutoridadeInstructions(ctx: AdvogadoAgentContext, secretariaNome: string = "a secretária"): string {
   const { iaFlowStepChave, merged, vinculos } = ctx;
   const nomeCliente = String(merged.nome ?? "cliente");
   const vinculoDesc = vinculos.map(v =>
     `${v.empresa ?? "?"} (${v.funcao ?? "?"}, ${v.vinculo ?? "?"}, ${v.tempo ?? "?"})`
   ).join("; ");
 
-  const isColetandoComplemento = iaFlowStepChave && COMPLEMENTO_STEPS.has(iaFlowStepChave);
+  const isParecer = iaFlowStepChave === "parecer" ||
+    iaFlowStepChave === "parecer_acolhimento" ||
+    iaFlowStepChave === "parecer_verbas" ||
+    iaFlowStepChave === "parecer_calculista" ||
+    iaFlowStepChave === "parecer_convite";
 
   const base = [
-    `AGENTE DE AUTORIDADE — Dra. Daniela Pires`,
-    `Fase: coletar informações complementares e elaborar o parecer jurídico personalizado.`,
-    ``,
-    `REGRAS ABSOLUTAS NESTA FASE:`,
-    `- NUNCA peça documentos (CNH, RG, CPF, comprovante de endereço) — isso acontece depois.`,
-    `- NUNCA mencione contrato, procuração ou assinatura — ainda não.`,
-    `- USE os dados reais do caso: cliente ${nomeCliente}, vínculos: ${vinculoDesc || "ver dados coletados pela Ana"}.`,
-    `- Linguagem de WhatsApp: frases curtas e diretas. Máximo 4 frases por resposta.`,
-    `- Posicione-se como especialista: transmita segurança e autoridade sobre o caso.`,
+    `Restrições importantes nesta fase:`,
+    `- Não pergunte sobre salário, holerite, jornada de trabalho, FGTS, carteira de trabalho ou valores financeiros.`,
+    `- Não calcule nem mencione valores monetários do caso do cliente.`,
+    `- Não invente nomes de empresas — use apenas o que o cliente informou. Se não souber, diga "a empresa".`,
+    `- Não peça documentos (CNH, RG, CPF) — isso é feito em outro momento.`,
+    `- Não mencione contrato, procuração ou assinatura.`,
+    `- Cliente: ${nomeCliente}${vinculoDesc ? `. Vínculos: ${vinculoDesc}` : " — use os dados coletados pela assistente"}.`,
+    isParecer
+      ? `- Linguagem de WhatsApp: parágrafos curtos. Escreva o conteúdo completo conforme a estrutura da tarefa.`
+      : `- Linguagem de WhatsApp: frases curtas e diretas. Máximo 3 frases por resposta.`,
   ];
 
-  if (isColetandoComplemento) {
+  if (isParecer) {
     base.push(
       ``,
-      `OBJETIVO IMEDIATO (step ${iaFlowStepChave}): Faça UMA PERGUNTA de cada vez para completar os dados necessários ao parecer.`,
-      `- NÃO resuma o que já foi dito. Vá direto à pergunta obrigatória do fluxo.`,
-      `- NÃO explique por que está perguntando — apenas pergunte de forma natural.`,
-      `- Após essa resposta, haverá mais 1-2 perguntas rápidas antes do parecer jurídico completo.`,
+      `Escreva o conteúdo completo conforme a estrutura definida na tarefa.`,
+      `- Não encurte nem resuma.`,
+      `- Não faça perguntas intermediárias.`,
+      `- Não calcule nem mencione valores monetários do caso.`,
+      `- Linguagem próxima e humana — sem juridiquês rebuscado.`,
     );
-  } else if (iaFlowStepChave === "parecer") {
-    base.push(
-      ``,
-      `⚠️ VOCÊ ESTÁ NO PASSO DO PARECER AGORA. GERE O PARECER JURÍDICO IMEDIATAMENTE.`,
-      `PROIBIDO fazer qualquer pergunta neste momento. NÃO peça mais dados. NÃO confirme informações já ditas.`,
-      `REGRAS OBRIGATÓRIAS DO PARECER:`,
-      `- Cite artigos reais específicos do caso: horas extras não pagas → art. 59 CLT + Súmula 264 TST; pagamento por fora da folha → art. 457 CLT; rescisão indireta → art. 483 CLT; FGTS não depositado → Lei 8.036/90.`,
-      `- Use os nomes reais das empresas e irregularidades informadas pelo cliente.`,
-      `- Máximo 4 frases curtas. Linguagem de WhatsApp.`,
-      `- NÃO termine com pergunta — o lead já confirmou interesse. Encerre afirmando que vai calcular o valor.`,
-    );
-  } else if (iaFlowStepChave === "valor_estimado") {
-    base.push(
-      ``,
-      `⚠️ VOCÊ ESTÁ NO PASSO DO VALOR ESTIMADO. CALCULE E APRESENTE O RANGE AGORA.`,
-      `PROIBIDO fazer qualquer pergunta neste momento. NÃO peça datas, nomes de empresas ou qualquer dado adicional.`,
-      `REGRAS OBRIGATÓRIAS DO VALOR ESTIMADO:`,
-      `- Calcule para CADA vínculo/empresa separadamente. Os vínculos são: ${vinculoDesc || "ver dados coletados"}.`,
-      `- Para cada vínculo informe: nome da empresa, período trabalhado e o range estimado (R$ X a R$ Y).`,
-      `- Ao final, some todos os vínculos e apresente o TOTAL estimado.`,
-      `- Se faltar algum dado de um vínculo, use o tempo aproximado declarado e sinalize que é estimativa preliminar.`,
-      `- Mencione brevemente as verbas: horas extras, FGTS, férias + 13º proporcional, reflexos do salário por fora.`,
-      `- NÃO peça confirmação de dados. NÃO faça perguntas. Encerre com transição natural para o próximo passo.`,
-    );
+    if (iaFlowStepChave === "parecer_acolhimento") {
+      base.push(``, `Bloco atual: ACOLHIMENTO. Acolha com empatia, valide a situação, confirme que analisou o caso. Cite os vínculos e irregularidades identificados. Encerre sinalizando que vai apresentar os direitos encontrados.`);
+    } else if (iaFlowStepChave === "parecer_verbas") {
+      base.push(``, `Bloco atual: VERBAS E DIREITOS. Liste as verbas trabalhistas aplicáveis ao caso (horas extras, FGTS, multa, aviso prévio etc.). Cite artigos legais relevantes (art. 59 CLT, Lei 8.036/90, art. 477 CLT). Sem juridiquês.`);
+    } else if (iaFlowStepChave === "parecer_calculista") {
+      base.push(``, `Bloco atual: PERSPECTIVA E PRAZO. Mencione o prazo de 2 anos para acionar a Justiça. Cite experiência do escritório com casos semelhantes. Gere expectativa positiva sem prometer valores. Indique que o próximo passo é a reunião técnica já agendada.`);
+    } else if (iaFlowStepChave === "parecer_convite") {
+      base.push(``, `Bloco atual: CONFIRMAÇÃO. A reunião JÁ ESTÁ AGENDADA — NÃO convide para agendar. Parabenize pela decisão, reforce que a reunião é online, rápida (20-30 min) e sem necessidade de preparação. Encerre com entusiasmo — sem pergunta.`);
+    }
   } else if (iaFlowStepChave === "contorno_objecao") {
     base.push(
       ``,
-      `⚠️ VOCÊ ESTÁ NO PASSO DE CONTORNO DE OBJEÇÃO. O LEAD HESITOU OU DISSE NÃO.`,
-      `PROIBIDO encerrar a conversa ou dizer "até mais". NÃO desista.`,
-      `REGRAS OBRIGATÓRIAS:`,
-      `- Valide a preocupação com empatia em 1 frase curta.`,
-      `- Reforce o modelo de sucesso: zero custo adiantado, só cobramos se ganhar, sem risco para o cliente.`,
-      `- Se o valor estimado ainda não foi mencionado, apresente o range agora.`,
-      `- Encerre com uma pergunta simples de fechamento: "Quer pelo menos ver quanto pode receber?".`,
+      `Contexto: a reunião técnica JÁ ESTÁ AGENDADA. O lead está hesitando, quer cancelar ou demonstrou preocupação.`,
+      `Leia o que o lead disse e escolha o cenário correto:`,
+      ``,
+      `Cenário A — Lead confirma a reunião, está animado ou fez uma pergunta simples:`,
+      `→ Responda em 1-2 frases com entusiasmo. Encerre: "Até a reunião!"`,
+      ``,
+      `Cenário B — Lead quer reagendar (surgiu frete, ocupado esta semana):`,
+      `→ Acolha sem drama. Diga que pode reagendar: "Manda um aviso pra secretária, a gente encaixa outro horário pra você!"`,
+      `→ Reforce: é online, rápida, sem compromisso.`,
+      ``,
+      `Cenário C — Lead hesita ou quer desistir (mudou de ideia, não sei não, depois eu vejo):`,
+      `→ Acolha com cuidado. Pergunte o que aconteceu em 1 frase.`,
+      `→ Reforce: a reunião não abre nenhum processo — é só uma conversa. Zero custo, zero compromisso.`,
+      `→ Mencione prescrição com cuidado: cada mês que passa é um direito que some.`,
+      ``,
+      `Não pergunte sobre documentos, valores do caso ou salário. Máximo 4 frases.`,
+    );
+  } else if (iaFlowStepChave === "__done__") {
+    // First message after meeting was scheduled (secretaria → advogado handoff).
+    // Do NOT use reengagement/closer language ("ficamos de conversar", "na época").
+    // The lead just confirmed a meeting — start with a warm, professional introduction.
+    base.push(
+      ``,
+      `Esta é sua primeira mensagem para este lead — a reunião técnica acaba de ser agendada pela secretária.`,
+      `Apresente-se brevemente como a advogada responsável pelo caso. Use o nome do lead (${nomeCliente}).`,
+      `Tom: próxima, confiante e profissional. Frases curtas. Máximo 3 frases.`,
+      `NÃO use expressões como "ficamos de conversar", "na época", "acabamos não conseguindo" ou linguagem de reengajamento — você está sendo apresentada AGORA, logo após o agendamento.`,
+      `Finalize sinalizando que vai analisar o histórico do lead para a reunião.`,
     );
   } else {
     base.push(
       ``,
-      `Cite artigos reais (art. 59 CLT, art. 457 CLT, art. 483 CLT, Súmula 264 TST, Lei 8.036/90, etc.) e mencione as teses específicas do caso quando aplicável.`,
+      `Transmita segurança e autoridade. Cite artigos legais relevantes quando aplicável (art. 59 CLT, Lei 8.036/90, art. 477 CLT).`,
     );
   }
 
@@ -147,18 +157,17 @@ function buildColetaInstructions(ctx: AdvogadoAgentContext): string {
   const nomeCliente = String(merged.nome ?? "cliente");
 
   const lines = [
-    `AGENTE DE COLETA — Dra. Daniela Pires`,
-    `Fase: coletar dados pessoais para formalizar o contrato e a procuração.`,
+    `Fase de coleta de dados pessoais para formalizar o contrato e a procuração.`,
     ``,
-    `REGRAS ABSOLUTAS NESTA FASE:`,
-    `- UMA PERGUNTA POR VEZ. Não agrupe campos.`,
-    `- NUNCA repita o parecer jurídico — essa fase é só coleta de dados.`,
-    `- NÃO mencione valores ou estimativas novamente — já foram apresentados.`,
+    `Orientações para esta fase:`,
+    `- Uma pergunta por vez. Não agrupe campos.`,
+    `- Não repita o parecer jurídico — esta fase é só coleta de dados.`,
+    `- Não mencione valores ou estimativas — já foram apresentados.`,
     `- Fale de forma natural e rápida: "Me informa seu CPF?" — sem explicar por que precisa.`,
     `- Se o cliente perguntar algo jurídico, responda em 1 frase e volte para o campo pendente.`,
     `- Confirme os dados que o cliente informar (ex: "Perfeito, anota aqui: CPF 000.000.000-00. Correto?").`,
     `- Step atual: ${iaFlowStepChave ?? "início"}. Dados de ${nomeCliente} sendo coletados.`,
-    `- Quando todos os dados estiverem prontos, o contrato será gerado automaticamente — NÃO mencione isso antes.`,
+    `- Quando todos os dados estiverem prontos, o contrato será gerado automaticamente — não mencione isso antes.`,
   ];
 
   // Inject structured identity values when available so LLM doesn't re-derive them from raw OCR text
@@ -175,8 +184,11 @@ function buildColetaInstructions(ctx: AdvogadoAgentContext): string {
     if (rg)             dadosLines.push(`- RG: ${rg}`);
     if (nomeCompleto)   dadosLines.push(`- Nome completo: ${nomeCompleto}`);
     if (dataNascimento) dadosLines.push(`- Data de nascimento: ${dataNascimento}`);
-    dadosLines.push(`NUNCA confirme valores diferentes destes ao cliente.`);
+    dadosLines.push(`Use estes valores exatos ao confirmar com o cliente. Não use outros números.`);
     lines.push(...dadosLines);
+  } else {
+    // CPF/RG ainda não foram coletados — bloquear alucinação
+    lines.push(``, `CPF e RG ainda não foram coletados. Não mencione nenhum número de CPF ou RG — pergunte diretamente ao cliente.`);
   }
 
   return lines.join("\n");

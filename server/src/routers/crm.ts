@@ -1,6 +1,7 @@
 import { z }         from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma }    from "../db.js";
+import { whereEmpresa, canAccess } from "./tenant-utils.js";
 
 // ─── Seed dados carreteiros ───────────────────────────────────────────────────
 
@@ -41,9 +42,9 @@ export const crmRouter = router({
 
   // ── Pipelines ──────────────────────────────────────────────────────────────
 
-  listPipelines: authProc.query(async () => {
+  listPipelines: authProc.query(async ({ ctx }) => {
     return prisma.crmPipeline.findMany({
-      where: { ativo: true },
+      where: { ativo: true, ...whereEmpresa(ctx) },
       orderBy: { ordem: "asc" },
       include: { _count: { select: { deals: { where: { status: "aberto" } } } } },
     });
@@ -56,10 +57,13 @@ export const crmRouter = router({
       cor: z.string().optional(),
       tipo: z.enum(["comercial", "processual", "custom"]).default("comercial"),
     }))
-    .mutation(async ({ input }) => {
-      const last = await prisma.crmPipeline.findFirst({ orderBy: { ordem: "desc" } });
+    .mutation(async ({ input, ctx }) => {
+      const last = await prisma.crmPipeline.findFirst({
+        where: whereEmpresa(ctx),
+        orderBy: { ordem: "desc" },
+      });
       return prisma.crmPipeline.create({
-        data: { ...input, ordem: (last?.ordem ?? -1) + 1 },
+        data: { ...input, empresaId: ctx.empresaId ?? undefined, ordem: (last?.ordem ?? -1) + 1 },
       });
     }),
 
@@ -70,14 +74,19 @@ export const crmRouter = router({
       descricao: z.string().optional(),
       cor: z.string().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, ...data } = input;
+      const p0 = await prisma.crmPipeline.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!p0 || !canAccess(ctx, p0.empresaId)) throw new Error("Pipeline não pertence à sua empresa");
       return prisma.crmPipeline.update({ where: { id }, data });
     }),
 
   deletePipeline: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const { id } = input;
+      const p0 = await prisma.crmPipeline.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!p0 || !canAccess(ctx, p0.empresaId)) throw new Error("Pipeline não pertence à sua empresa");
       // Excluir deals do pipeline (cascade via stages)
       const stages = await prisma.crmStage.findMany({ where: { pipelineId: input.id } });
       for (const stage of stages) {
@@ -93,8 +102,9 @@ export const crmRouter = router({
     .input(z.object({
       pipelineId: z.string(),
       busca: z.string().optional(),
+      tagIds: z.array(z.string()).optional(),
     }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const busca = input.busca?.trim();
 
       const [pipeline, stages] = await Promise.all([
@@ -104,6 +114,8 @@ export const crmRouter = router({
           orderBy: { ordem: "asc" },
         }),
       ]);
+
+      if (!canAccess(ctx, pipeline.empresaId)) throw new Error("Pipeline não pertence à sua empresa");
 
       // Carregar deals por stage em paralelo (usa índice stageId+status)
       const stagesComDeals = await Promise.all(
@@ -118,15 +130,18 @@ export const crmRouter = router({
                 { contato: { whatsapp: { contains: busca } } },
               ],
             } : {}),
+            ...(input.tagIds && input.tagIds.length > 0 ? {
+              tags: { some: { id: { in: input.tagIds } } },
+            } : {}),
           };
 
-          const deals = await prisma.crmDeal.findMany({
+          const deals = await (prisma as any).crmDeal.findMany({
             where,
             orderBy: { criadoEm: "asc" },
             select: {
               id: true, titulo: true, valor: true, urgencia: true,
               status: true, stageId: true, criadoEm: true,
-              valorEstimado: true,
+              valorEstimado: true, iaAtiva: true, iaPausadaPor: true,
               contato: { select: { id: true, nome: true, whatsapp: true, cidade: true } },
             },
           });
@@ -142,7 +157,9 @@ export const crmRouter = router({
 
   listStages: authProc
     .input(z.object({ pipelineId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      { const p = await prisma.crmPipeline.findUnique({ where: { id: input.pipelineId }, select: { empresaId: true } });
+        if (!p || !canAccess(ctx, p.empresaId)) throw new Error("Pipeline não pertence à sua empresa"); }
       return prisma.crmStage.findMany({
         where: { pipelineId: input.pipelineId, ativo: true },
         orderBy: { ordem: "asc" },
@@ -159,7 +176,9 @@ export const crmRouter = router({
       ehGanho: z.boolean().optional(),
       requerAcaoHumana: z.boolean().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      { const p = await prisma.crmPipeline.findUnique({ where: { id: input.pipelineId }, select: { empresaId: true } });
+        if (!p || !canAccess(ctx, p.empresaId)) throw new Error("Pipeline não pertence à sua empresa"); }
       const last = await prisma.crmStage.findFirst({
         where: { pipelineId: input.pipelineId },
         orderBy: { ordem: "desc" },
@@ -175,15 +194,37 @@ export const crmRouter = router({
       nome: z.string().min(1).optional(),
       cor: z.string().optional(),
       requerAcaoHumana: z.boolean().optional(),
+      ehEntrada: z.boolean().optional(),
+      ehGanho: z.boolean().optional(),
+      ehEncerramento: z.boolean().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, ...data } = input;
+      { const stage = await prisma.crmStage.findUnique({ where: { id }, include: { pipeline: { select: { empresaId: true } } } });
+        if (!stage || !canAccess(ctx, stage.pipeline.empresaId)) throw new Error("Stage não pertence à sua empresa"); }
       return prisma.crmStage.update({ where: { id }, data });
+    }),
+
+  reorderStages: authProc
+    .input(z.object({
+      pipelineId: z.string(),
+      stageIds: z.array(z.string()),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      { const p = await prisma.crmPipeline.findUnique({ where: { id: input.pipelineId }, select: { empresaId: true } });
+        if (!p || !canAccess(ctx, p.empresaId)) throw new Error("Pipeline não pertence à sua empresa"); }
+      await Promise.all(
+        input.stageIds.map((id, idx) => prisma.crmStage.update({ where: { id }, data: { ordem: idx } }))
+      );
+      return { ok: true };
     }),
 
   deleteStage: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const { id } = input;
+      { const stage = await prisma.crmStage.findUnique({ where: { id }, include: { pipeline: { select: { empresaId: true } } } });
+        if (!stage || !canAccess(ctx, stage.pipeline.empresaId)) throw new Error("Stage não pertence à sua empresa"); }
       return prisma.crmStage.update({ where: { id: input.id }, data: { ativo: false } });
     }),
 
@@ -191,8 +232,8 @@ export const crmRouter = router({
 
   getDeal: authProc
     .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
-      return prisma.crmDeal.findUniqueOrThrow({
+    .query(async ({ input, ctx }) => {
+      const deal = await prisma.crmDeal.findUniqueOrThrow({
         where: { id: input.id },
         include: {
           contato: true,
@@ -208,6 +249,8 @@ export const crmRouter = router({
           },
         },
       });
+      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
+      return deal;
     }),
 
   createDeal: authProc
@@ -228,18 +271,19 @@ export const crmRouter = router({
         cidade: z.string().optional(),
       }).optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { contato, valor, ...rest } = input;
 
       let contatoId: string | undefined;
       if (contato) {
-        const created = await prisma.crmContato.create({ data: contato });
+        const created = await prisma.crmContato.create({ data: { ...contato, empresaId: ctx.empresaId ?? undefined } });
         contatoId = created.id;
       }
 
       const deal = await prisma.crmDeal.create({
         data: {
           ...rest,
+          empresaId: ctx.empresaId ?? undefined,
           valor: valor != null ? valor : undefined,
           contatoId,
         },
@@ -269,8 +313,10 @@ export const crmRouter = router({
       valorCondenacao: z.number().nullable().optional(),
       valorAcordo: z.number().nullable().optional(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, proximoPrazo, valor, valorEstimado, valorCausaAjuizada, valorCondenacao, valorAcordo, ...rest } = input;
+      { const d = await prisma.crmDeal.findUnique({ where: { id }, select: { empresaId: true } });
+        if (!d || !canAccess(ctx, d.empresaId)) throw new Error("Deal não pertence à sua empresa"); }
       return prisma.crmDeal.update({
         where: { id },
         data: {
@@ -288,8 +334,9 @@ export const crmRouter = router({
 
   moveDeal: authProc
     .input(z.object({ dealId: z.string(), stageId: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const deal = await prisma.crmDeal.findUniqueOrThrow({ where: { id: input.dealId } });
+      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
 
       await prisma.crmDealStageLog.create({
         data: {
@@ -308,9 +355,10 @@ export const crmRouter = router({
 
   deleteDeal: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const deal = await prisma.crmDeal.findUnique({ where: { id: input.id } });
       if (!deal) throw new Error("Deal não encontrado");
+      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
 
       // Limpar tudo relacionado ao deal
       await prisma.crmMensagemWhatsapp.deleteMany({ where: { dealId: input.id } });
@@ -336,7 +384,9 @@ export const crmRouter = router({
 
   addNota: authProc
     .input(z.object({ dealId: z.string(), conteudo: z.string().min(1) }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      { const d = await prisma.crmDeal.findUnique({ where: { id: input.dealId }, select: { empresaId: true } });
+        if (!d || !canAccess(ctx, d.empresaId)) throw new Error("Deal não pertence à sua empresa"); }
       return prisma.crmNota.create({ data: input });
     }),
 
@@ -344,10 +394,11 @@ export const crmRouter = router({
 
   searchContatos: authProc
     .input(z.object({ q: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       if (input.q.length < 2) return [];
       return prisma.crmContato.findMany({
         where: {
+          ...whereEmpresa(ctx),
           OR: [
             { nome: { contains: input.q, mode: "insensitive" } },
             { whatsapp: { contains: input.q } },
@@ -359,15 +410,55 @@ export const crmRouter = router({
       });
     }),
 
+  // ── Tags ─────────────────────────────────────────────────────────────────
+
+  listTags: authProc.query(async ({ ctx }) => {
+    return (prisma as any).crmTag.findMany({
+      where: whereEmpresa(ctx),
+      orderBy: { nome: "asc" },
+    });
+  }),
+
+  createTag: authProc
+    .input(z.object({ nome: z.string().min(1), cor: z.string().default("#6366f1") }))
+    .mutation(async ({ input, ctx }) => {
+      return (prisma as any).crmTag.create({
+        data: { ...input, empresaId: ctx.empresaId ?? undefined },
+      });
+    }),
+
+  updateTag: authProc
+    .input(z.object({ id: z.string(), nome: z.string().optional(), cor: z.string().optional() }))
+    .mutation(async ({ input }) => {
+      const { id, ...data } = input;
+      return (prisma as any).crmTag.update({ where: { id }, data });
+    }),
+
+  deleteTag: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      return (prisma as any).crmTag.delete({ where: { id: input.id } });
+    }),
+
+  setDealTags: authProc
+    .input(z.object({ dealId: z.string(), tagIds: z.array(z.string()) }))
+    .mutation(async ({ input }) => {
+      return (prisma as any).crmDeal.update({
+        where: { id: input.dealId },
+        data: { tags: { set: input.tagIds.map((id: string) => ({ id })) } },
+        select: { id: true, tags: { select: { id: true, nome: true, cor: true } } },
+      });
+    }),
+
   // ── Seed carreteiros ───────────────────────────────────────────────────────
 
-  seedCarreteiros: authProc.mutation(async () => {
+  seedCarreteiros: authProc.mutation(async ({ ctx }) => {
     const existing = await prisma.crmPipeline.count();
     if (existing > 0) return { skipped: true, message: "Pipelines já existem." };
 
     for (const seed of [SEED_COMERCIAL, SEED_PROCESSUAL]) {
       const pipeline = await prisma.crmPipeline.create({
-        data: { nome: seed.nome, tipo: seed.tipo, cor: seed.cor, ordem: seed === SEED_COMERCIAL ? 0 : 1 },
+        data: { nome: seed.nome, tipo: seed.tipo, cor: seed.cor, empresaId: ctx.empresaId ?? undefined, ordem: seed === SEED_COMERCIAL ? 0 : 1 },
       });
       for (const s of seed.stages) {
         await prisma.crmStage.create({

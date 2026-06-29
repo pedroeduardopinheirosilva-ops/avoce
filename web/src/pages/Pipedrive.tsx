@@ -10,6 +10,8 @@ export default function Pipedrive() {
   const [log, setLog] = useState<string[]>([]);
   const [overwrite, setOverwrite] = useState(false);
   const [importarPerdidos, setImportarPerdidos] = useState(false);
+  const [importarHistoricoEtapas, setImportarHistoricoEtapas] = useState(false);
+  const [forceFull, setForceFull] = useState(false);
 
   // Bot RAP
   const [botOverwrite, setBotOverwrite] = useState(false);
@@ -64,7 +66,7 @@ export default function Pipedrive() {
   async function handleImport() {
     setImporting(true);
     setLog([]);
-    importarMutation.mutate({ overwrite, importarPerdidos });
+    importarMutation.mutate({ overwrite, importarPerdidos, importarHistoricoEtapas, forceFull });
   }
 
   const botMutation = trpc.reengajamento.importarBot.useMutation({
@@ -132,9 +134,14 @@ export default function Pipedrive() {
         )}
 
         {conexao && (
-          <p className={`text-sm ${conexao.ok ? "text-green-700" : "text-red-600"}`}>
-            {conexao.ok ? `✓ Conectado — empresa: ${conexao.companyDomain}` : `✗ ${conexao.error}`}
-          </p>
+          <div className="space-y-1">
+            <p className={`text-sm ${conexao.ok ? "text-green-700" : "text-red-600"}`}>
+              {conexao.ok ? `✓ Conectado — empresa: ${conexao.companyDomain}` : `✗ ${conexao.error}`}
+            </p>
+            {conexao.ok && conexao.rateLimitInfo && (
+              <p className="text-xs text-gray-400">{conexao.rateLimitInfo}</p>
+            )}
+          </div>
         )}
 
         <div className="flex gap-2">
@@ -192,7 +199,18 @@ export default function Pipedrive() {
       {/* Import options */}
       {config?.hasToken && (
         <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-4">
-          <h2 className="font-semibold text-gray-800">Opções</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-gray-800">Opções</h2>
+            {config.lastSync && !forceFull && (
+              <span className="text-xs text-gray-500 bg-gray-100 rounded px-2 py-1">
+                Incremental desde{" "}
+                {new Date(config.lastSync).toLocaleString("pt-BR", {
+                  day: "2-digit", month: "2-digit", year: "numeric",
+                  hour: "2-digit", minute: "2-digit",
+                })}
+              </span>
+            )}
+          </div>
 
           <label className="flex items-center gap-2 cursor-pointer">
             <input
@@ -214,12 +232,44 @@ export default function Pipedrive() {
             <span className="text-sm text-gray-700">Importar deals perdidos</span>
           </label>
 
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={importarHistoricoEtapas}
+              onChange={(e) => setImportarHistoricoEtapas(e.target.checked)}
+              className="rounded"
+            />
+            <span className="text-sm text-gray-700">
+              Importar histórico de etapas{" "}
+              <span className="text-xs text-amber-600">(mais lento — 1 requisição por deal)</span>
+            </span>
+          </label>
+
+          {config.lastSync && (
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={forceFull}
+                onChange={(e) => setForceFull(e.target.checked)}
+                className="rounded"
+              />
+              <span className="text-sm text-gray-700">
+                Forçar importação completa{" "}
+                <span className="text-xs text-amber-600">(ignora data do último sync — consome mais quota da API)</span>
+              </span>
+            </label>
+          )}
+
           <button
             onClick={handleImport}
             disabled={importing || importarMutation.isPending}
             className="w-full py-2.5 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
           >
-            {importing ? "Importando..." : "Executar importação"}
+            {importing
+              ? "Importando..."
+              : config.lastSync && !forceFull
+              ? "Importar novos registros"
+              : "Executar importação completa"}
           </button>
 
           {log.length > 0 && (

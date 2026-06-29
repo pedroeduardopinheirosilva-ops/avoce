@@ -1,9 +1,27 @@
 import { describe, it, expect, vi } from "vitest";
-import { detectPhase } from "./assistente-agents.js";
 
-vi.mock("./persona-router.js", () => ({
-  getNextDeterministicQuestion: vi.fn().mockResolvedValue(null),
+// runAssistenteAgent agora também usa parseTempToMeses e getMaisEmpregosAnteriorQuestion
+// do persona-router — partial mock mantém o parser real e mocka só as funções com I/O.
+vi.mock("./persona-router.js", async (importOriginal) => {
+  const actual = await importOriginal() as any;
+  return {
+    ...actual,
+    getNextDeterministicQuestion: vi.fn().mockResolvedValue(null),
+    getMaisEmpregosAnteriorQuestion: vi.fn().mockResolvedValue("Você trabalhou em outra empresa antes?"),
+  };
+});
+
+// runAssistenteAgent consulta o DB (getPersonaNomeExibicao, getMesesMinimoProjeto, iaGateSdr) —
+// mock determinístico para não depender do banco local.
+vi.mock("../db.js", () => ({
+  prisma: {
+    iaPersona: { findFirst: vi.fn().mockResolvedValue({ nomeExibicao: "Dra. Daniela" }) },
+    iaGateSdr: { findMany: vi.fn().mockResolvedValue([]), findFirst: vi.fn().mockResolvedValue(null) },
+    iaEmpresaBloqueada: { findMany: vi.fn().mockResolvedValue([]) },
+  },
 }));
+
+import { detectPhase } from "./assistente-agents.js";
 
 describe("detectPhase", () => {
   it("returns 'inicial' when no vinculos", () => {
@@ -29,8 +47,21 @@ describe("detectPhase", () => {
   });
 
   it("vinculosOk overrides vinculos content", () => {
-    const vinculos = [{ ordem: 1 }, { ordem: 2 }];
+    const compOk = { salario_holerite: "3000", jornada_inicio: "06:00", jornada_fim: "18:00", fgts_ok: "sim" };
+    const vinculos = [{ ordem: 1, ...compOk }, { ordem: 2, ...compOk }];
     expect(detectPhase({ _mais_empregos_confirmado: true }, vinculos, true)).toBe("resumo");
+  });
+
+  it("vinculosOk with only vinculos[0] missing comp → resumo (Daniela handles it)", () => {
+    const vinculos = [{ ordem: 1 }]; // vinculos[0] without comp — Daniela covers it
+    expect(detectPhase({}, vinculos, true)).toBe("resumo");
+  });
+
+  it("vinculosOk with vinculos[1] missing comp → resumo (fase comp_vinculos foi removida)", () => {
+    // A fase "comp_vinculos" não existe mais: vinculosOk=true sempre leva a "resumo".
+    // Os campos complementares (salário/jornada) migraram para o fluxo da Daniela.
+    const vinculos = [{ ordem: 1 }, { ordem: 2 }]; // vinculos[1] without comp
+    expect(detectPhase({}, vinculos, true)).toBe("resumo");
   });
 });
 
@@ -60,7 +91,8 @@ describe("runAssistenteAgent context shape", () => {
       projetoId: "proj-1",
       merged: {}, // _vinculos_ok NOT in merged (simulates DB lag)
       vinculos: [{ ordem: 1, empresa: "TransABC", funcao: "Motorista", vinculo: "CLT",
-        saida: "demitido", tempo: "2 anos", horas_extras: "sim", pagamento_fora: "nao", injustica: "nao" }],
+        saida: "demitido", tempo: "2 anos", horas_extras: "sim", pagamento_fora: "nao", injustica: "nao",
+        salario_holerite: "3000", jornada_inicio: "06:00", jornada_fim: "18:00", fgts_ok: "sim" }],
       vinculosOk: true, // in-memory state from processVinculos
       vinculosTodosPrescritos: false,
       empresasBloqueadas: [],

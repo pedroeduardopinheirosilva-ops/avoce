@@ -1,5 +1,6 @@
 import { z }                     from "zod";
 import { router, authProc }      from "../../routers/trpc.js";
+import { assertEmitenteAccess } from "../../routers/tenant-utils.js";
 import { bankAccountService }    from "./services/bank-account.service.js";
 import { credentialsService }    from "./services/credentials.service.js";
 import { statementService }      from "./services/statement.service.js";
@@ -24,15 +25,24 @@ const accountsRouter = router({
       isDefault:         z.boolean().optional(),
       externalAccountId: z.string().max(100).optional(),
     }))
-    .mutation(({ input }) => bankAccountService.create(input)),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.create(input);
+    }),
 
   list: authProc
     .input(z.object({ emitenteId: z.string() }))
-    .query(({ input }) => bankAccountService.findAll(input.emitenteId)),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.findAll(input.emitenteId);
+    }),
 
   get: authProc
     .input(z.object({ emitenteId: z.string(), id: z.string() }))
-    .query(({ input }) => bankAccountService.findById(input.emitenteId, input.id)),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.findById(input.emitenteId, input.id);
+    }),
 
   update: authProc
     .input(z.object({
@@ -45,22 +55,32 @@ const accountsRouter = router({
       externalAccountId:  z.string().optional(),
       accountType:        z.string().optional(),
     }))
-    .mutation(({ input }) => {
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
       const { emitenteId, id, ...data } = input;
       return bankAccountService.update(emitenteId, id, data);
     }),
 
   deactivate: authProc
     .input(z.object({ emitenteId: z.string(), id: z.string() }))
-    .mutation(({ input }) => bankAccountService.deactivate(input.emitenteId, input.id)),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.deactivate(input.emitenteId, input.id);
+    }),
 
   setDefault: authProc
     .input(z.object({ emitenteId: z.string(), id: z.string() }))
-    .mutation(({ input }) => bankAccountService.setDefault(input.emitenteId, input.id)),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.setDefault(input.emitenteId, input.id);
+    }),
 
   summary: authProc
     .input(z.object({ emitenteId: z.string() }))
-    .query(({ input }) => bankAccountService.getSummary(input.emitenteId)),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return bankAccountService.getSummary(input.emitenteId);
+    }),
 
   metadata: authProc
     .query(() => BANK_METADATA),
@@ -82,14 +102,20 @@ const credentialsRouter = router({
       clientSecret:   z.string().optional(),
       expiresAt:      z.string().datetime().optional(),
     }))
-    .mutation(({ input }) => credentialsService.save({
-      ...input,
-      expiresAt: input.expiresAt ? new Date(input.expiresAt) : undefined,
-    })),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return credentialsService.save({
+        ...input,
+        expiresAt: input.expiresAt ? new Date(input.expiresAt) : undefined,
+      });
+    }),
 
   getMeta: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string() }))
-    .query(({ input }) => credentialsService.getMeta(input.emitenteId, input.bankAccountId)),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return credentialsService.getMeta(input.emitenteId, input.bankAccountId);
+    }),
 
   testConnection: authProc
     .input(z.object({
@@ -97,17 +123,24 @@ const credentialsRouter = router({
       bankAccountId: z.string(),
       provider:      z.enum(["SICOOB", "BRADESCO", "INTER", "BTG"]),
     }))
-    .mutation(({ input }) =>
-      credentialsService.testConnection(input.emitenteId, input.bankAccountId, input.provider)
-    ),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return credentialsService.testConnection(input.emitenteId, input.bankAccountId, input.provider);
+    }),
 
   getExpiring: authProc
     .input(z.object({ emitenteId: z.string(), daysAhead: z.number().int().min(1).max(90).default(30) }))
-    .query(({ input }) => credentialsService.getExpiring(input.emitenteId, input.daysAhead)),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return credentialsService.getExpiring(input.emitenteId, input.daysAhead);
+    }),
 
   remove: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string() }))
-    .mutation(({ input }) => credentialsService.remove(input.emitenteId, input.bankAccountId)),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return credentialsService.remove(input.emitenteId, input.bankAccountId);
+    }),
 });
 
 // ── Statements sub-router ─────────────────────────────────────────────────────
@@ -120,15 +153,16 @@ const statementsRouter = router({
       startDate:     z.string().datetime(),
       endDate:       z.string().datetime(),
     }))
-    .mutation(({ input, ctx }) =>
-      statementService.syncAccount({
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.syncAccount({
         emitenteId:    input.emitenteId,
         bankAccountId: input.bankAccountId,
         startDate:     new Date(input.startDate),
         endDate:       new Date(input.endDate),
         triggeredBy:   (ctx as { userId?: string }).userId ?? "api",
-      })
-    ),
+      });
+    }),
 
   list: authProc
     .input(z.object({
@@ -140,13 +174,14 @@ const statementsRouter = router({
       skip:                   z.number().int().min(0).default(0),
       take:                   z.number().int().min(1).max(200).default(50),
     }))
-    .query(({ input }) =>
-      statementService.getStatements({
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.getStatements({
         ...input,
         startDate: input.startDate ? new Date(input.startDate) : undefined,
         endDate:   input.endDate   ? new Date(input.endDate)   : undefined,
-      })
-    ),
+      });
+    }),
 
   unified: authProc
     .input(z.object({
@@ -155,14 +190,15 @@ const statementsRouter = router({
       startDate:     z.string().datetime(),
       endDate:       z.string().datetime(),
     }))
-    .query(({ input }) =>
-      statementService.getUnified(
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.getUnified(
         input.emitenteId,
         input.bankAccountId,
         new Date(input.startDate),
         new Date(input.endDate)
-      )
-    ),
+      );
+    }),
 
   createManual: authProc
     .input(z.object({
@@ -180,14 +216,15 @@ const statementsRouter = router({
       attachmentUrl:        z.string().optional(),
       attachmentName:       z.string().optional(),
     }))
-    .mutation(({ input, ctx }) =>
-      statementService.createManual({
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.createManual({
         ...input,
         entryDate: new Date(input.entryDate),
         valueDate: input.valueDate ? new Date(input.valueDate) : undefined,
         createdByUserId: (ctx as { userId?: string }).userId,
-      })
-    ),
+      });
+    }),
 
   updateManual: authProc
     .input(z.object({
@@ -199,13 +236,17 @@ const statementsRouter = router({
       attachmentName: z.string().optional(),
     }))
     .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
       const { emitenteId, id, ...data } = input;
       return statementService.updateManual(emitenteId, id, data, (ctx as { userId?: string }).userId);
     }),
 
   deleteManual: authProc
     .input(z.object({ emitenteId: z.string(), id: z.string() }))
-    .mutation(({ input }) => statementService.deleteManual(input.emitenteId, input.id)),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.deleteManual(input.emitenteId, input.id);
+    }),
 
   syncLogs: authProc
     .input(z.object({
@@ -213,9 +254,10 @@ const statementsRouter = router({
       bankAccountId: z.string().optional(),
       limit:         z.number().int().min(1).max(100).default(20),
     }))
-    .query(({ input }) =>
-      statementService.getSyncLogs(input.emitenteId, input.bankAccountId, input.limit)
-    ),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return statementService.getSyncLogs(input.emitenteId, input.bankAccountId, input.limit);
+    }),
 });
 
 // ── Reconciliation sub-router ─────────────────────────────────────────────────
@@ -223,9 +265,10 @@ const statementsRouter = router({
 const reconciliationRouter = router({
   run: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string() }))
-    .mutation(({ input }) =>
-      reconciliationService.reconcileAccount(input.emitenteId, input.bankAccountId)
-    ),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.reconcileAccount(input.emitenteId, input.bankAccountId);
+    }),
 
   applyMatch: authProc
     .input(z.object({
@@ -233,44 +276,50 @@ const reconciliationRouter = router({
       statementId: z.string(),
       cobrancaId:  z.string(),
     }))
-    .mutation(({ input, ctx }) =>
-      reconciliationService.applyMatch(
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.applyMatch(
         input.statementId,
         input.cobrancaId,
         "MANUAL",
         (ctx as { userId?: string }).userId ?? "manual"
-      )
-    ),
+      );
+    }),
 
   unmatch: authProc
     .input(z.object({ emitenteId: z.string(), statementId: z.string() }))
-    .mutation(({ input }) =>
-      reconciliationService.unmatch(input.emitenteId, input.statementId)
-    ),
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.unmatch(input.emitenteId, input.statementId);
+    }),
 
   suggestions: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string() }))
-    .query(({ input }) =>
-      reconciliationService.getSuggestions(input.emitenteId, input.bankAccountId)
-    ),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.getSuggestions(input.emitenteId, input.bankAccountId);
+    }),
 
   unmatched: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string().optional() }))
-    .query(({ input }) =>
-      reconciliationService.getUnmatched(input.emitenteId, input.bankAccountId)
-    ),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.getUnmatched(input.emitenteId, input.bankAccountId);
+    }),
 
   stats: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string().optional() }))
-    .query(({ input }) =>
-      reconciliationService.getStats(input.emitenteId, input.bankAccountId)
-    ),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.getStats(input.emitenteId, input.bankAccountId);
+    }),
 
   cobrancasSemExtrato: authProc
     .input(z.object({ emitenteId: z.string() }))
-    .query(({ input }) =>
-      reconciliationService.getCobrancasSemExtrato(input.emitenteId)
-    ),
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.getCobrancasSemExtrato(input.emitenteId);
+    }),
 });
 
 // ── Main banking router ───────────────────────────────────────────────────────

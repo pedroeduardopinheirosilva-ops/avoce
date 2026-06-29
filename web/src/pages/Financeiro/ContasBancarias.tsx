@@ -129,9 +129,9 @@ export default function ContasBancarias() {
   }
 
   return (
-    <div className="p-8">
+    <div className="p-4 md:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Contas Bancárias</h1>
           <p className="text-sm text-gray-500 mt-1">Gerencie suas contas e sincronize extratos.</p>

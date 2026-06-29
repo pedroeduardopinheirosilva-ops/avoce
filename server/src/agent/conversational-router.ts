@@ -12,6 +12,7 @@
 
 import type { VinculoEmprego } from "./qualification.js";
 import { getNextDeterministicQuestion } from "./persona-router.js";
+import { getPersonaNomeExibicao } from "./transition-engine.js";
 
 export type ConversationalResult = {
   systemSuffix: string;
@@ -33,14 +34,17 @@ export async function getConversationalSystemInstructions(
     projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount,
   );
 
-  if (!nextQ) return {
-    systemSuffix:
-      `⚠️ ENCERRAMENTO — Você coletou todas as informações. Sua próxima mensagem deve:\n` +
-      `1. Agradecer brevemente pelo tempo\n` +
-      `2. Informar que a Dra. Daniela Pires vai entrar em contato em instantes para dar o parecer jurídico do caso\n` +
-      `MÁXIMO 2 frases. Não prometa ligação, não peça horário. Exemplo: "Ótimo! Registrei tudo aqui. A Dra. Daniela Pires vai te chamar agora mesmo com o parecer do seu caso."`,
-    isDone: true,
-  };
+  if (!nextQ) {
+    const advNome = await getPersonaNomeExibicao(projetoId, "advogado");
+    return {
+      systemSuffix:
+        `⚠️ ENCERRAMENTO — Você coletou todas as informações. Sua próxima mensagem deve:\n` +
+        `1. Agradecer brevemente pelo tempo\n` +
+        `2. Informar que ${advNome} vai entrar em contato em instantes para dar o parecer jurídico do caso\n` +
+        `MÁXIMO 2 frases. Não prometa ligação, não peça horário. Exemplo: "Ótimo! Registrei tudo aqui. ${advNome} vai te chamar agora mesmo com o parecer do seu caso."`,
+      isDone: true,
+    };
+  }
 
   const lastV = vinculos.length > 0 ? vinculos[vinculos.length - 1] : null;
   const norm = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "");

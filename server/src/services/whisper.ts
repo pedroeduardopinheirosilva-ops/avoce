@@ -21,7 +21,8 @@ export async function transcribeAudio(
   mimetype: string,
   apiKey: string,
   model: string,
-  provider: "groq" | "openai" = "groq"
+  provider: "groq" | "openai" = "groq",
+  prompt?: string,
 ): Promise<TranscribeResult> {
   if (!apiKey) return { ok: false, error: "audio_api_key não configurada" };
 
@@ -30,7 +31,6 @@ export async function transcribeAudio(
       ? "https://api.openai.com/v1/audio/transcriptions"
       : "https://api.groq.com/openai/v1/audio/transcriptions";
 
-  // Determinar extensão a partir do mimetype
   const ext = mimetypeToExt(mimetype);
 
   const form = new FormData();
@@ -38,6 +38,7 @@ export async function transcribeAudio(
   form.append("model", model);
   form.append("language", "pt");
   form.append("response_format", "text");
+  if (prompt) form.append("prompt", prompt);
 
   try {
     const res = await fetch(endpoint, {

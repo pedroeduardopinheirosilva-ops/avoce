@@ -290,6 +290,11 @@ type Persona = {
   ordem: number;
   ttsVoiceId: string | null;
   llmProviderChave: string | null;
+  midiaApresentacaoPath: string | null;
+  midiaApresentacaoTipo: string | null;
+  proximaPersonaChave: string | null;
+  usarAudio: boolean;
+  farewellTexto: string | null;
 };
 
 const CATEGORIA_LABELS: Record<string, string> = {
@@ -300,6 +305,7 @@ const CATEGORIA_LABELS: Record<string, string> = {
   ocr: "OCR (Documentos e Imagens)",
   comportamento: "Comportamento",
   pakt: "PAKT (Assinatura)",
+  coleta_docs: "Coleta de Documentos",
 };
 
 function WhatsappPanel({ projetoId }: { projetoId: string }) {
@@ -309,11 +315,11 @@ function WhatsappPanel({ projetoId }: { projetoId: string }) {
 
   const status = trpc.ia.whatsappStatus.useQuery(
     { projetoId },
-    { refetchInterval: showQr ? 5000 : 15000 }
+    { refetchInterval: showQr ? 4000 : 15000, refetchIntervalInBackground: true }
   );
   const qr = trpc.ia.whatsappQr.useQuery(
     { projetoId },
-    { enabled: showQr, refetchInterval: 20000 }
+    { enabled: showQr, refetchInterval: 12000, refetchIntervalInBackground: true, staleTime: 0, gcTime: 0 }
   );
   const desconectar = trpc.ia.whatsappDesconectar.useMutation({
     onSuccess: () => { status.refetch(); setShowQr(false); },
@@ -378,12 +384,19 @@ function WhatsappPanel({ projetoId }: { projetoId: string }) {
           {qr.data?.qrcode && (
             <>
               <img
+                key={qr.dataUpdatedAt}
                 src={qr.data.qrcode}
                 alt="QR Code WhatsApp"
                 className="w-56 h-56 border rounded-xl shadow"
               />
               <p className="text-xs text-gray-500">Abra o WhatsApp → Dispositivos vinculados → Vincular dispositivo</p>
-              <p className="text-xs text-gray-400">O QR atualiza automaticamente a cada 20s</p>
+              <button
+                onClick={() => qr.refetch()}
+                className="text-xs px-3 py-1 bg-gray-100 rounded-lg hover:bg-gray-200"
+              >
+                ↻ Atualizar QR agora
+              </button>
+              <p className="text-xs text-gray-400">Atualiza sozinho a cada 12s. Se falhar, toque em Atualizar e escaneie na hora.</p>
             </>
           )}
         </div>
@@ -411,6 +424,7 @@ type Regra = {
   stageDestinoChave: string;
   condicao: string;
   acaoAdicional: string | null;
+  parametros: Record<string, unknown> | null;
   ordem: number;
   requerPrescricaoAtiva: boolean;
 };
@@ -423,12 +437,15 @@ const BLANK_PERGUNTA = (): Partial<Pergunta> => ({
 
 const BLANK_REGRA = (): Partial<Regra> => ({
   stageOrigemChave: "", stageDestinoChave: "", condicao: "", acaoAdicional: "",
-  ordem: 0, requerPrescricaoAtiva: false,
+  parametros: null, ordem: 0, requerPrescricaoAtiva: false,
 });
 
 export default function ConfigIAPage() {
   const [projetoId, setProjetoId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo">("configs");
+  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo" | "followup" | "desqualificacao">("configs");
+  const [followUpExpanded, setFollowUpExpanded] = useState(false);
+  const [followUpMsgExpanded, setFollowUpMsgExpanded] = useState(false);
+  const [stageFollowExpanded, setStageFollowExpanded] = useState<Record<string, boolean>>({});
   const [editando, setEditando] = useState<Record<string, string>>({});
   const [editPersona, setEditPersona] = useState<Persona | null>(null);
   const [editNotif, setEditNotif] = useState<Partial<Notificacao> | null>(null);
@@ -436,6 +453,8 @@ export default function ConfigIAPage() {
   const [editPergunta, setEditPergunta] = useState<Partial<Pergunta> | null>(null);
   const [editRegra, setEditRegra] = useState<Partial<Regra> | null>(null);
   const [palavrasLigacaoEdit, setPalavrasLigacaoEdit] = useState<string | null>(null);
+  const [lembretesEdit, setLembretesEdit] = useState<{ horas: number; texto: string }[] | null>(null);
+  const [midiaUploading, setMidiaUploading] = useState<string | null>(null); // personaId being uploaded
 
   const projetos = trpc.ia.listProjetos.useQuery();
   const configs = trpc.ia.listConfigs.useQuery(
@@ -470,6 +489,7 @@ export default function ConfigIAPage() {
   );
 
 
+
   const empresas = trpc.empresa.listar.useQuery(undefined, { enabled: tab === "proposta" });
   const seedPropostaConfigs = trpc.ia.seedPropostaConfigs.useMutation({ onSuccess: () => configs.refetch() });
 
@@ -497,13 +517,45 @@ export default function ConfigIAPage() {
       setEditPersona(null);
     },
   });
+  const clearPersonaMidia = trpc.ia.clearPersonaMidia.useMutation({
+    onSuccess: () => personas.refetch(),
+  });
+
+  async function uploadPersonaMidia(personaId: string, file: File) {
+    setMidiaUploading(personaId);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const token = localStorage.getItem("avoce_token");
+      const res = await fetch(`/api/ia-persona-midia/${personaId}`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      if (!res.ok) throw new Error(await res.text());
+      personas.refetch();
+    } catch (e) {
+      alert("Erro ao enviar mídia: " + (e instanceof Error ? e.message : e));
+    } finally {
+      setMidiaUploading(null);
+    }
+  }
   const seedCarreteiros = trpc.ia.seedCarreteiros.useMutation({
     onSuccess: (data) => {
       setProjetoId(data.projetoId);
       projetos.refetch();
     },
   });
+  const seedCarreteiro3 = trpc.ia.seedCarreteiro3.useMutation({
+    onSuccess: (data) => {
+      setProjetoId(data.projetoId);
+      projetos.refetch();
+    },
+  });
   const seedAudio = trpc.ia.seedAudioConfigs.useMutation({
+    onSuccess: () => configs.refetch(),
+  });
+  const seedTts = trpc.ia.seedTtsConfigs.useMutation({
     onSuccess: () => configs.refetch(),
   });
   const upsertNotif = trpc.ia.upsertNotificacao.useMutation({
@@ -524,6 +576,37 @@ export default function ConfigIAPage() {
   const deleteRegra = trpc.ia.deleteRegra.useMutation({
     onSuccess: () => regras.refetch(),
   });
+
+  // Follow-up PAKT
+  const followUpConfigs = trpc.ia.getFollowUpConfigs.useQuery(
+    { projetoId: projetoId ?? "" },
+    { enabled: !!projetoId && tab === "followup" }
+  );
+  const saveFollowUpConfig = trpc.ia.saveFollowUpConfig.useMutation({
+    onSuccess: () => followUpConfigs.refetch(),
+  });
+
+  // Stage follow-up (per-persona)
+  const STAGE_FOLLOWUP_DEFS = [
+    { stageChave: "lead_carreteiro",          label: "Ana SDR — Qualificação",      persona: "assistente", cor: "blue",   desc: "Lead para de responder durante a qualificação" },
+    { stageChave: "lead_qualificado",         label: "Dra. Daniela — Fechamento",   persona: "advogado",   cor: "purple", desc: "Lead qualificado não agenda/avança para contrato" },
+    { stageChave: "aguardando_reuniao",       label: "Lembrete de Reunião",          persona: "advogado",   cor: "green",  desc: "Confirmações e lembretes de reunião agendada" },
+    { stageChave: "aguardando_docs_pessoais", label: "Ana Coleta — Documentos",      persona: "advogado",   cor: "orange", desc: "Lead para de enviar documentos durante a coleta" },
+    { stageChave: "aguardando_assinatura",    label: "Assinatura — Contrato",        persona: "advogado",   cor: "red",    desc: "Contrato enviado mas não assinado (reengajamento)" },
+  ] as const;
+
+  // Load all stage follow-up configs at once when on follow-up tab
+  const stageFollowUpQueries = STAGE_FOLLOWUP_DEFS.map(def =>
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    trpc.ia.getStageFollowUp.useQuery(
+      { projetoId: projetoId ?? "", stageChave: def.stageChave },
+      { enabled: !!projetoId && tab === "followup" }
+    )
+  );
+  const saveStageFollowUp = trpc.ia.saveStageFollowUp.useMutation();
+
+  // Local state for stage follow-up editing
+  const [stageFollowLocal, setStageFollowLocal] = useState<Record<string, { ativo: boolean; mensagens: { delayHoras: number; template: string }[] }>>({});
 
   // Auto-select first projeto
   useEffect(() => {
@@ -574,14 +657,18 @@ export default function ConfigIAPage() {
       ordem: editPersona.ordem,
       ttsVoiceId: editPersona.ttsVoiceId || undefined,
       llmProviderChave: editPersona.llmProviderChave || null,
+      proximaPersonaChave: editPersona.proximaPersonaChave || null,
+      usarAudio: editPersona.usarAudio ?? false,
+      farewellTexto: editPersona.farewellTexto || null,
     });
   }
 
-  // Group configs by category — exclude "llm" (managed by the new LLM providers card)
+  // Group configs by category — exclude managed categories that have dedicated UI sections
+  const EXCLUDED_CATS = new Set(["llm", "tts", "proposta", "follow_up", "reuniao", "coleta_docs", "integracao"]);
   const configsByCategory: Record<string, Config[]> = {};
   for (const c of (configs.data as unknown as Config[]) ?? []) {
     const cat = c.categoria ?? "outros";
-    if (cat === "llm") continue;
+    if (EXCLUDED_CATS.has(cat)) continue;
     if (!configsByCategory[cat]) configsByCategory[cat] = [];
     configsByCategory[cat].push(c);
   }
@@ -639,6 +726,8 @@ export default function ConfigIAPage() {
               ["transicoes", "Transições"],
               ["notificacoes", "Notificações"],
               ["proposta", "Proposta"],
+              ["followup", "Follow-up"],
+              ["desqualificacao", "🚫 Desqualificação"],
             ] as const).map(([t, label]) => (
               <button
                 key={t}
@@ -736,88 +825,326 @@ export default function ConfigIAPage() {
               {/* LLM Provedores — inside Configs tab */}
               {projetoId && <LlmProvedoresCard projetoId={projetoId} />}
 
-              {/* Modo de Coleta — A/B */}
-              {(() => {
-                const cfgModo = (configs.data as unknown as Config[] | undefined)?.find(
-                  (c) => c.categoria === "comportamento" && c.chave === "modo_coleta"
-                );
-                const modoAtual = cfgModo?.valor ?? "sequencial";
-                return (
-                  <div className="bg-white border rounded-xl p-5">
-                    <div className="mb-4">
-                      <h3 className="font-semibold text-gray-800 text-sm">Modo de Coleta — A/B</h3>
-                      <p className="text-xs text-gray-500 mt-1">
-                        Define como a Ana coleta informações do lead. O modo <strong>conversacional</strong> é experimental —
-                        teste com leads reais antes de ativar em produção.
-                      </p>
-                    </div>
-                    <div className="flex gap-3">
-                      {([
-                        {
-                          valor: "sequencial",
-                          label: "Sequencial",
-                          badge: "padrão",
-                          badgeColor: "bg-gray-100 text-gray-600",
-                          desc: "Uma pergunta por vez. Resposta sempre exata do fluxo configurado.",
-                          pros: ["Previsível", "Sem surpresas", "Testado em produção"],
-                        },
-                        {
-                          valor: "conversacional",
-                          label: "Conversacional",
-                          badge: "novo",
-                          badgeColor: "bg-amber-100 text-amber-700",
-                          desc: "IA combina campos relacionados numa pergunta fluída. Ex: empresa + função + CLT numa só mensagem.",
-                          pros: ["Menos turnos", "Mais natural", "Melhor experiência"],
-                        },
-                      ] as const).map(({ valor, label, badge, badgeColor, desc, pros }) => {
-                        const ativo = modoAtual === valor;
-                        return (
-                          <button
-                            key={valor}
-                            onClick={() => {
-                              if (!projetoId || ativo) return;
-                              upsertConfig.mutate({
-                                projetoId,
-                                chave: "modo_coleta",
-                                valor,
-                                tipo: "texto",
-                                categoria: "comportamento",
-                                descricao: "Modo de coleta: sequencial (uma pergunta) | conversacional (perguntas compostas)",
-                              }, { onSuccess: () => configs.refetch() });
-                            }}
-                            className={`flex-1 rounded-xl border-2 p-5 text-left transition-all ${
-                              ativo
-                                ? "border-indigo-500 bg-indigo-50"
-                                : "border-gray-200 hover:border-gray-300 cursor-pointer"
-                            }`}
-                          >
-                            <div className="flex items-center gap-2 mb-2">
-                              <span className={`text-sm font-semibold ${ativo ? "text-indigo-700" : "text-gray-800"}`}>{label}</span>
-                              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${badgeColor}`}>{badge}</span>
-                              {ativo && <span className="ml-auto text-xs font-medium text-indigo-600 bg-indigo-100 px-2 py-0.5 rounded-full">ativo</span>}
-                            </div>
-                            <p className="text-xs text-gray-600 mb-3">{desc}</p>
-                            <ul className="space-y-1">
-                              {pros.map(p => (
-                                <li key={p} className="text-xs text-gray-500 flex items-center gap-1.5">
-                                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${ativo ? "bg-indigo-400" : "bg-gray-300"}`} />
-                                  {p}
-                                </li>
-                              ))}
-                            </ul>
-                          </button>
-                        );
-                      })}
-                    </div>
-                    {modoAtual === "conversacional" && (
-                      <div className="mt-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">
-                        <strong>Modo experimental ativo.</strong> A extração e as transições de stage continuam normais.
-                        Se perceber comportamento inesperado, troque para Sequencial com um clique.
+              {/* TTS — Voz (ElevenLabs) */}
+              {projetoId && (() => {
+                const cfgData = (configs.data as unknown as Config[] | undefined) ?? [];
+                const ttsApiKey = cfgData.find(c => c.chave === "tts_api_key");
+                const ttsModel  = cfgData.find(c => c.chave === "tts_model");
+                const ttsMoments = cfgData.find(c => c.categoria === "tts" && c.chave === "tts_momentos_audio");
+
+                if (!ttsApiKey) {
+                  return (
+                    <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-medium text-amber-800">TTS (ElevenLabs) não configurado</p>
+                        <p className="text-xs text-amber-600 mt-0.5">Adicione as configurações de voz para enviar áudios via ElevenLabs</p>
                       </div>
-                    )}
+                      <button
+                        onClick={() => seedTts.mutate({ projetoId: projetoId! })}
+                        disabled={seedTts.isPending}
+                        className="text-sm px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:opacity-50 flex-shrink-0 ml-4"
+                      >
+                        {seedTts.isPending ? "Adicionando..." : "+ Configurar TTS"}
+                      </button>
+                    </div>
+                  );
+                }
+
+                const MOMENTOS_DISPONIVEIS = [
+                  { key: "primeira_mensagem",  label: "Primeira mensagem (novo lead)" },
+                  { key: "parecer",            label: "Parecer com valor estimado (Dra. Daniela)" },
+                  { key: "closer_tentativa_1", label: "Closer: lembrete de prescrição" },
+                  { key: "closer_tentativa_2", label: "Closer: segunda tentativa" },
+                ];
+                const momentosAtivos = (ttsMoments?.valor ?? "").split(",").map((m: string) => m.trim()).filter(Boolean);
+                const toggleMomento = (key: string) => {
+                  const atuais = (ttsMoments?.valor ?? "").split(",").map((m: string) => m.trim()).filter(Boolean);
+                  const novos = atuais.includes(key) ? atuais.filter((m: string) => m !== key) : [...atuais, key];
+                  upsertConfig.mutate({ projetoId: projetoId!, chave: "tts_momentos_audio", valor: novos.join(","), tipo: "texto", categoria: "tts", descricao: "Momentos para envio de áudio TTS" }, { onSuccess: () => configs.refetch() });
+                };
+
+                return (
+                  <div className="bg-white border rounded-xl p-5 space-y-5">
+                    <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">TTS — Voz (ElevenLabs)</h3>
+
+                    {/* API Key */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        API Key ElevenLabs
+                        <span className="ml-2 text-xs bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded">secret</span>
+                      </label>
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          value={editando["tts_api_key"] ?? ""}
+                          onChange={(e) => setEditando(prev => ({ ...prev, tts_api_key: e.target.value }))}
+                          onKeyDown={(e) => e.key === "Enter" && saveConfig("tts_api_key")}
+                          placeholder="••••••••"
+                          className="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                        />
+                        <button onClick={() => saveConfig("tts_api_key")} disabled={saving["tts_api_key"]} className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50">
+                          {saving["tts_api_key"] ? "..." : "Salvar"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Modelo */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Modelo TTS</label>
+                      <div className="flex gap-2">
+                        <select
+                          value={editando["tts_model"] ?? ttsModel?.valor ?? "eleven_multilingual_v2"}
+                          onChange={(e) => setEditando(prev => ({ ...prev, tts_model: e.target.value }))}
+                          className="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                        >
+                          <option value="eleven_multilingual_v2">eleven_multilingual_v2 (qualidade, multilíngue)</option>
+                          <option value="eleven_turbo_v2_5">eleven_turbo_v2_5 (rápido, baixa latência)</option>
+                          <option value="eleven_flash_v2_5">eleven_flash_v2_5 (ultra-rápido)</option>
+                        </select>
+                        <button onClick={() => saveConfig("tts_model")} disabled={saving["tts_model"]} className="bg-indigo-600 text-white px-3 py-2 rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50">
+                          {saving["tts_model"] ? "..." : "Salvar"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Momentos de Áudio */}
+                    <div>
+                      <p className="text-sm font-medium text-gray-700 mb-1">Momentos de envio de áudio</p>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Nesses momentos a persona envia um PTT (bolha de voz) em vez de texto. O Voice ID é configurado em cada persona.
+                      </p>
+                      <div className="space-y-2">
+                        {MOMENTOS_DISPONIVEIS.map((m) => (
+                          <label key={m.key} className="flex items-center gap-3 cursor-pointer select-none">
+                            <input type="checkbox" checked={momentosAtivos.includes(m.key)} onChange={() => toggleMomento(m.key)} className="rounded w-4 h-4 accent-indigo-600" />
+                            <span className="text-sm text-gray-700">{m.label}</span>
+                            <code className="text-xs text-gray-400 bg-gray-50 px-1.5 py-0.5 rounded">{m.key}</code>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
                   </div>
                 );
               })()}
+
+              {/* Horário Comercial */}
+              {projetoId && (() => {
+                const cfgIni = (configs.data as unknown as Config[] | undefined)?.find(
+                  (c) => c.categoria === "comportamento" && c.chave === "horario_ini"
+                );
+                const cfgFim = (configs.data as unknown as Config[] | undefined)?.find(
+                  (c) => c.categoria === "comportamento" && c.chave === "horario_fim"
+                );
+                const iniVal = cfgIni?.valor ?? "6";
+                const fimVal = cfgFim?.valor ?? "22";
+                return (
+                  <div className="bg-white border rounded-xl p-5">
+                    <div className="mb-4">
+                      <h3 className="font-semibold text-gray-800 text-sm">Horário Comercial</h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Mensagens proativas do cron (Closer, follow-ups, intro Daniela) só são enviadas dentro deste horário.
+                        Respostas a mensagens recebidas <strong>não são afetadas</strong>.
+                      </p>
+                    </div>
+                    <div className="flex gap-4 items-end">
+                      {([
+                        { chave: "horario_ini", label: "Início (h)", defaultVal: "6", currentVal: iniVal },
+                        { chave: "horario_fim", label: "Fim (h)", defaultVal: "22", currentVal: fimVal },
+                      ] as const).map(({ chave, label, defaultVal, currentVal }) => (
+                        <div key={chave} className="flex-1">
+                          <label className="block text-xs font-medium text-gray-600 mb-1">{label}</label>
+                          <input
+                            type="number"
+                            min={0}
+                            max={23}
+                            defaultValue={currentVal}
+                            onBlur={(e) => {
+                              const v = Math.max(0, Math.min(23, parseInt(e.target.value, 10) || parseInt(defaultVal, 10)));
+                              e.target.value = String(v);
+                              upsertConfig.mutate({
+                                projetoId: projetoId!,
+                                chave,
+                                valor: String(v),
+                                tipo: "numero",
+                                categoria: "comportamento",
+                                descricao: chave === "horario_ini"
+                                  ? "Hora de início do horário comercial (0–23, Brasília)"
+                                  : "Hora de fim do horário comercial (0–23, Brasília)",
+                              }, { onSuccess: () => configs.refetch() });
+                            }}
+                            className="w-full border rounded-lg px-3 py-2 text-sm text-center"
+                          />
+                        </div>
+                      ))}
+                      <div className="flex-1 text-xs text-gray-400 pb-2">
+                        Fuso: <span className="font-mono">America/Sao_Paulo</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+
+              {/* ── Coleta de Documentos (coleta_docs) ────────────────────── */}
+              {projetoId && (() => {
+                const cfgs = (configs.data as unknown as Config[] | undefined) ?? [];
+                const get = (k: string) => cfgs.find(c => c.chave === k)?.valor ?? "";
+                const lerTranscricao   = get("coleta_docs_ler_transcricao")   || "true";
+                const lerPastaDocs     = get("coleta_docs_ler_pasta_docs")     || "true";
+                const docsObrig        = get("coleta_docs_docs_obrigatorios")  || "cnh,comprovante_endereco";
+                const confirmacao      = get("coleta_docs_confirmacao_usuario")|| "true";
+                const docOpcional      = get("coleta_docs_doc_opcional")       || "false";
+                const docRecusaResp    = get("coleta_docs_doc_recusa_resposta")|| "";
+
+                const toggle = (chave: string, valor: string, descricao: string) =>
+                  upsertConfig.mutate({ projetoId: projetoId!, chave, valor, tipo: "booleano", categoria: "coleta_docs", descricao },
+                    { onSuccess: () => configs.refetch() });
+
+                return (
+                  <div className="bg-white border rounded-xl p-5">
+                    <div className="mb-4">
+                      <h3 className="font-semibold text-gray-800 text-sm">Coleta de Documentos (Ana → coleta_docs)</h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Quando o fluxo <code className="bg-gray-100 px-1 rounded">coleta_docs</code> inicia, a Ana lê automaticamente
+                        a transcrição da reunião e a pasta de documentos para pré-preencher os dados do cliente —
+                        apenas campos ainda não coletados são perguntados.
+                      </p>
+                    </div>
+
+                    <div className="space-y-4">
+                      {/* Ler transcrição */}
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input type="checkbox" checked={lerTranscricao === "true"}
+                          onChange={(e) => toggle("coleta_docs_ler_transcricao", e.target.checked ? "true" : "false",
+                            "Ler transcrição da reunião (parcial e finalizada) para pré-preencher dados do cliente")}
+                          className="mt-0.5 h-4 w-4 rounded text-indigo-600" />
+                        <div>
+                          <p className="text-sm font-medium text-gray-700">Ler transcrição da reunião</p>
+                          <p className="text-xs text-gray-500">
+                            Lê transcrições parciais (em andamento) e finalizadas. O closer pode
+                            adicionar notas em tempo real durante a reunião e a Ana já usa esse conteúdo
+                            para pré-preencher nome, CPF, endereço, etc.
+                          </p>
+                        </div>
+                      </label>
+
+                      {/* Ler pasta de documentos */}
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input type="checkbox" checked={lerPastaDocs === "true"}
+                          onChange={(e) => toggle("coleta_docs_ler_pasta_docs", e.target.checked ? "true" : "false",
+                            "Ler pasta de documentos do deal para detectar CNH e comprovante já recebidos")}
+                          className="mt-0.5 h-4 w-4 rounded text-indigo-600" />
+                        <div>
+                          <p className="text-sm font-medium text-gray-700">Ler pasta de documentos</p>
+                          <p className="text-xs text-gray-500">
+                            Detecta CNH, RG e comprovante de endereço já recebidos. Se presentes,
+                            os passos de solicitação desses documentos são pulados automaticamente.
+                            Campos extraídos pelo OCR (nome, CPF, RG) também são aproveitados.
+                          </p>
+                        </div>
+                      </label>
+
+                      {/* Documentos obrigatórios */}
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          Documentos obrigatórios
+                        </label>
+                        <input
+                          defaultValue={docsObrig}
+                          onBlur={(e) =>
+                            upsertConfig.mutate({
+                              projetoId: projetoId!,
+                              chave: "coleta_docs_docs_obrigatorios",
+                              valor: e.target.value.trim() || "cnh,comprovante_endereco",
+                              tipo: "texto",
+                              categoria: "coleta_docs",
+                              descricao: "Documentos obrigatórios separados por vírgula: cnh, comprovante_endereco",
+                            }, { onSuccess: () => configs.refetch() })
+                          }
+                          placeholder="cnh,comprovante_endereco"
+                          className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                        />
+                        <p className="text-xs text-gray-400 mt-1">
+                          Valores possíveis: <code className="bg-gray-100 px-1 rounded">cnh</code>,{" "}
+                          <code className="bg-gray-100 px-1 rounded">comprovante_endereco</code>.
+                          Remova um valor para não exigi-lo.
+                        </p>
+                      </div>
+
+                      {/* Confirmar antes de gerar */}
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input type="checkbox" checked={confirmacao === "true"}
+                          onChange={(e) => toggle("coleta_docs_confirmacao_usuario", e.target.checked ? "true" : "false",
+                            "Exigir confirmação do cliente antes de gerar contrato e procuração")}
+                          className="mt-0.5 h-4 w-4 rounded text-indigo-600" />
+                        <div>
+                          <p className="text-sm font-medium text-gray-700">Confirmar dados antes de gerar documentos</p>
+                          <p className="text-xs text-gray-500">
+                            A Ana exibe um resumo de todos os dados coletados e aguarda o cliente confirmar
+                            antes de gerar contrato e procuração. Se desmarcado, os documentos são gerados
+                            automaticamente assim que todos os dados forem coletados.
+                          </p>
+                        </div>
+                      </label>
+
+                      {/* Documentos opcionais */}
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input type="checkbox" checked={docOpcional === "true"}
+                          onChange={(e) => toggle("coleta_docs_doc_opcional", e.target.checked ? "true" : "false",
+                            "Se true, o lead pode recusar o envio de documentos sem travar o fluxo")}
+                          className="mt-0.5 h-4 w-4 rounded text-indigo-600" />
+                        <div>
+                          <p className="text-sm font-medium text-gray-700">Fotos de documentos são opcionais</p>
+                          <p className="text-xs text-gray-500">
+                            Se habilitado, quando o lead recusar enviar a foto da CNH ou comprovante de endereço,
+                            a Ana avança o fluxo e gera contrato/procuração com os dados textuais já coletados.
+                          </p>
+                        </div>
+                      </label>
+
+                      {docOpcional === "true" && (
+                        <div className="space-y-1">
+                          <label className="block text-sm font-medium text-gray-700">
+                            Mensagem ao recusar documento
+                          </label>
+                          <textarea
+                            rows={3}
+                            defaultValue={docRecusaResp || "Tudo bem! Vou precisar dessa documentação para finalizar o contrato, mas já vou avançar com os dados que você informou. O contrato e a procuração serão gerados com as informações fornecidas."}
+                            onBlur={(e) => {
+                              if (!projetoId) return;
+                              upsertConfig.mutate({
+                                projetoId, chave: "coleta_docs_doc_recusa_resposta",
+                                valor: e.target.value, tipo: "string", categoria: "coleta_docs",
+                                descricao: "Mensagem enviada quando o lead recusa enviar foto de documento",
+                              }, { onSuccess: () => configs.refetch() });
+                            }}
+                            className="w-full border rounded-lg px-3 py-2 text-sm resize-none"
+                            placeholder="Tudo bem! Vou precisar dessa documentação futuramente..."
+                          />
+                          <p className="text-xs text-gray-400">
+                            Salvo automaticamente ao sair do campo.
+                          </p>
+                        </div>
+                      )}
+
+                      <div className="mt-2 p-3 bg-indigo-50 border border-indigo-200 rounded-lg text-xs text-indigo-800 space-y-1">
+                        <p><strong>Fluxo completo:</strong></p>
+                        <ol className="list-decimal list-inside space-y-0.5 ml-1">
+                          <li>Ana entra na fase <code className="bg-indigo-100 px-1 rounded">coleta_docs</code></li>
+                          <li>Lê transcrição + pasta de docs → pré-preenche dados e detecta documentos</li>
+                          <li>Pergunta apenas o que ainda falta (nome, CPF, RG, endereço…)</li>
+                          <li>Se CNH não recebida → solicita foto da CNH</li>
+                          <li>Se comprovante não recebido → solicita comprovante</li>
+                          <li>Exibe resumo dos dados → aguarda confirmação do cliente (se habilitado)</li>
+                          <li>Gera contrato + procuração automaticamente</li>
+                        </ol>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+
             </div>
           )}
 
@@ -883,6 +1210,61 @@ export default function ConfigIAPage() {
                       </p>
                     </div>
                   </div>
+
+                  {/* Fluxo IA — próxima persona e áudio */}
+                  <div className="border-t pt-4 mt-2 space-y-4">
+                    <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Fluxo IA</p>
+
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        id="usarAudio"
+                        checked={editPersona.usarAudio ?? false}
+                        onChange={(e) => setEditPersona((p) => p ? { ...p, usarAudio: e.target.checked } : p)}
+                        className="rounded"
+                      />
+                      <label htmlFor="usarAudio" className="text-sm font-medium text-gray-700 cursor-pointer">
+                        Enviar respostas como áudio (ElevenLabs)
+                        <span className="ml-2 text-xs font-normal text-gray-400">Requer Voice ID preenchido acima</span>
+                      </label>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Próxima persona após concluir
+                        <span className="ml-2 text-xs font-normal text-gray-400">Persona que assume quando esta termina o flow</span>
+                      </label>
+                      <select
+                        value={editPersona.proximaPersonaChave ?? ""}
+                        onChange={(e) => setEditPersona((p) => p ? { ...p, proximaPersonaChave: e.target.value || null } : p)}
+                        className="w-full border rounded-lg px-3 py-2 text-sm bg-white"
+                      >
+                        <option value="">— nenhuma (encerrar) —</option>
+                        {(personas.data as unknown as Persona[] | undefined)
+                          ?.filter((p) => p.chave !== editPersona.chave)
+                          .map((p) => (
+                            <option key={p.chave} value={p.chave}>
+                              {p.nomeExibicao} ({p.chave})
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Mensagem de despedida (farewell)
+                        <span className="ml-2 text-xs font-normal text-gray-400">Enviada ao lead ao passar para a próxima persona. Deixe vazio para usar o padrão.</span>
+                      </label>
+                      <textarea
+                        value={editPersona.farewellTexto ?? ""}
+                        onChange={(e) => setEditPersona((p) => p ? { ...p, farewellTexto: e.target.value } : p)}
+                        rows={3}
+                        placeholder="Ex: Registrei tudo! Vou te passar agora para nossa secretária que vai confirmar o horário da reunião."
+                        className="w-full border rounded-lg px-3 py-2 text-sm resize-none"
+                      />
+                    </div>
+                  </div>
+
                   <div className="flex gap-2 mt-4">
                     <button type="submit" disabled={upsertPersona.isLoading} className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50">
                       {upsertPersona.isLoading ? "Salvando..." : "Salvar"}
@@ -895,24 +1277,75 @@ export default function ConfigIAPage() {
               ) : (
                 <div className="space-y-3">
                   {(personas.data as unknown as Persona[] | undefined)?.map((p) => (
-                    <div key={p.id} className="bg-white border rounded-xl p-5 flex justify-between items-start">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-semibold text-gray-800">{p.nomeExibicao}</span>
-                          <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">{p.chave}</span>
-                          {p.llmProviderChave && (
-                            <span className="text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">{p.llmProviderChave}</span>
-                          )}
+                    <div key={p.id} className="bg-white border rounded-xl p-5">
+                      <div className="flex justify-between items-start">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-semibold text-gray-800">{p.nomeExibicao}</span>
+                            <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">{p.chave}</span>
+                            {p.llmProviderChave && (
+                              <span className="text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">{p.llmProviderChave}</span>
+                            )}
+                          </div>
+                          {p.descricaoPapel && <p className="text-sm text-gray-500 mt-1">{p.descricaoPapel}</p>}
+                          <p className="text-xs text-gray-400 mt-2 line-clamp-2">{p.systemPrompt.slice(0, 120)}...</p>
                         </div>
-                        {p.descricaoPapel && <p className="text-sm text-gray-500 mt-1">{p.descricaoPapel}</p>}
-                        <p className="text-xs text-gray-400 mt-2 line-clamp-2">{p.systemPrompt.slice(0, 120)}...</p>
+                        <button
+                          onClick={() => setEditPersona(p)}
+                          className="ml-4 text-sm text-indigo-600 hover:underline flex-shrink-0"
+                        >
+                          Editar
+                        </button>
                       </div>
-                      <button
-                        onClick={() => setEditPersona(p)}
-                        className="ml-4 text-sm text-indigo-600 hover:underline flex-shrink-0"
-                      >
-                        Editar
-                      </button>
+
+                      {/* Mídia de apresentação */}
+                      <div className="mt-3 pt-3 border-t flex items-center gap-3">
+                        <span className="text-xs font-medium text-gray-500 w-28 flex-shrink-0">Foto/vídeo intro</span>
+                        {p.midiaApresentacaoPath ? (
+                          <>
+                            {p.midiaApresentacaoTipo === "video" ? (
+                              <video
+                                src={`/api/ia-persona-midia/${p.id}?t=${Date.now()}`}
+                                className="h-12 w-20 object-cover rounded border"
+                                muted
+                              />
+                            ) : (
+                              <img
+                                src={`/api/ia-persona-midia/${p.id}?t=${Date.now()}`}
+                                className="h-12 w-12 object-cover rounded border"
+                                alt="intro"
+                              />
+                            )}
+                            <span className="text-xs text-emerald-600 font-medium">
+                              {p.midiaApresentacaoTipo === "video" ? "Vídeo" : "Foto"} configurada
+                            </span>
+                            <button
+                              onClick={() => clearPersonaMidia.mutate({ personaId: p.id })}
+                              className="text-xs text-red-500 hover:underline"
+                            >
+                              Remover
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-xs text-gray-400">Nenhuma mídia — será enviada ao lead na apresentação</span>
+                        )}
+                        <label className="ml-auto cursor-pointer">
+                          <span className={`text-xs px-3 py-1.5 rounded-lg border font-medium ${midiaUploading === p.id ? "opacity-50 cursor-not-allowed bg-gray-50 text-gray-400" : "bg-white text-indigo-600 border-indigo-300 hover:bg-indigo-50"}`}>
+                            {midiaUploading === p.id ? "Enviando..." : p.midiaApresentacaoPath ? "Trocar" : "Enviar mídia"}
+                          </span>
+                          <input
+                            type="file"
+                            accept="image/*,video/*"
+                            className="hidden"
+                            disabled={midiaUploading === p.id}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) uploadPersonaMidia(p.id, f);
+                              e.target.value = "";
+                            }}
+                          />
+                        </label>
+                      </div>
                     </div>
                   ))}
                   {!personas.data?.length && (
@@ -973,59 +1406,78 @@ export default function ConfigIAPage() {
                 );
               })()}
 
-              {/* Momentos de Áudio (TTS ElevenLabs) */}
+              {/* Lembretes de Reunião */}
               {(() => {
-                const MOMENTOS_DISPONIVEIS = [
-                  { key: "primeira_mensagem",  label: "Primeira mensagem (novo lead)" },
-                  { key: "parecer",            label: "Parecer com valor estimado (Dra. Daniela)" },
-                  { key: "closer_tentativa_1", label: "Closer: lembrete de prescrição" },
-                  { key: "closer_tentativa_2", label: "Closer: segunda tentativa" },
+                const DEFAULT_LEMBRETES = [
+                  { horas: 24, texto: "Oi {nome}! Aqui é a Ana, do escritório da Dra. Daniela. Só lembrando que sua reunião é *amanhã às {horario}h*. Acesse pelo link: {link} Qualquer dúvida me chama!" },
+                  { horas: 1,  texto: "Oi {nome}! Reunião com a Dra. Daniela em *1 hora* ({horario}h). Acesse pelo link: {link} Até já!" },
                 ];
-                const cfgMomentos = (configs.data as unknown as Config[] | undefined)?.find(
-                  (c) => c.categoria === "tts" && c.chave === "tts_momentos_audio"
-                );
-                const momentosAtivos = (cfgMomentos?.valor ?? "")
-                  .split(",").map((m: string) => m.trim()).filter(Boolean);
-
-                const toggle = (key: string) => {
-                  const atuais = (cfgMomentos?.valor ?? "")
-                    .split(",").map((m: string) => m.trim()).filter(Boolean);
-                  const novos = atuais.includes(key)
-                    ? atuais.filter((m: string) => m !== key)
-                    : [...atuais, key];
-                  if (!projetoId) return;
-                  upsertConfig.mutate({
-                    projetoId,
-                    chave: "tts_momentos_audio",
-                    valor: novos.join(","),
-                    tipo: "texto",
-                    categoria: "tts",
-                    descricao: "Momentos para envio de áudio TTS",
-                  }, { onSuccess: () => configs.refetch() });
-                };
-
+                const cfgData = configs.data as unknown as Config[] | undefined;
+                const cfgRaw = cfgData?.find(c => c.chave === "reuniao_lembretes")?.valor;
+                let saved: { horas: number; texto: string }[] = DEFAULT_LEMBRETES;
+                try { if (cfgRaw) saved = JSON.parse(cfgRaw); } catch {}
+                const lembretes = lembretesEdit ?? saved;
+                const setL = (fn: (prev: { horas: number; texto: string }[]) => { horas: number; texto: string }[]) =>
+                  setLembretesEdit(prev => fn(prev ?? saved));
                 return (
-                  <div className="bg-white border rounded-xl p-5">
-                    <div className="mb-3">
-                      <h3 className="font-semibold text-gray-800 text-sm">Momentos de Áudio — Dra. Daniela</h3>
-                      <p className="text-xs text-gray-500 mt-0.5">
-                        Nesses momentos, além da mensagem de texto, a persona envia um áudio PTT (bolha de voz) via ElevenLabs.
-                        Configure a API Key em <strong>Configs → TTS (Voz)</strong> e o Voice ID em <strong>Personas → Dra. Daniela</strong>.
-                      </p>
+                  <div className="bg-white border rounded-xl p-5 space-y-4">
+                    <div className="flex items-start justify-between">
+                      <div>
+                        <h3 className="font-semibold text-gray-800 text-sm">Lembretes de Reunião — Ana</h3>
+                        <p className="text-xs text-gray-500 mt-0.5">
+                          Enviados automaticamente antes da reunião. Variáveis:{" "}
+                          <code className="bg-gray-100 px-1 rounded">{"{nome}"}</code>{" "}
+                          <code className="bg-gray-100 px-1 rounded">{"{horario}"}</code>{" "}
+                          <code className="bg-gray-100 px-1 rounded">{"{link}"}</code>
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setL(prev => [...prev, { horas: 48, texto: "Oi {nome}! Lembrete: sua reunião é em {horario}h. Link: {link}" }])}
+                        className="flex items-center gap-1 text-xs text-indigo-600 border border-indigo-200 rounded-lg px-2 py-1 hover:bg-indigo-50 flex-shrink-0 ml-3"
+                      >
+                        + Lembrete
+                      </button>
                     </div>
-                    <div className="space-y-2">
-                      {MOMENTOS_DISPONIVEIS.map((m) => (
-                        <label key={m.key} className="flex items-center gap-3 cursor-pointer select-none">
+                    {lembretes.map((l, idx) => (
+                      <div key={idx} className="border rounded-lg p-3 space-y-2 bg-gray-50">
+                        <div className="flex items-center gap-2">
+                          <label className="text-xs text-gray-500 flex-shrink-0">Horas antes:</label>
                           <input
-                            type="checkbox"
-                            checked={momentosAtivos.includes(m.key)}
-                            onChange={() => toggle(m.key)}
-                            className="rounded w-4 h-4 accent-indigo-600"
+                            type="number" min={1} max={168} value={l.horas}
+                            onChange={e => setL(prev => prev.map((x, i) => i === idx ? { ...x, horas: Number(e.target.value) } : x))}
+                            className="w-20 border rounded px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-indigo-300"
                           />
-                          <span className="text-sm text-gray-700">{m.label}</span>
-                          <code className="text-xs text-gray-400 bg-gray-50 px-1.5 py-0.5 rounded">{m.key}</code>
-                        </label>
-                      ))}
+                          <span className="text-xs text-gray-400">h</span>
+                          <button
+                            onClick={() => setL(prev => prev.filter((_, i) => i !== idx))}
+                            className="ml-auto text-red-400 hover:text-red-600 text-xs"
+                          >✕ remover</button>
+                        </div>
+                        <textarea
+                          value={l.texto}
+                          onChange={e => setL(prev => prev.map((x, i) => i === idx ? { ...x, texto: e.target.value } : x))}
+                          rows={2}
+                          className="w-full border rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                        />
+                      </div>
+                    ))}
+                    <div className="flex items-center justify-end gap-3">
+                      {lembretesEdit !== null && (
+                        <span className="text-xs text-amber-600">● alterações não salvas</span>
+                      )}
+                      <button
+                        disabled={upsertConfig.isLoading || !projetoId}
+                        onClick={() => {
+                          if (!projetoId) return;
+                          const toSave = lembretesEdit ?? saved;
+                          upsertConfig.mutate({ projetoId, chave: "reuniao_lembretes", valor: JSON.stringify(toSave), tipo: "json", categoria: "reuniao", descricao: "Lista de lembretes de reunião (JSON)" }, {
+                            onSuccess: () => { configs.refetch(); setLembretesEdit(null); },
+                          });
+                        }}
+                        className="bg-indigo-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-40"
+                      >
+                        {upsertConfig.isLoading ? "Salvando..." : "Salvar lembretes"}
+                      </button>
                     </div>
                   </div>
                 );
@@ -1216,8 +1668,9 @@ export default function ConfigIAPage() {
               { v: "EVENTUAL",   l: "Eventual (sem recorrência)" },
             ];
             const MOMENTOS = [
+              { v: "dados_coletados",       l: "Dados coletados — Daniela (advogado) ou Ana (coleta_docs)" },
               { v: "parecer_enviado",       l: "Após enviar o parecer (Dra. Daniela)" },
-              { v: "qualificacao_completa", l: "Quando o lead estiver qualificado (dados coletados)" },
+              { v: "qualificacao_completa", l: "Lead qualificado (Ana assistente)" },
               { v: "documentos_pessoais",   l: "Após o cliente enviar documentos pessoais" },
               { v: "manual",                l: "Apenas manual (não automático)" },
             ];
@@ -1630,6 +2083,7 @@ export default function ConfigIAPage() {
                         stageDestinoChave: editRegra.stageDestinoChave!,
                         condicao: editRegra.condicao!,
                         acaoAdicional: editRegra.acaoAdicional || undefined,
+                        parametros: editRegra.parametros ?? undefined,
                         ordem: editRegra.ordem ?? 0,
                         requerPrescricaoAtiva: editRegra.requerPrescricaoAtiva ?? false,
                       });
@@ -1665,6 +2119,29 @@ export default function ConfigIAPage() {
                           onChange={(e) => setEditRegra((r) => ({ ...r!, acaoAdicional: e.target.value }))} />
                       </div>
                     </div>
+                    {(editRegra.condicao === "sem_resposta_Xhoras" || editRegra.condicao === "follow_up_timed") && (
+                      <div>
+                        <label className="text-xs font-medium text-gray-600">
+                          {editRegra.condicao === "sem_resposta_Xhoras" ? "Horas de silêncio antes de disparar" : "Horas de espera antes do follow-up"}
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          className="w-full border rounded-lg px-3 py-2 text-sm mt-1"
+                          value={(editRegra.parametros as any)?.horas ?? ""}
+                          placeholder="ex: 24"
+                          onChange={(e) => setEditRegra((r) => ({
+                            ...r!,
+                            parametros: { ...(r?.parametros ?? {}), horas: Number(e.target.value) },
+                          }))}
+                        />
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          {editRegra.condicao === "sem_resposta_Xhoras"
+                            ? "Depois desse tempo sem resposta do lead, a transição é executada."
+                            : "Depois desse tempo sem resposta, o follow-up proativo é enviado (sem mudar de stage)."}
+                        </p>
+                      </div>
+                    )}
                     <div className="grid grid-cols-2 gap-3 items-end">
                       <div>
                         <label className="text-xs font-medium text-gray-600">Ordem</label>
@@ -1707,7 +2184,12 @@ export default function ConfigIAPage() {
                     {(regras.data ?? []).map((r: any) => (
                       <tr key={r.id} className="hover:bg-gray-50">
                         <td className="px-4 py-2"><code className="text-xs text-gray-500">{r.stageOrigemChave ?? "*"}</code></td>
-                        <td className="px-4 py-2"><code className="text-xs text-indigo-600">{r.condicao}</code></td>
+                        <td className="px-4 py-2">
+                          <code className="text-xs text-indigo-600">{r.condicao}</code>
+                          {(r.condicao === "sem_resposta_Xhoras" || r.condicao === "follow_up_timed") && r.parametros?.horas && (
+                            <span className="ml-1 text-xs text-gray-400">({r.parametros.horas}h)</span>
+                          )}
+                        </td>
                         <td className="px-4 py-2"><code className="text-xs text-green-600">{r.stageDestinoChave}</code></td>
                         <td className="px-4 py-2 text-xs text-gray-500">{r.acaoAdicional ?? "—"}</td>
                         <td className="px-4 py-2 text-center">
@@ -1785,8 +2267,499 @@ export default function ConfigIAPage() {
             />
           )}
 
+          {/* Follow-up tab */}
+          {tab === "followup" && projetoId && (() => {
+            const cfg = followUpConfigs.data ?? {};
+            const fuAtivo         = cfg["follow_up_ativo"] === "true";
+            const fuIntervalo     = cfg["follow_up_intervalo_dias"] ?? "1";
+            const fuMaxTentativas = cfg["follow_up_max_tentativas"] ?? "0";
+            const fuValidade      = cfg["follow_up_validade_meses"] ?? "24";
+            function saveFu(chave: string, valor: string) {
+              saveFollowUpConfig.mutate({ projetoId: projetoId!, chave, valor });
+            }
+            const stageCorMap: Record<string, string> = {
+              blue:   "bg-blue-500",
+              purple: "bg-purple-500",
+              green:  "bg-green-500",
+              orange: "bg-orange-500",
+              red:    "bg-red-500",
+            };
+            return (
+              <div className="space-y-6">
+
+                {/* Section header */}
+                <div className="flex items-center gap-3">
+                  <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Follow-up Automático</h2>
+                  <div className="flex-1 border-t border-gray-200" />
+                </div>
+
+                {/* PAKT Signature Follow-up */}
+                <div className="bg-white border rounded-xl overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setFollowUpExpanded(v => !v)}
+                    className="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-gray-50 transition-colors"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-2.5 h-2.5 rounded-full bg-indigo-500" />
+                      <div>
+                        <h3 className="font-semibold text-gray-800 text-sm">Assinatura PAKT — Lembretes de Contrato</h3>
+                        <p className="text-xs text-gray-500 mt-0.5">Lembrete diário para leads com links não assinados — tom escalante até a assinatura</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 ml-4">
+                      {fuAtivo && <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">ativo</span>}
+                      <span className="text-gray-400 text-sm">{followUpExpanded ? "▲" : "▼"}</span>
+                    </div>
+                  </button>
+
+                  {followUpExpanded && (
+                    <div className="border-t px-5 py-4 space-y-5">
+                      <label className="flex items-start gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={fuAtivo}
+                          onChange={(e) => saveFu("follow_up_ativo", e.target.checked ? "true" : "false")}
+                          className="mt-0.5 h-4 w-4 rounded text-indigo-600"
+                        />
+                        <div>
+                          <p className="text-sm font-medium text-gray-700">Ativar follow-up automático</p>
+                          <p className="text-xs text-gray-500">O sistema enviará mensagens diárias (às 9h) para leads com proposta aceita e links PAKT não assinados.</p>
+                        </div>
+                      </label>
+
+                      <div className="grid grid-cols-3 gap-4">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-600 mb-1">Intervalo entre mensagens (dias)</label>
+                          <input type="number" min={1} defaultValue={fuIntervalo}
+                            onBlur={(e) => saveFu("follow_up_intervalo_dias", String(Math.max(1, parseInt(e.target.value, 10) || 1)))}
+                            className="w-full border rounded-lg px-3 py-2 text-sm text-center" />
+                          <p className="text-xs text-gray-400 mt-1">Mínimo: 1 dia</p>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-600 mb-1">Máximo de tentativas (0 = ilimitado)</label>
+                          <input type="number" min={0} defaultValue={fuMaxTentativas}
+                            onBlur={(e) => saveFu("follow_up_max_tentativas", String(Math.max(0, parseInt(e.target.value, 10) || 0)))}
+                            className="w-full border rounded-lg px-3 py-2 text-sm text-center" />
+                          <p className="text-xs text-gray-400 mt-1">0 = sem limite</p>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-600 mb-1">Validade dos links PAKT (meses)</label>
+                          <input type="number" min={1} defaultValue={fuValidade}
+                            onBlur={(e) => saveFu("follow_up_validade_meses", String(Math.max(1, parseInt(e.target.value, 10) || 24)))}
+                            className="w-full border rounded-lg px-3 py-2 text-sm text-center" />
+                          <p className="text-xs text-gray-400 mt-1">Links expirados são renovados</p>
+                        </div>
+                      </div>
+
+                      <div>
+                        <button type="button" onClick={() => setFollowUpMsgExpanded(v => !v)}
+                          className="flex items-center gap-2 text-sm font-medium text-indigo-600 hover:text-indigo-800">
+                          <span>{followUpMsgExpanded ? "▲" : "▼"}</span>
+                          Mensagens personalizadas (opcional)
+                        </button>
+                        <p className="text-xs text-gray-400 mt-1">
+                          Deixe em branco para usar os padrões. Use <code className="bg-gray-100 px-1 rounded">{"{{nome}}"}</code> e{" "}
+                          <code className="bg-gray-100 px-1 rounded">{"{{links}}"}</code> como variáveis.
+                        </p>
+                        {followUpMsgExpanded && (
+                          <div className="mt-3 space-y-4">
+                            {[1, 2, 3, 4, 5].map((n) => {
+                              const chave = `follow_up_msg_${n}`;
+                              const labels = ["Mensagem dia 1 — Lembrete gentil", "Mensagem dia 2 — Reforço", "Mensagem dia 3 — Prazo prescricional", "Mensagem dia 4 — Urgência", "Mensagem dia 5+ — Última chamada"];
+                              return (
+                                <div key={chave}>
+                                  <label className="block text-xs font-medium text-gray-600 mb-1">{labels[n - 1]}</label>
+                                  <textarea rows={3} defaultValue={cfg[chave] ?? ""}
+                                    onBlur={(e) => { if (e.target.value !== (cfg[chave] ?? "")) saveFu(chave, e.target.value); }}
+                                    placeholder={`Deixe em branco para usar a mensagem padrão do dia ${n}...`}
+                                    className="w-full border rounded-lg px-3 py-2 text-sm resize-none font-mono text-xs" />
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-800 space-y-1">
+                        <p><strong>Como funciona:</strong></p>
+                        <ol className="list-decimal list-inside space-y-0.5 ml-1">
+                          <li>Todo dia às 9h o cron verifica propostas aceitas com links PAKT não assinados</li>
+                          <li>Consulta a API PAKT — se já assinou, marca como concluído e para</li>
+                          <li>Se o link expirou, renova automaticamente via API PAKT antes de enviar</li>
+                          <li>Envia mensagem pelo WhatsApp com tom escalante (dia 1 → gentil, dia 5+ → urgente)</li>
+                        </ol>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Per-stage section header */}
+                <div className="flex items-center gap-3">
+                  <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Follow-up por Etapa do Funil</h2>
+                  <div className="flex-1 border-t border-gray-200" />
+                </div>
+                <p className="text-xs text-gray-500 -mt-4">
+                  Configure mensagens proativas por etapa. O cron roda a cada 15 minutos e dispara quando o lead fica em silêncio pelo tempo configurado.
+                  Use <code className="bg-gray-100 px-1 rounded">{"{{nome}}"}</code> para o nome do cliente.
+                </p>
+
+                {/* Stage follow-up cards */}
+                {STAGE_FOLLOWUP_DEFS.map((def, idx) => {
+                  const query = stageFollowUpQueries[idx];
+                  const serverData = query.data as { ativo: boolean; mensagens: { delayHoras: number; template: string }[] } | undefined;
+                  const local = stageFollowLocal[def.stageChave];
+                  const defaultMsgs = [{ delayHoras: 24, template: "" }, { delayHoras: 48, template: "" }, { delayHoras: 72, template: "" }];
+                  const data = local ?? serverData ?? { ativo: false, mensagens: defaultMsgs };
+                  const expanded = stageFollowExpanded[def.stageChave] ?? false;
+                  const hasUnsaved = !!local;
+                  const dotCls = stageCorMap[def.cor] ?? "bg-gray-400";
+
+                  return (
+                    <div key={def.stageChave} className="bg-white border rounded-xl overflow-hidden">
+                      <button
+                        type="button"
+                        onClick={() => setStageFollowExpanded(v => ({ ...v, [def.stageChave]: !v[def.stageChave] }))}
+                        className="w-full flex items-center justify-between px-5 py-4 text-left hover:bg-gray-50"
+                      >
+                        <div className="flex items-center gap-3">
+                          <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${dotCls}`} />
+                          <div>
+                            <h3 className="font-semibold text-gray-800 text-sm">{def.label}</h3>
+                            <p className="text-xs text-gray-500 mt-0.5">{def.desc}</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 ml-4 shrink-0">
+                          {query.isLoading && <span className="text-xs text-gray-400">carregando…</span>}
+                          {data.ativo && <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">ativo</span>}
+                          {hasUnsaved && <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">não salvo</span>}
+                          <span className="text-gray-400 text-sm">{expanded ? "▲" : "▼"}</span>
+                        </div>
+                      </button>
+
+                      {expanded && (
+                        <div className="border-t px-5 py-4 space-y-4">
+                          <label className="flex items-start gap-3 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={data.ativo}
+                              onChange={(e) => setStageFollowLocal(v => ({ ...v, [def.stageChave]: { ...data, ativo: e.target.checked } }))}
+                              className="mt-0.5 h-4 w-4 rounded text-indigo-600"
+                            />
+                            <div>
+                              <p className="text-sm font-medium text-gray-700">Ativar follow-up nesta etapa</p>
+                              <p className="text-xs text-gray-500">Quando o lead fica em silêncio, o agente retoma o contato com mensagens escalantes.</p>
+                            </div>
+                          </label>
+
+                          <div className="space-y-3">
+                            {data.mensagens.map((msg, mIdx) => (
+                              <div key={mIdx} className="border rounded-lg p-3 space-y-2">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-medium text-gray-500 w-16 shrink-0">Mensagem {mIdx + 1}</span>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={msg.delayHoras}
+                                    onChange={(e) => {
+                                      const newMsgs = data.mensagens.map((m, i) =>
+                                        i === mIdx ? { ...m, delayHoras: parseInt(e.target.value) || 24 } : m
+                                      );
+                                      setStageFollowLocal(v => ({ ...v, [def.stageChave]: { ...data, mensagens: newMsgs } }));
+                                    }}
+                                    className="w-16 border rounded px-2 py-1 text-sm text-center"
+                                  />
+                                  <span className="text-xs text-gray-500">horas após silêncio</span>
+                                  {data.mensagens.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const newMsgs = data.mensagens.filter((_, i) => i !== mIdx);
+                                        setStageFollowLocal(v => ({ ...v, [def.stageChave]: { ...data, mensagens: newMsgs } }));
+                                      }}
+                                      className="ml-auto text-xs text-red-400 hover:text-red-600"
+                                    >✕</button>
+                                  )}
+                                </div>
+                                <textarea
+                                  rows={3}
+                                  value={msg.template}
+                                  onChange={(e) => {
+                                    const newMsgs = data.mensagens.map((m, i) =>
+                                      i === mIdx ? { ...m, template: e.target.value } : m
+                                    );
+                                    setStageFollowLocal(v => ({ ...v, [def.stageChave]: { ...data, mensagens: newMsgs } }));
+                                  }}
+                                  placeholder={`Template da mensagem ${mIdx + 1}… Use {{nome}} para o nome do cliente.`}
+                                  className="w-full border rounded-lg px-3 py-2 text-sm resize-none font-mono text-xs"
+                                />
+                              </div>
+                            ))}
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const lastDelay = data.mensagens[data.mensagens.length - 1]?.delayHoras ?? 24;
+                                const newMsgs = [...data.mensagens, { delayHoras: lastDelay + 24, template: "" }];
+                                setStageFollowLocal(v => ({ ...v, [def.stageChave]: { ...data, mensagens: newMsgs } }));
+                              }}
+                              className="text-xs text-indigo-600 hover:text-indigo-800"
+                            >+ Adicionar mensagem</button>
+                          </div>
+
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              disabled={saveStageFollowUp.isPending}
+                              onClick={() => {
+                                if (!projetoId) return;
+                                saveStageFollowUp.mutate(
+                                  { projetoId, stageChave: def.stageChave, ativo: data.ativo, mensagens: data.mensagens },
+                                  {
+                                    onSuccess: () => {
+                                      setStageFollowLocal(v => { const n = { ...v }; delete n[def.stageChave]; return n; });
+                                      query.refetch();
+                                    },
+                                  }
+                                );
+                              }}
+                              className="px-4 py-2 text-sm bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+                            >
+                              {saveStageFollowUp.isPending ? "Salvando…" : "Salvar"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+
+          {/* ── Desqualificação tab ─────────────────────────────────────────── */}
+          {tab === "desqualificacao" && projetoId && (
+            <DesqualificacaoTab projetoId={projetoId} />
+          )}
+
         </>
       )}
+    </div>
+  );
+}
+
+// ── DesqualificacaoTab ────────────────────────────────────────────────────────
+
+const TIPOS_GATE: Record<string, string> = {
+  prescricao:       "Prescrição 2 anos",
+  empresa_bloqueada: "Empresa bloqueada",
+  vinculo_invalido: "Vínculo inválido",
+  nao_carreteiro:   "Não carreteiro",
+  tempo_minimo:     "Tempo mínimo",
+  campo_booleano:   "Campo booleano",
+};
+
+function DesqualificacaoTab({ projetoId }: { projetoId: string }) {
+  const [novaEmpresa, setNovaEmpresa] = useState("");
+  const [editingGateId, setEditingGateId] = useState<string | null>(null);
+  const [editingGateMsg, setEditingGateMsg] = useState("");
+  const [editingMesesMin, setEditingMesesMin] = useState<number>(2);
+  const utils = trpc.useUtils();
+
+  const gates = trpc.ia.listGatesSdr.useQuery({ projetoId });
+  const empresas = trpc.ia.listEmpresasBloqueadas.useQuery({ projetoId });
+
+  const toggleGate = trpc.ia.toggleGateSdr.useMutation({
+    onSuccess: () => utils.ia.listGatesSdr.invalidate(),
+  });
+  const deleteGate = trpc.ia.deleteGateSdr.useMutation({
+    onSuccess: () => { utils.ia.listGatesSdr.invalidate(); },
+  });
+  const updateGate = trpc.ia.updateGateSdr.useMutation({
+    onSuccess: () => { utils.ia.listGatesSdr.invalidate(); setEditingGateId(null); },
+  });
+  const criarEmpresa = trpc.ia.criarEmpresaBloqueada.useMutation({
+    onSuccess: () => { utils.ia.listEmpresasBloqueadas.invalidate(); setNovaEmpresa(""); },
+  });
+  const toggleEmpresa = trpc.ia.toggleEmpresaBloqueada.useMutation({
+    onSuccess: () => utils.ia.listEmpresasBloqueadas.invalidate(),
+  });
+  const deleteEmpresa = trpc.ia.deleteEmpresaBloqueada.useMutation({
+    onSuccess: () => utils.ia.listEmpresasBloqueadas.invalidate(),
+  });
+
+  const gatesList = (gates.data as any[] | undefined) ?? [];
+  const empresasList = (empresas.data as any[] | undefined) ?? [];
+
+  return (
+    <div className="space-y-6">
+      {/* Gates */}
+      <div className="bg-white border rounded-xl p-5">
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Gates de Desqualificação</h3>
+          <p className="text-xs text-gray-400 mt-0.5">
+            Verificados automaticamente após cada campo coletado. Quando disparado, encerra a conversa e move para lead_desqualificado.
+          </p>
+        </div>
+        {gatesList.length === 0 && (
+          <p className="text-sm text-gray-400 text-center py-4">Nenhum gate configurado.</p>
+        )}
+        <div className="space-y-2">
+          {gatesList.map((g: any) => (
+            <div key={g.id} className={`flex items-start gap-3 border rounded-lg px-4 py-3 ${!g.ativo ? "opacity-50 bg-gray-50" : "bg-white"}`}>
+              <div className="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs flex-shrink-0 bg-indigo-100 text-indigo-700">
+                {g.ordem}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-medium text-gray-800 text-sm">{g.nome}</span>
+                  <span className="text-xs px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
+                    {TIPOS_GATE[g.tipo] ?? g.tipo}
+                  </span>
+                  {g.campoGatilho && (
+                    <span className="text-xs text-gray-400 font-mono">→ {g.campoGatilho}</span>
+                  )}
+                  <span className={`text-xs px-2 py-0.5 rounded-full ${g.ativo ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                    {g.ativo ? "ativo" : "inativo"}
+                  </span>
+                </div>
+                {editingGateId === g.id ? (
+                  <div className="mt-2 space-y-2">
+                    {g.tipo === "tempo_minimo" && (
+                      <div className="flex items-center gap-2">
+                        <label className="text-xs text-gray-600 whitespace-nowrap">Mínimo de meses:</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={24}
+                          value={editingMesesMin}
+                          onChange={e => setEditingMesesMin(Number(e.target.value))}
+                          className="w-20 border rounded px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+                        />
+                        <span className="text-xs text-gray-400">mês(es) — vínculos abaixo disso pulam para emprego anterior</span>
+                      </div>
+                    )}
+                    <textarea
+                      rows={4}
+                      value={editingGateMsg}
+                      onChange={e => setEditingGateMsg(e.target.value)}
+                      className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 resize-none"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => updateGate.mutate({
+                          id: g.id,
+                          mensagemLead: editingGateMsg,
+                          ...(g.tipo === "tempo_minimo" ? { mesesMin: editingMesesMin } : {}),
+                        })}
+                        disabled={updateGate.isLoading}
+                        className="bg-indigo-600 text-white px-3 py-1 rounded text-xs font-medium hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        {updateGate.isLoading ? "..." : "Salvar"}
+                      </button>
+                      <button
+                        onClick={() => setEditingGateId(null)}
+                        className="text-xs text-gray-500 hover:underline"
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-1">
+                    {g.tipo === "tempo_minimo" && (
+                      <p className="text-xs text-blue-600 font-medium mb-0.5">
+                        Mínimo: {(g.condicaoJson as any)?.mesesMin ?? 2} mês(es)
+                      </p>
+                    )}
+                    <p className="text-xs text-gray-500 line-clamp-2">{g.mensagemLead}</p>
+                  </div>
+                )}
+              </div>
+              <div className="flex gap-2 flex-shrink-0">
+                <button
+                  onClick={() => {
+                    setEditingGateId(g.id);
+                    setEditingGateMsg(g.mensagemLead);
+                    setEditingMesesMin((g.condicaoJson as any)?.mesesMin ?? 2);
+                  }}
+                  className="text-xs text-indigo-600 hover:underline"
+                >
+                  Editar
+                </button>
+                <button
+                  onClick={() => toggleGate.mutate({ id: g.id, ativo: !g.ativo })}
+                  className="text-xs text-gray-500 hover:underline"
+                >
+                  {g.ativo ? "Desativar" : "Ativar"}
+                </button>
+                <button
+                  onClick={() => { if (confirm(`Remover gate "${g.nome}"?`)) deleteGate.mutate({ id: g.id }); }}
+                  className="text-xs text-red-500 hover:underline"
+                >
+                  Remover
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Empresas Bloqueadas */}
+      <div className="bg-white border rounded-xl p-5">
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">Empresas Bloqueadas</h3>
+          <p className="text-xs text-gray-400 mt-0.5">
+            Quando o lead informa o nome de uma empresa bloqueada, o gate "Empresa bloqueada" é disparado automaticamente.
+          </p>
+        </div>
+        {empresasList.length === 0 && (
+          <p className="text-sm text-gray-400 text-center py-3">Nenhuma empresa bloqueada.</p>
+        )}
+        <div className="space-y-1.5 mb-4">
+          {empresasList.map((e: any) => (
+            <div key={e.id} className={`flex items-center gap-3 border rounded-lg px-4 py-2.5 ${!e.ativo ? "opacity-50 bg-gray-50" : "bg-white"}`}>
+              <div className="flex-1">
+                <span className="text-sm text-gray-800">{e.nome}</span>
+                <span className="ml-2 text-xs text-gray-400 font-mono">({e.nomeNorm})</span>
+              </div>
+              <span className={`text-xs px-2 py-0.5 rounded-full ${e.ativo ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                {e.ativo ? "ativa" : "inativa"}
+              </span>
+              <button
+                onClick={() => toggleEmpresa.mutate({ id: e.id, ativo: !e.ativo })}
+                className="text-xs text-indigo-600 hover:underline"
+              >
+                {e.ativo ? "Desativar" : "Ativar"}
+              </button>
+              <button
+                onClick={() => { if (confirm(`Remover "${e.nome}"?`)) deleteEmpresa.mutate({ id: e.id }); }}
+                className="text-xs text-red-500 hover:underline"
+              >
+                Remover
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={novaEmpresa}
+            onChange={e => setNovaEmpresa(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && novaEmpresa.trim()) criarEmpresa.mutate({ projetoId, nome: novaEmpresa.trim() }); }}
+            placeholder="Nome da empresa..."
+            className="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          />
+          <button
+            onClick={() => { if (novaEmpresa.trim()) criarEmpresa.mutate({ projetoId, nome: novaEmpresa.trim() }); }}
+            disabled={criarEmpresa.isLoading || !novaEmpresa.trim()}
+            className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {criarEmpresa.isLoading ? "..." : "+ Adicionar"}
+          </button>
+        </div>
+
+      </div>
     </div>
   );
 }

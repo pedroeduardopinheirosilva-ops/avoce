@@ -46,7 +46,7 @@ describe("applyConversacionalMode", () => {
 
   it("modoColeta = undefined → equivale a sequencial, router NÃO chamado", async () => {
     const result = await applyConversacionalMode({
-      modoColeta: (undefined as any) ?? "sequencial",
+      modoColeta: (undefined as any) || "sequencial",
       personaChave: "assistente",
       agentResult: baseAgentResult,
       currentNextQ: "Qual empresa?",
@@ -57,7 +57,10 @@ describe("applyConversacionalMode", () => {
     expect(result.nextQDeterministico).toBe("Qual empresa?");
   });
 
-  it("conversacional → router É chamado, nextQDeterministico = null", async () => {
+  // O modo conversacional foi DESATIVADO no código-fonte (conversational-dispatch.ts):
+  // applyConversacionalMode é hoje um no-op que sempre retorna o fluxo sequencial/determinístico,
+  // mesmo quando modoColeta = "conversacional". O router conversacional nunca é chamado.
+  it("conversacional (desativado) → router NÃO é chamado, fluxo sequencial preservado", async () => {
     mockConvRouter.mockResolvedValue({
       systemSuffix: "⚠️ CAMPO OBRIGATÓRIO — combine empresa + função",
       isDone: false,
@@ -71,13 +74,12 @@ describe("applyConversacionalMode", () => {
       convParams,
     });
 
-    expect(mockConvRouter).toHaveBeenCalledOnce();
-    expect(result.nextQDeterministico).toBeNull();
-    expect(result.agentResult.systemInstructions).toContain("INSTRUCOES_BASE");
-    expect(result.agentResult.systemInstructions).toContain("⚠️ CAMPO OBRIGATÓRIO");
+    expect(mockConvRouter).not.toHaveBeenCalled();
+    expect(result.nextQDeterministico).toBe("Qual empresa?");
+    expect(result.agentResult.systemInstructions).toBe("INSTRUCOES_BASE");
   });
 
-  it("conversacional, isDone=true → agentResult.allDone = true", async () => {
+  it("conversacional (desativado), isDone=true do router é ignorado → allDone permanece false", async () => {
     mockConvRouter.mockResolvedValue({ systemSuffix: "Encerramento", isDone: true });
 
     const result = await applyConversacionalMode({
@@ -88,8 +90,8 @@ describe("applyConversacionalMode", () => {
       convParams,
     });
 
-    expect(result.agentResult.allDone).toBe(true);
-    expect(result.nextQDeterministico).toBeNull();
+    expect(result.agentResult.allDone).toBe(false);
+    expect(result.nextQDeterministico).toBeNull(); // currentNextQ era null — passa adiante
   });
 
   it("conversacional + router lança erro → fallback para sequencial", async () => {

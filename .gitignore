@@ -23,6 +23,12 @@ Thumbs.db
 # Leads / large data files
 leads_*.json
 
+# n8n workflow exports
+n8n-*.json
+
+# Snapshots
+_snapshot_*/
+
 # Generated uploads / contracts (keep structure, not files)
 uploads/
 contratos/

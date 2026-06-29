@@ -260,3 +260,16 @@ export async function baixarBoleto(cfg: SicoobBoletoConfig, nossoNumero: number)
 export function sicoobBoletoConfigurado(cfg: SicoobBoletoConfig): boolean {
   return !!(cfg.clientId && cfg.numeroCliente && cfg.contaCorrente && existsSync(resolve(cfg.certPath)));
 }
+
+// ── Invalida cache ao trocar certificado ──────────────────────────────────────
+
+export function invalidarCacheSicoobBoleto(certPath: string): void {
+  for (const key of _agents.keys()) {
+    if (key.startsWith(certPath + "::")) {
+      _agents.get(key)?.destroy?.();
+      _agents.delete(key);
+    }
+  }
+  // Limpa tokens também (autenticação depende do cert mTLS)
+  _tokens.clear();
+}

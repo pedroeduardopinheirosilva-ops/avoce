@@ -160,9 +160,9 @@ export default function Conciliacao() {
   const pct = stats ? Math.round(((stats as any).matched / Math.max((stats as any).total, 1)) * 100) : 0;
 
   return (
-    <div className="p-8">
+    <div className="p-4 md:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Conciliação Bancária</h1>
           <p className="text-sm text-gray-500 mt-1">Vincule lançamentos do extrato às cobranças.</p>

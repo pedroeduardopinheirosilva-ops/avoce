@@ -1,11 +1,14 @@
 import { z }                 from "zod";
 import { router, authProc }  from "./trpc.js";
 import { prisma }            from "../db.js";
+import { whereEmitenteFilter, assertEmitenteAccess } from "./tenant-utils.js";
 import nodemailer             from "nodemailer";
 import { htmlToPdf }         from "../lib/pdf.js";
 import { existsSync, readFileSync } from "node:fs";
 import { readFile }          from "node:fs/promises";
 import { sendText }          from "../services/evolution.js";
+import { fieldDecrypt }      from "../lib/field-crypto.js";
+import { sendMailAndSave, type SmtpConfig } from "../lib/email.js";
 
 // ── Auto-conversão de proposta aceita em contrato ────────────────────────────
 
@@ -29,8 +32,8 @@ export async function autoConverterEmContrato(propostaId: string): Promise<void>
       tomadorId:         p.tomadorId,
       nomeServico:       p.titulo,
       descricaoServico:  descricao,
-      valor:             p.valorEstimado,
-      diaVencimento:     p.contratoDiaVencimento,
+      valor:             p.valorEstimado ?? 0,
+      diaVencimento:     p.contratoDiaVencimento ?? 5,
       metodoCobr:        p.contratoMetodoCobr ?? "PIX_BOLETO",
       emitirNfseAuto:    isEventual ? false : (p.contratoEmitirNfseAuto ?? false),
       gerarCobrancaAuto: isEventual ? false : (p.contratoGerarCobrancaAuto ?? true),
@@ -128,12 +131,14 @@ export async function enviarEmailAceite(propostaId: string): Promise<void> {
   const fromEmail = p.emitente.smtpUser;
   const fromField = fromName ? `"${fromName}" <${fromEmail}>` : (p.emitente.smtpFrom ?? fromEmail);
 
-  const transporter = nodemailer.createTransport({
-    host: p.emitente.smtpHost, port: p.emitente.smtpPort ?? 587,
-    secure: p.emitente.smtpPort === 465, requireTLS: p.emitente.smtpPort !== 465,
-    auth: { user: p.emitente.smtpUser, pass: p.emitente.smtpPass ?? "" },
-    tls: { rejectUnauthorized: false },
-  });
+  const smtpAceite: SmtpConfig = {
+    host:   p.emitente.smtpHost,
+    port:   p.emitente.smtpPort ?? 587,
+    secure: p.emitente.smtpPort === 465,
+    user:   p.emitente.smtpUser,
+    pass:   fieldDecrypt(p.emitente.smtpPass),
+    from:   fromField,
+  };
 
   const logoBase64 = logoPathToBase64(p.emitente.logoPath);
   const aceitoStr  = p.aceitoEm ? new Date(p.aceitoEm).toLocaleString("pt-BR", { timeZone: "America/Bahia" }) : "—";
@@ -188,7 +193,7 @@ export async function enviarEmailAceite(propostaId: string): Promise<void> {
 
   const recipients = [p.tomador.email, p.emitente.email].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i);
 
-  await transporter.sendMail({
+  await sendMailAndSave(smtpAceite, {
     from:        fromField,
     to:          recipients.join(", "),
     subject:     `✅ Proposta aceita: ${p.titulo} — ${emitenteNome}`,
@@ -379,7 +384,8 @@ export const propostaRouter = router({
 
   templates: authProc
     .input(z.object({ emitenteId: z.string().optional() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      if (input.emitenteId) assertEmitenteAccess(ctx, input.emitenteId);
       // Templates do tipo PROPOSTA salvos no banco têm prioridade
       const dbTemplates = input.emitenteId
         ? await (prisma as any).templateDocumento.findMany({
@@ -401,8 +407,10 @@ export const propostaRouter = router({
       page:       z.number().int().default(1),
       pageSize:   z.number().int().default(20),
     }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const where = {
+        ...emitenteFilter,
         ...(input.status     ? { status: input.status }         : {}),
         ...(input.emitenteId ? { emitenteId: input.emitenteId } : {}),
       };
@@ -452,7 +460,7 @@ export const propostaRouter = router({
       validadeAte:   z.string().optional().nullable(),
       paktSignUrl:   z.string().url().optional().nullable(),
       // parâmetros do contrato
-      contratoDiaVencimento:     z.number().int().min(1).max(28).optional().nullable(),
+      contratoDiaVencimento:     z.number().int().min(1).max(30).optional().nullable(),
       contratoMetodoCobr:        z.enum(["PIX_BOLETO","PIX","BOLETO","NENHUM","ALVARA"]).optional().nullable(),
       contratoTipoContrato:      z.enum(["RECORRENTE","PARCELADO","EVENTUAL"]).optional().nullable(),
       contratoTotalParcelas:     z.number().int().positive().optional().nullable(),
@@ -463,7 +471,8 @@ export const propostaRouter = router({
       templatesGerar:            z.array(z.string()).optional().nullable(),
       honorariosExitoPerc:       z.number().int().min(1).max(100).optional().nullable(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
       return prisma.proposta.create({
         data: {
           emitenteId:    input.emitenteId,
@@ -501,7 +510,7 @@ export const propostaRouter = router({
       validadeAte:   z.string().optional().nullable(),
       paktSignUrl:   z.string().optional().nullable(),
       status:        z.enum(["RASCUNHO", "ENVIADA", "ACEITA", "RECUSADA", "EM_NEGOCIACAO"]).optional(),
-      contratoDiaVencimento:     z.number().int().min(1).max(28).optional().nullable(),
+      contratoDiaVencimento:     z.number().int().min(1).max(30).optional().nullable(),
       contratoMetodoCobr:        z.enum(["PIX_BOLETO","PIX","BOLETO","NENHUM","ALVARA"]).optional().nullable(),
       contratoTipoContrato:      z.enum(["RECORRENTE","PARCELADO","EVENTUAL"]).optional().nullable(),
       contratoTotalParcelas:     z.number().int().positive().optional().nullable(),
@@ -512,8 +521,10 @@ export const propostaRouter = router({
       templatesGerar:            z.array(z.string()).optional().nullable(),
       honorariosExitoPerc:       z.number().int().min(1).max(100).optional().nullable(),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, validadeAte, templatesGerar, ...rest } = input;
+      const p = await prisma.proposta.findUniqueOrThrow({ where: { id }, select: { emitenteId: true } });
+      assertEmitenteAccess(ctx, p.emitenteId);
       return prisma.proposta.update({
         where: { id },
         data: {
@@ -526,19 +537,21 @@ export const propostaRouter = router({
 
   excluir: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
-      const p = await prisma.proposta.findUniqueOrThrow({ where: { id: input.id } });
+    .mutation(async ({ input, ctx }) => {
+      const p = await prisma.proposta.findUniqueOrThrow({ where: { id: input.id }, select: { emitenteId: true, status: true } });
+      assertEmitenteAccess(ctx, p.emitenteId);
       if (p.status !== "RASCUNHO") throw new Error("Apenas rascunhos podem ser excluídos");
       return prisma.proposta.delete({ where: { id: input.id } });
     }),
 
   enviarEmail: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const p = await prisma.proposta.findUniqueOrThrow({
         where: { id: input.id },
         include: { emitente: true, tomador: true },
       });
+      assertEmitenteAccess(ctx, p.emitenteId);
 
       if (!p.tomador.email) throw new Error("Tomador não possui e-mail cadastrado");
       if (!p.emitente.smtpHost || !p.emitente.smtpUser)
@@ -674,12 +687,14 @@ export const propostaRouter = router({
       const fromEmail = p.emitente.smtpUser;
       const fromField = fromName ? `"${fromName}" <${fromEmail}>` : (p.emitente.smtpFrom ?? fromEmail);
 
-      const transporter = nodemailer.createTransport({
-        host: p.emitente.smtpHost, port: p.emitente.smtpPort ?? 587,
-        secure: p.emitente.smtpPort === 465, requireTLS: p.emitente.smtpPort !== 465,
-        auth: { user: p.emitente.smtpUser, pass: p.emitente.smtpPass ?? "" },
-        tls: { rejectUnauthorized: false },
-      });
+      const smtpProposta: SmtpConfig = {
+        host:   p.emitente.smtpHost,
+        port:   p.emitente.smtpPort ?? 587,
+        secure: p.emitente.smtpPort === 465,
+        user:   p.emitente.smtpUser,
+        pass:   fieldDecrypt(p.emitente.smtpPass),
+        from:   fromField,
+      };
 
       const cnpjFmtEmail = fmtCnpj(p.emitente.cnpj);
       const valorStr     = p.valorEstimado ? fmtValor(p.valorEstimado) : null;
@@ -773,14 +788,13 @@ export const propostaRouter = router({
 </table>
 </body></html>`;
 
-      await transporter.sendMail({
+      await sendMailAndSave(smtpProposta, {
         from:    fromField,
         to:      p.tomador.email,
         subject: `${temDocs ? "Documentos para assinar" : "Proposta"}: ${p.titulo} — ${emitenteNome}`,
         html:    htmlEmail,
         attachments: [
           ...allAttachments,
-          // Logo como CID para exibição inline no e-mail
           ...(logoPath ? [{ filename: `logo.${logoExt}`, path: logoPath, cid: logoCid, contentType: logoMime }] : []),
         ],
       });
@@ -797,11 +811,12 @@ export const propostaRouter = router({
 
   enviarWhatsApp: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const p = await prisma.proposta.findUniqueOrThrow({
         where: { id: input.id },
         include: { tomador: true },
       }) as any;
+      assertEmitenteAccess(ctx, p.emitenteId);
 
       const telefone: string | null = p.tomador.telefone ?? null;
       if (!telefone) throw new Error("Tomador não possui telefone cadastrado");
@@ -842,7 +857,7 @@ export const propostaRouter = router({
       descricaoServico: z.string().min(5),
       nomeServico:      z.string().optional().nullable(),
       valor:            z.number().int().positive(),
-      diaVencimento:    z.number().int().min(1).max(28),
+      diaVencimento:    z.number().int().min(1).max(30),
       metodoCobr:       z.enum(["PIX_BOLETO", "PIX", "BOLETO", "NENHUM", "ALVARA"]).default("PIX_BOLETO"),
       emitirNfseAuto:   z.boolean().default(false),
       gerarCobrancaAuto:z.boolean().default(true),
@@ -850,9 +865,13 @@ export const propostaRouter = router({
       totalParcelas:    z.number().int().positive().optional().nullable(),
       issRetido:        z.boolean().default(false),
     }))
-    .mutation(async ({ input }) => {
-      const p = await prisma.proposta.findUniqueOrThrow({ where: { id: input.id } });
+    .mutation(async ({ input, ctx }) => {
+      const p = await prisma.proposta.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true, contratoId: true, tomadorId: true },
+      });
       if (p.contratoId) throw new Error("Proposta já convertida em contrato");
+      assertEmitenteAccess(ctx, p.emitenteId);
 
       const { id: propostaId, ...contratoData } = input;
 

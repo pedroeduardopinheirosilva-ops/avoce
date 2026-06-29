@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { trpc } from "../lib/trpc";
 import RichEditor from "../components/RichEditor";
@@ -43,66 +43,75 @@ function DocsBotoes({ propostaId, onGerar, onEdit }: {
     URL.revokeObjectURL(url);
   }
 
-  if (!docs || docs.length === 0) {
+  if (!docs) {
+    return <p className="px-3 py-2 text-xs text-gray-400">Carregando...</p>;
+  }
+
+  if (docs.length === 0) {
     return (
       <button
         onClick={() => onGerar()}
-        className="px-2 py-1 rounded text-xs text-brand-700 hover:bg-brand-50 font-medium border border-brand-200"
-        title="Gerar contrato/procuração dos templates configurados"
+        className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
       >
-        📋 Gerar Docs
+        📋 Gerar documentos
       </button>
     );
   }
 
+  const tipoLabel = (tipo: string) =>
+    tipo === "CONTRATO" ? "Contrato" : tipo === "PROCURACAO" ? "Procuração" : "Doc";
+
+  const tipoCor = (tipo: string) =>
+    tipo === "CONTRATO"   ? "bg-blue-100 text-blue-700" :
+    tipo === "PROCURACAO" ? "bg-purple-100 text-purple-700" :
+    "bg-gray-100 text-gray-700";
+
   return (
     <>
-      {docs.map((doc: any) => (
-        <span key={doc.id} className="inline-flex gap-1">
-          <button
-            onClick={() => baixar(doc.id, doc.titulo, doc.tipo, "pdf")}
-            className={`px-2 py-1 rounded text-xs font-medium border ${
-              doc.tipo === "CONTRATO"   ? "text-blue-700 border-blue-200 hover:bg-blue-50" :
-              doc.tipo === "PROCURACAO" ? "text-purple-700 border-purple-200 hover:bg-purple-50" :
-              "text-gray-700 border-gray-200 hover:bg-gray-50"
-            }`}
-            title={`${doc.titulo} — PDF`}
-          >
-            📄 {doc.tipo === "CONTRATO" ? "Contrato" : doc.tipo === "PROCURACAO" ? "Procuração" : "Doc"}
-          </button>
-          {doc.docxPath && (
+      {(docs as any[]).map((doc: any) => (
+        <div key={doc.id} className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50">
+          <span className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold ${tipoCor(doc.tipo)}`}>
+            {tipoLabel(doc.tipo)}
+          </span>
+          <span className="flex-1 text-xs text-gray-600 truncate min-w-0" title={doc.titulo}>
+            {doc.titulo}
+          </span>
+          <div className="flex items-center gap-1 shrink-0">
             <button
-              onClick={() => baixar(doc.id, doc.titulo, doc.tipo, "docx")}
-              className={`px-2 py-1 rounded text-xs font-medium border ${
-                doc.tipo === "CONTRATO"   ? "text-blue-700 border-blue-200 hover:bg-blue-50" :
-                doc.tipo === "PROCURACAO" ? "text-purple-700 border-purple-200 hover:bg-purple-50" :
-                "text-gray-700 border-gray-200 hover:bg-gray-50"
-              }`}
-              title={`${doc.titulo} — DOCX (Word)`}
+              onClick={() => baixar(doc.id, doc.titulo, doc.tipo, "pdf")}
+              className="px-1.5 py-0.5 rounded text-[10px] font-medium text-gray-600 hover:bg-gray-200"
+              title="Baixar PDF"
             >
-              📝 .docx
+              PDF
             </button>
-          )}
-          <button
-            onClick={() => { if (doc.htmlEditado) onEdit(doc); }}
-            disabled={!doc.htmlEditado}
-            title={doc.htmlEditado ? `Editar ${doc.titulo}` : "Regenere os documentos para habilitar edição"}
-            className={`px-2 py-1 rounded text-xs font-medium border ${
-              doc.htmlEditado
-                ? "text-amber-700 border-amber-200 hover:bg-amber-50"
-                : "text-gray-300 border-gray-200 cursor-not-allowed"
-            }`}
-          >
-            ✏️
-          </button>
-        </span>
+            {doc.docxPath && (
+              <button
+                onClick={() => baixar(doc.id, doc.titulo, doc.tipo, "docx")}
+                className="px-1.5 py-0.5 rounded text-[10px] font-medium text-gray-600 hover:bg-gray-200"
+                title="Baixar DOCX"
+              >
+                DOCX
+              </button>
+            )}
+            <button
+              onClick={() => { if (doc.htmlEditado) onEdit(doc); }}
+              disabled={!doc.htmlEditado}
+              title={doc.htmlEditado ? "Editar texto" : "Regenere para habilitar edição"}
+              className={`px-1 py-0.5 rounded text-xs ${
+                doc.htmlEditado ? "text-gray-500 hover:bg-gray-200" : "text-gray-300 cursor-not-allowed"
+              }`}
+            >
+              ✏️
+            </button>
+          </div>
+        </div>
       ))}
       <button
         onClick={() => { if (confirm("Regenerar todos os documentos desta proposta?")) onGerar(); }}
-        className="px-2 py-1 rounded text-xs text-gray-500 hover:bg-gray-100 font-medium border border-gray-200"
-        title="Regenerar documentos (apaga e recria)"
+        className="w-full text-left flex items-center gap-2 px-3 py-1.5 text-xs text-gray-500 hover:bg-gray-50"
+        title="Apaga e recria todos os documentos"
       >
-        🔄
+        🔄 Regenerar documentos
       </button>
     </>
   );
@@ -256,6 +265,8 @@ export default function Propostas() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [editDocModal, setEditDocModal] = useState<any | null>(null);
   const [editDocHtml, setEditDocHtml]   = useState("");
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [menuPos, setMenuPos] = useState<{ top?: number; bottom?: number; right: number }>({ right: 0 });
 
   function abrirWhatsApp(p: any) {
     const nome    = p.tomador.nome.split(" ")[0];
@@ -403,6 +414,27 @@ export default function Propostas() {
     }
   }
 
+  useEffect(() => {
+    if (!openMenuId) return;
+    const close = () => setOpenMenuId(null);
+    window.addEventListener("scroll", close, { passive: true });
+    return () => window.removeEventListener("scroll", close);
+  }, [openMenuId]);
+
+  function handleMenuToggle(e: React.MouseEvent<HTMLButtonElement>, id: string) {
+    e.stopPropagation();
+    if (openMenuId === id) { setOpenMenuId(null); return; }
+    const rect = e.currentTarget.getBoundingClientRect();
+    const right = window.innerWidth - rect.right;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    if (spaceBelow < 300) {
+      setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
+    } else {
+      setMenuPos({ top: rect.bottom + 4, right });
+    }
+    setOpenMenuId(id);
+  }
+
   function abrirNegociacao(p: any) {
     setNegociacaoModal(p);
     setNegociacaoObs("");
@@ -425,7 +457,7 @@ export default function Propostas() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
+    <div className="p-4 md:p-6 max-w-7xl mx-auto">
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
@@ -466,15 +498,15 @@ export default function Propostas() {
 
       {/* Tabela */}
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-x-auto">
-        <table className="w-full text-sm min-w-[700px]">
+        <table className="w-full text-sm min-w-[860px]">
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
-              <th className="px-4 py-3 text-left font-semibold text-gray-600">Título</th>
-              <th className="px-4 py-3 text-left font-semibold text-gray-600">Tomador</th>
-              {!filterEmitenteId && <th className="px-4 py-3 text-left font-semibold text-gray-600">Empresa</th>}
-              <th className="px-4 py-3 text-left font-semibold text-gray-600">Valor</th>
-              <th className="px-4 py-3 text-left font-semibold text-gray-600">Validade</th>
-              <th className="px-4 py-3 text-left font-semibold text-gray-600">Status</th>
+              <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[260px]">Título</th>
+              <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[180px]">Tomador</th>
+              {!filterEmitenteId && <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[150px]">Empresa</th>}
+              <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[100px] whitespace-nowrap">Valor</th>
+              <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[90px] whitespace-nowrap">Validade</th>
+              <th className="px-4 py-3 text-left font-semibold text-gray-600 min-w-[120px]">Status</th>
               <th className="px-4 py-3 sticky right-0 bg-gray-50"></th>
             </tr>
           </thead>
@@ -482,122 +514,182 @@ export default function Propostas() {
             {isLoading && <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">Carregando...</td></tr>}
             {!isLoading && !data?.propostas.length && <tr><td colSpan={6} className="px-4 py-8 text-center text-gray-400">Nenhuma proposta encontrada</td></tr>}
             {data?.propostas.map(p => (
-              <tr key={p.id} className="hover:bg-gray-50 transition-colors">
-                <td className="px-4 py-3 font-medium text-gray-800 max-w-[200px] truncate">
-                  {p.titulo}
+              <tr
+                key={p.id}
+                className="hover:bg-gray-50 transition-colors cursor-pointer group"
+                onClick={() => {
+                  if (p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") abrirEditar(p);
+                  else window.open(`/api/proposta/${p.tokenAceite}`, "_blank");
+                }}
+              >
+                <td className="px-4 py-3 min-w-[260px] max-w-[340px]">
+                  <span className="font-medium text-gray-800 group-hover:text-brand-700 transition-colors block truncate">
+                    {p.titulo}
+                  </span>
                   {(p as any).contratoDiaVencimento && (
-                    <span className="ml-1.5 text-xs bg-brand-50 text-brand-700 px-1.5 py-0.5 rounded">Auto</span>
+                    <span className="text-xs bg-brand-50 text-brand-700 px-1.5 py-0.5 rounded">Auto</span>
                   )}
                 </td>
-                <td className="px-4 py-3 text-gray-600">{p.tomador.nome}</td>
+                <td className="px-4 py-3 text-gray-600 max-w-[220px] truncate">{p.tomador.nome}</td>
                 {!filterEmitenteId && (
-                  <td className="px-4 py-3 text-xs text-gray-500 max-w-[120px] truncate">
+                  <td className="px-4 py-3 text-xs text-gray-500 max-w-[180px] truncate">
                     {(p as any).emitente?.nomeFantasia || (p as any).emitente?.nome || "—"}
                   </td>
                 )}
-                <td className="px-4 py-3 text-gray-700">{p.valorEstimado ? fmt(p.valorEstimado) : "—"}</td>
-                <td className="px-4 py-3 text-gray-500 text-xs">
+                <td className="px-4 py-3 text-gray-700 whitespace-nowrap">{p.valorEstimado ? fmt(p.valorEstimado) : "—"}</td>
+                <td className="px-4 py-3 text-gray-500 text-xs whitespace-nowrap">
                   {p.validadeAte ? p.validadeAte.slice(0, 10).split("-").reverse().join("/") : "—"}
                 </td>
-                <td className="px-4 py-3"><StatusBadge status={p.status} /></td>
-                <td className="px-4 py-3 text-right whitespace-nowrap sticky right-0 bg-white border-l border-gray-100">
-                  <div className="flex items-center gap-1 justify-end">
-                    {/* Ver */}
-                    {p.status !== "RASCUNHO" && (
-                      <a href={`/api/proposta/${p.tokenAceite}`} target="_blank" rel="noopener noreferrer"
-                        className="px-2 py-1 rounded text-xs text-brand-600 hover:bg-brand-50 font-medium">Ver</a>
-                    )}
-                    {/* WhatsApp — copiar/abrir link */}
-                    {p.status !== "RASCUNHO" && (
-                      <button
-                        onClick={() => abrirWhatsApp(p)}
-                        title="Abrir no WhatsApp Web com mensagem pré-preenchida (e copiar link)"
-                        className={`px-2 py-1 rounded text-xs font-medium border transition-colors ${
-                          copiedId === p.id
-                            ? "text-green-700 border-green-300 bg-green-50"
-                            : "text-green-600 border-green-200 hover:bg-green-50"
-                        }`}
+                <td className="px-4 py-3">
+                  <StatusBadge status={p.status} />
+                  {(p as any).contratoId && (
+                    <span className="ml-1.5 text-green-600 text-xs font-bold" title="Contrato gerado">✓</span>
+                  )}
+                </td>
+
+                {/* Coluna de ações: apenas ⋮ */}
+                <td className="px-3 py-3 sticky right-0 bg-white group-hover:bg-gray-50 border-l border-gray-100 transition-colors"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    onClick={(e) => handleMenuToggle(e, p.id)}
+                    className="w-7 h-7 flex items-center justify-center rounded text-gray-400 hover:bg-gray-200 hover:text-gray-700 border border-gray-200 leading-none"
+                    title="Ações"
+                  >
+                    ⋮
+                  </button>
+
+                  {openMenuId === p.id && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={() => setOpenMenuId(null)} />
+                      <div
+                        className="fixed bg-white border border-gray-200 rounded-xl shadow-xl z-20 w-56 py-1.5 overflow-y-auto"
+                        style={{ top: menuPos.top, bottom: menuPos.bottom, right: menuPos.right, maxHeight: "min(480px, 85vh)" }}
+                        onClick={(e) => e.stopPropagation()}
                       >
-                        {copiedId === p.id ? "✓ Copiado" : "💬 WhatsApp"}
-                      </button>
-                    )}
-                    {/* Editar */}
-                    {(p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") && (
-                      <button onClick={() => abrirEditar(p)}
-                        className="px-2 py-1 rounded text-xs text-gray-600 hover:bg-gray-100 font-medium">Editar</button>
-                    )}
-                    {/* Em negociação */}
-                    {(p.status === "ENVIADA" || p.status === "RASCUNHO") && (
-                      <button onClick={() => abrirNegociacao(p)}
-                        className="px-2 py-1 rounded text-xs text-yellow-700 hover:bg-yellow-50 font-medium border border-yellow-200">
-                        Negociar
-                      </button>
-                    )}
-                    {/* Enviar / Reenviar e-mail */}
-                    {p.status === "RASCUNHO" ? (
-                      <button
-                        onClick={() => { if (confirm(`Enviar proposta para ${p.tomador.email || p.tomador.nome}?`)) enviarEmail.mutate({ id: p.id }); }}
-                        disabled={enviarEmail.isPending}
-                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50 border border-blue-200">
-                        {enviarEmail.isPending ? "..." : "✉️ Enviar"}
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => { if (confirm(`Reenviar e-mail para ${p.tomador.email || p.tomador.nome}?`)) enviarEmail.mutate({ id: p.id }); }}
-                        disabled={enviarEmail.isPending}
-                        className="px-2 py-1 rounded text-xs text-blue-600 hover:bg-blue-50 font-medium disabled:opacity-50 border border-blue-200">
-                        {enviarEmail.isPending ? "..." : "✉️ E-mail"}
-                      </button>
-                    )}
-                    {/* Reenviar via WhatsApp (Evolution API) */}
-                    {p.status !== "RASCUNHO" && (
-                      <button
-                        onClick={() => { if (confirm(`Enviar link via WhatsApp para ${p.tomador.nome}?`)) enviarWA.mutate({ id: p.id }); }}
-                        disabled={enviarWA.isPending}
-                        title="Envia o link PAKT (ou de aceite) diretamente via WhatsApp"
-                        className="px-2 py-1 rounded text-xs text-green-700 hover:bg-green-50 font-medium disabled:opacity-50 border border-green-200">
-                        {enviarWA.isPending ? "..." : "📱 WA"}
-                      </button>
-                    )}
-                    {/* PDF Assinado (PAKT) */}
-                    {p.status === "ACEITA" && (p as any).paktSignedPdfPath && (
-                      <button
-                        onClick={async () => {
-                          const token = localStorage.getItem("avoce_token");
-                          const res = await fetch(`/api/proposta/${p.id}/pdf-assinado`, {
-                            headers: { Authorization: `Bearer ${token}` },
-                          });
-                          if (!res.ok) { alert("PDF ainda não disponível"); return; }
-                          const blob = await res.blob();
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement("a");
-                          a.href = url; a.download = `Proposta-Assinada-${p.titulo.replace(/[^a-zA-Z0-9]/g, "-")}.pdf`;
-                          a.click(); URL.revokeObjectURL(url);
-                        }}
-                        className="px-2 py-1 rounded text-xs text-green-700 hover:bg-green-50 font-medium border border-green-200">
-                        📄 PDF Assinado
-                      </button>
-                    )}
-                    {/* Documentos gerados (contrato/procuração) */}
-                    <DocsBotoes
-                      propostaId={p.id}
-                      onGerar={() => gerarDocumentos.mutate({ propostaId: p.id })}
-                      onEdit={(doc) => { setEditDocModal(doc); setEditDocHtml(doc.htmlEditado ?? ""); }}
-                    />
-                    {/* Converter manual (só se não tiver parâmetros auto ou já aceita sem contrato) */}
-                    {p.status === "ACEITA" && !(p as any).contratoId && !(p as any).contratoDiaVencimento && (
-                      <button onClick={() => setConverterModal(p)}
-                        className="px-2 py-1 rounded text-xs text-green-700 hover:bg-green-50 font-medium">Contratar</button>
-                    )}
-                    {(p as any).contratoId && (
-                      <span className="text-xs text-green-600 font-medium px-2">✓ Contrato</span>
-                    )}
-                    {/* Excluir */}
-                    {p.status === "RASCUNHO" && (
-                      <button onClick={() => { if (confirm("Excluir esta proposta?")) excluir.mutate({ id: p.id }); }}
-                        className="px-2 py-1 rounded text-xs text-red-500 hover:bg-red-50 font-medium">Excluir</button>
-                    )}
-                  </div>
+                        {/* Abrir */}
+                        {(p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") ? (
+                          <button onClick={() => { abrirEditar(p); setOpenMenuId(null); }}
+                            className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-brand-600 hover:bg-brand-50 font-medium">
+                            ✏️ Editar proposta
+                          </button>
+                        ) : (
+                          <a href={`/api/proposta/${p.tokenAceite}`} target="_blank" rel="noopener noreferrer"
+                            className="flex items-center gap-2 px-3 py-2 text-sm text-brand-600 hover:bg-brand-50 font-medium"
+                            onClick={() => setOpenMenuId(null)}>
+                            🔗 Ver proposta
+                          </a>
+                        )}
+
+                        {/* ── Envio ──────────────────────────────────── */}
+                        <div className="border-t border-gray-100 pt-1 mt-1">
+                          <p className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Envio</p>
+                          <button
+                            onClick={() => {
+                              if (confirm(`${p.status === "RASCUNHO" ? "Enviar" : "Reenviar"} e-mail para ${p.tomador.email || p.tomador.nome}?`))
+                                enviarEmail.mutate({ id: p.id });
+                              setOpenMenuId(null);
+                            }}
+                            disabled={enviarEmail.isPending}
+                            className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                          >
+                            ✉️ {p.status === "RASCUNHO" ? "Enviar por E-mail" : "Reenviar E-mail"}
+                          </button>
+                          {p.status !== "RASCUNHO" && (
+                            <>
+                              <button
+                                onClick={() => {
+                                  if (confirm(`Enviar link via WhatsApp para ${p.tomador.nome}?`))
+                                    enviarWA.mutate({ id: p.id });
+                                  setOpenMenuId(null);
+                                }}
+                                disabled={enviarWA.isPending}
+                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                              >
+                                📱 Enviar via WhatsApp
+                              </button>
+                              <button
+                                onClick={() => { abrirWhatsApp(p); setOpenMenuId(null); }}
+                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                              >
+                                💬 Copiar link WhatsApp
+                                {copiedId === p.id && <span className="text-xs text-green-600 ml-auto">✓ copiado</span>}
+                              </button>
+                            </>
+                          )}
+                        </div>
+
+                        {/* ── Fluxo ──────────────────────────────────── */}
+                        {(p.status === "ENVIADA" || p.status === "RASCUNHO" ||
+                          (p.status === "ACEITA" && !(p as any).contratoId && !(p as any).contratoDiaVencimento)) && (
+                          <div className="border-t border-gray-100 pt-1 mt-1">
+                            <p className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Fluxo</p>
+                            {(p.status === "ENVIADA" || p.status === "RASCUNHO") && (
+                              <button
+                                onClick={() => { abrirNegociacao(p); setOpenMenuId(null); }}
+                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                              >
+                                📋 Marcar Em Negociação
+                              </button>
+                            )}
+                            {p.status === "ACEITA" && !(p as any).contratoId && !(p as any).contratoDiaVencimento && (
+                              <button
+                                onClick={() => { setConverterModal(p); setOpenMenuId(null); }}
+                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                              >
+                                🤝 Converter em Contrato
+                              </button>
+                            )}
+                          </div>
+                        )}
+
+                        {/* ── Documentos ─────────────────────────────── */}
+                        <div className="border-t border-gray-100 pt-1 mt-1">
+                          <p className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Documentos</p>
+                          {p.status === "ACEITA" && (p as any).paktSignedPdfPath && (
+                            <button
+                              onClick={async () => {
+                                const token = localStorage.getItem("avoce_token");
+                                const res = await fetch(`/api/proposta/${p.id}/pdf-assinado`, {
+                                  headers: { Authorization: `Bearer ${token}` },
+                                });
+                                if (!res.ok) { alert("PDF ainda não disponível"); return; }
+                                const blob = await res.blob();
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement("a");
+                                a.href = url;
+                                a.download = `Proposta-Assinada-${p.titulo.replace(/[^a-zA-Z0-9]/g, "-")}.pdf`;
+                                a.click();
+                                URL.revokeObjectURL(url);
+                                setOpenMenuId(null);
+                              }}
+                              className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                            >
+                              📄 PDF Assinado
+                            </button>
+                          )}
+                          <DocsBotoes
+                            propostaId={p.id}
+                            onGerar={() => { gerarDocumentos.mutate({ propostaId: p.id }); setOpenMenuId(null); }}
+                            onEdit={(doc) => { setEditDocModal(doc); setEditDocHtml(doc.htmlEditado ?? ""); setOpenMenuId(null); }}
+                          />
+                        </div>
+
+                        {/* ── Danger ─────────────────────────────────── */}
+                        {p.status === "RASCUNHO" && (
+                          <>
+                            <div className="border-t border-gray-100 mt-1" />
+                            <button
+                              onClick={() => { if (confirm("Excluir esta proposta?")) { excluir.mutate({ id: p.id }); setOpenMenuId(null); } }}
+                              className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-red-600 hover:bg-red-50"
+                            >
+                              🗑️ Excluir proposta
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </td>
               </tr>
             ))}
@@ -773,7 +865,7 @@ export default function Propostas() {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Dia de Vencimento *</label>
-                    <input type="number" min={1} max={28} value={form.contratoDiaVencimento}
+                    <input type="number" min={1} max={30} value={form.contratoDiaVencimento}
                       onChange={e => setForm({ ...form, contratoDiaVencimento: e.target.value })}
                       className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
                       placeholder="Ex: 5" />

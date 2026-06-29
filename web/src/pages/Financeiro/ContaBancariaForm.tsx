@@ -343,7 +343,7 @@ export default function ContaBancariaForm() {
   const isBusy = createMut.isPending || updateMut.isPending || saveCredMut.isPending;
 
   return (
-    <div className="p-8 max-w-2xl mx-auto">
+    <div className="p-4 md:p-8 max-w-2xl mx-auto">
       <div className="flex items-center gap-3 mb-6">
         <Link to="/financeiro/contas" className="text-sm text-indigo-600 hover:underline">← Contas</Link>
         <h1 className="text-2xl font-bold text-gray-900">

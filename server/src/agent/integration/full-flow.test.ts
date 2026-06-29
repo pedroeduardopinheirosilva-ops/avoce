@@ -61,8 +61,10 @@ const { state, mocks } = vi.hoisted(() => {
     getGreetingStep: vi.fn(async () => "Sou a Ana, assistente do escritório. Me conta, qual é o seu nome?"),
     transitionDeal: vi.fn(async () => ({ transitioned: false, pendingActions: [] as any[] })),
     checkTransitions: vi.fn(async () => ({ transitioned: false, pendingActions: [] as any[] })),
-    sendHumanized: vi.fn(async () => {}),
-    sendHumanizedSafe: vi.fn(async () => {}),
+    // Devem retornar true: dedupAndSend só persiste a mensagem out quando sent=true,
+    // e a persistência é o que permite o dedup bloquear o reenvio de webhooks duplicados.
+    sendHumanized: vi.fn(async () => true),
+    sendHumanizedSafe: vi.fn(async () => true),
   };
 
   return { state, mocks };
@@ -114,6 +116,8 @@ vi.mock("../../db.js", () => ({
         if (where?.dealId) list = list.filter(m => m.dealId === where.dealId);
         if (where?.conteudo) list = list.filter(m => m.conteudo === where.conteudo);
         if (where?.enviadaEm?.gte) list = list.filter(m => new Date(m.enviadaEm) >= new Date(where.enviadaEm.gte));
+        // dedupAndSend usa `enviadaEm: { gt: ... }` para checar resposta do lead após o último out
+        if (where?.enviadaEm?.gt) list = list.filter(m => new Date(m.enviadaEm) > new Date(where.enviadaEm.gt));
         if (!list.length) return null;
         if (orderBy?.enviadaEm === "desc") return list[list.length - 1];
         return list[0];
@@ -163,6 +167,9 @@ vi.mock("../../db.js", () => ({
     crmStage: { findFirst: vi.fn(async () => ({ id: "stage1", chave: "lead_carreteiro" })) },
     iaNotificacaoEvento: { findMany: vi.fn(async () => []) },
     iaNotificacaoLog: { create: vi.fn(async () => ({})) },
+    // Novos acessos do stage-engine: empresas bloqueadas + gates SDR (gate-evaluator)
+    iaEmpresaBloqueada: { findMany: vi.fn(async () => []) },
+    iaGateSdr: { findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null) },
   },
 }));
 
@@ -218,6 +225,9 @@ vi.mock("../transition-engine.js", () => ({
   transitionDeal: mocks.transitionDeal,
   checkTransitions: mocks.checkTransitions,
   enviarMensagemProativa: vi.fn(async () => {}),
+  // stage-engine agora também importa estes dois (B9a auto-tags + nomes de persona)
+  applyAutoTags: vi.fn(async () => {}),
+  getPersonaNomeExibicao: vi.fn(async (_pid: string, chave: string) => chave),
 }));
 
 // ─── Mock: output-guard ───────────────────────────────────────────────────────
@@ -252,6 +262,9 @@ vi.mock("../persona-router.js", () => ({
   buildInstrucaoBase: vi.fn(() => "INSTRUCAO_BASE"),
   detectarFaseAtualDaniela: vi.fn(() => "inicial"),
   invalidateFlowCache: vi.fn(),
+  // stage-engine: tracking do passo de vínculo atual + parser de tempo (reopen path)
+  getLastVinculoStepChave: vi.fn(() => null),
+  parseTempToMeses: vi.fn(() => 999),
 }));
 
 // ─── Mock: deal-repository ────────────────────────────────────────────────────
@@ -379,11 +392,11 @@ describe("Scenario 1: Ana qualification flow", () => {
 
     expect(mocks.callLlm).not.toHaveBeenCalled();
     expect(mocks.sendHumanized).toHaveBeenCalledOnce();
-    const sentText = mocks.sendHumanized.mock.calls[0][2] as string;
+    const sentText = (mocks.sendHumanized.mock.calls[0] as unknown[])[2] as string;
     expect(sentText).toMatch(/sou a ana|bom dia|boa tarde|boa noite/i);
   });
 
-  it("Msg 2 (nome): extractQualificacaoData called, LLM generates response", async () => {
+  it("Msg 2 (nome): extractQualificacaoData called, pergunta determinística enviada SEM chamar LLM", async () => {
     state.isNewDeal = false;
     state.deal.iaFlags = { _saudacao_enviada: true };
     mocks.extractQual.mockResolvedValueOnce({ nome: "João Silva" });
@@ -391,8 +404,13 @@ describe("Scenario 1: Ana qualification flow", () => {
     await processIncomingMessage(PROJETO_ID, makeMsg("msg2", "João Silva"), false);
 
     expect(mocks.extractQual).toHaveBeenCalled();
-    expect(mocks.callLlm).toHaveBeenCalled();
+    // Comportamento atual: quando há nextQDeterministico para a assistente, o stage-engine
+    // pula o LLM ("skipLLM — deterministic override") e envia a pergunta verbatim.
+    expect(mocks.callLlm).not.toHaveBeenCalled();
     expect(mocks.sendHumanizedSafe).toHaveBeenCalledOnce();
+    // O override determinístico pode personalizar com o nome do lead ("João, qual o seu nome...")
+    const sent = (mocks.sendHumanizedSafe.mock.calls[0] as unknown[])[2] as string;
+    expect(sent).toMatch(/qual o seu nome completo\?/i);
   });
 
   it("Msg 3 (work history): empresa_recente and vinculo_recente saved to deal state", async () => {
@@ -408,7 +426,8 @@ describe("Scenario 1: Ana qualification flow", () => {
     await processIncomingMessage(PROJETO_ID, makeMsg("msg3", "Trabalhei 3 anos na Transportes ABC, carteira assinada"), false);
 
     expect(mocks.extractQual).toHaveBeenCalled();
-    expect(mocks.callLlm).toHaveBeenCalled();
+    // Deterministic override: pergunta enviada sem LLM (ver Msg 2)
+    expect(mocks.sendHumanizedSafe).toHaveBeenCalled();
     const merged = { ...state.deal.qualificacao, ...state.deal.iaFlags };
     expect(merged.nome).toBe("João Silva");
     expect(merged.empresa_recente).toBe("Transportes ABC");
@@ -425,7 +444,7 @@ describe("Scenario 1: Ana qualification flow", () => {
 
     mocks.runAssistente.mockResolvedValueOnce({
       allDone: true, phase: "qualificacao_completa",
-      deterministicQuestion: null, systemInstructions: "", dealUpdates: null,
+      deterministicQuestion: null as unknown as string, systemInstructions: "", dealUpdates: null,
     });
     mocks.transitionDeal.mockResolvedValueOnce({
       transitioned: true,
@@ -439,7 +458,8 @@ describe("Scenario 1: Ana qualification flow", () => {
 
     await processIncomingMessage(PROJETO_ID, makeMsg("msg4", "sim tinha horas extras"), false);
 
-    expect(mocks.transitionDeal).toHaveBeenCalledWith(PROJETO_ID, "d1", "qualificacao_completa", "5511999999999");
+    // transitionDeal agora recebe um 5º argumento: stageChaveOverride (stage efetivo do deal)
+    expect(mocks.transitionDeal).toHaveBeenCalledWith(PROJETO_ID, "d1", "qualificacao_completa", "5511999999999", "lead_carreteiro");
 
     const t45 = setTimeoutSpy.mock.calls.find(c => c[1] === 45000);
     expect(t45).toBeDefined();
@@ -518,13 +538,13 @@ describe("Scenario 3: Audio message", () => {
 
     await processIncomingMessage(PROJETO_ID, audioMsg, false);
 
-    expect(mocks.extractQual).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.stringContaining(transcribedText),
-      expect.anything(),
-      expect.anything(),
-    );
-    expect(mocks.callLlm).toHaveBeenCalled();
+    // Assinatura atual: extractQualificacaoData(projetoId, texto, perguntas[], merged, personaLlmChave)
+    // O texto transcrito chega prefixado com "Cliente: " — verifica pelo argumento posicional.
+    expect(mocks.extractQual).toHaveBeenCalled();
+    const extractArgs = mocks.extractQual.mock.calls[0] as unknown[];
+    expect(String(extractArgs[1])).toContain(transcribedText);
+    // Deterministic override: a resposta é enviada sem chamar o LLM
+    expect(mocks.sendHumanizedSafe).toHaveBeenCalled();
   });
 });
 

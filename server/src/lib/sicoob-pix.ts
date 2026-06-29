@@ -221,3 +221,15 @@ export async function consultarWebhookPix(cfg: SicoobPixConfig): Promise<{ webho
 export function sicoobPixConfigurado(cfg: SicoobPixConfig): boolean {
   return !!(cfg.clientId && existsSync(resolve(cfg.certPath)));
 }
+
+// ── Invalida cache ao trocar certificado ──────────────────────────────────────
+
+export function invalidarCacheSicoobPix(certPath: string): void {
+  for (const key of _agents.keys()) {
+    if (key.startsWith(certPath + "::")) {
+      _agents.get(key)?.destroy?.();
+      _agents.delete(key);
+    }
+  }
+  _tokens.clear();
+}

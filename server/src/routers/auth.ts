@@ -1,64 +1,169 @@
 import { z }         from "zod";
 import jwt           from "jsonwebtoken";
 import bcrypt        from "bcryptjs";
+import { TRPCError } from "@trpc/server";
 import { router, publicProc, authProc } from "./trpc.js";
 import { prisma }    from "../db.js";
+import type { PermissoesUsuario } from "./permission-constants.js";
+
+// ── Rate limiting para login: 5 tentativas por IP a cada 15 minutos ───────────
+const _loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function checkLoginRateLimit(ip: string): void {
+  const now = Date.now();
+  const WINDOW_MS = 15 * 60 * 1000;
+  const MAX = 5;
+  const entry = _loginAttempts.get(ip);
+  if (entry && now < entry.resetAt) {
+    if (entry.count >= MAX) {
+      throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: "Muitas tentativas. Aguarde 15 minutos." });
+    }
+    entry.count++;
+  } else {
+    _loginAttempts.set(ip, { count: 1, resetAt: now + WINDOW_MS });
+  }
+}
 
 export const authRouter = router({
   login: publicProc
     .input(z.object({ email: z.string().email(), senha: z.string() }))
-    .mutation(async ({ input }) => {
-      const user = await prisma.usuario.findUnique({ where: { email: input.email } });
+    .mutation(async ({ input, ctx }) => {
+      const ip = (ctx.req.headers["x-forwarded-for"] as string | undefined)?.split(",")[0].trim()
+        ?? ctx.req.ip
+        ?? "unknown";
+      checkLoginRateLimit(ip);
+
+      const user = await prisma.usuario.findUnique({
+        where: { email: input.email },
+        select: { id: true, nome: true, email: true, senha: true, ativo: true, empresaId: true, role: true },
+      });
       if (!user || !user.ativo) throw new Error("Credenciais inválidas");
       const ok = await bcrypt.compare(input.senha, user.senha);
       if (!ok) throw new Error("Credenciais inválidas");
 
       const token = jwt.sign(
-        { userId: user.id },
-        process.env.JWT_SECRET ?? "avoce_secret",
+        { userId: user.id, empresaId: user.empresaId, role: user.role },
+        process.env.JWT_SECRET!,
         { expiresIn: "7d" }
       );
-      return { token, nome: user.nome, email: user.email };
+      return { token, nome: user.nome, email: user.email, empresaId: user.empresaId, role: user.role };
     }),
 
   me: authProc.query(async ({ ctx }) => {
-    const user = await prisma.usuario.findUniqueOrThrow({ where: { id: ctx.userId } });
-    return { id: user.id, nome: user.nome, email: user.email };
+    const user = await prisma.usuario.findUniqueOrThrow({
+      where: { id: ctx.userId },
+      select: { id: true, nome: true, email: true, empresaId: true, role: true, permissoes: true },
+    });
+    return user;
   }),
 
-  listUsuarios: authProc.query(async () => {
-    return prisma.usuario.findMany({
-      select: { id: true, nome: true, email: true, ativo: true, criadoEm: true },
+  listUsuarios: authProc.query(async ({ ctx }) => {
+    const where = ctx.role === "admin" && !ctx.empresaId ? {} : { empresaId: ctx.empresaId };
+    return (prisma as any).usuario.findMany({
+      where,
+      select: { id: true, nome: true, email: true, role: true, ativo: true, criadoEm: true, permissoes: true, whatsapp: true },
       orderBy: { nome: "asc" },
     });
   }),
 
   createUsuario: authProc
-    .input(z.object({ nome: z.string(), email: z.string().email(), senha: z.string().min(6) }))
-    .mutation(async ({ input }) => {
+    .input(z.object({
+      nome: z.string(),
+      email: z.string().email(),
+      senha: z.string().min(6),
+      empresaId: z.string().optional(),
+    }))
+    .mutation(async ({ input, ctx }) => {
       const hash = await bcrypt.hash(input.senha, 10);
+      // Só admin global (sem empresaId) pode definir empresaId manualmente
+      const empresaId = input.empresaId
+        ? (ctx.role === "admin" && !ctx.empresaId ? input.empresaId : ctx.empresaId)
+        : ctx.empresaId;
       return prisma.usuario.create({
-        data: { nome: input.nome, email: input.email, senha: hash },
-        select: { id: true, nome: true, email: true },
+        data: {
+          nome: input.nome,
+          email: input.email,
+          senha: hash,
+          empresaId,
+          role: "user",
+        },
+        select: { id: true, nome: true, email: true, role: true },
       });
     }),
 
   updateUsuario: authProc
     .input(z.object({
-      id:    z.string(),
-      nome:  z.string().optional(),
-      email: z.string().email().optional(),
-      senha: z.string().min(6).optional(),
-      ativo: z.boolean().optional(),
+      id:        z.string(),
+      nome:      z.string().optional(),
+      email:     z.string().email().optional(),
+      senha:     z.string().min(6).optional(),
+      ativo:     z.boolean().optional(),
+      role:      z.string().optional(),
+      whatsapp:  z.string().regex(/^\d{10,15}$/).nullable().optional(), // somente dígitos
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, senha, ...rest } = input;
       const data: any = { ...rest };
       if (senha) data.senha = await bcrypt.hash(senha, 10);
-      return prisma.usuario.update({
+
+      // Verify the user belongs to the same empresa (unless admin)
+      if (ctx.role !== "admin" || ctx.empresaId) {
+        const target = await prisma.usuario.findUnique({ where: { id }, select: { empresaId: true } });
+        if (!target || target.empresaId !== ctx.empresaId) {
+          throw new Error("Usuário não pertence à sua empresa");
+        }
+      }
+
+      return (prisma as any).usuario.update({
         where: { id },
         data,
-        select: { id: true, nome: true, email: true, ativo: true },
+        select: { id: true, nome: true, email: true, role: true, ativo: true, whatsapp: true },
       });
     }),
+
+  deleteUsuario: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      if (ctx.role !== "admin") throw new Error("Apenas administradores podem excluir usuários");
+      // Prevent self-deletion
+      if (input.id === ctx.userId) throw new Error("Não é possível excluir sua própria conta");
+      // Tenant admin can only delete users from same empresa
+      if (ctx.empresaId) {
+        const target = await prisma.usuario.findUnique({ where: { id: input.id }, select: { empresaId: true } });
+        if (!target || target.empresaId !== ctx.empresaId) throw new Error("Usuário não pertence à sua empresa");
+      }
+      return prisma.usuario.delete({ where: { id: input.id } });
+    }),
+
+  updatePermissoes: authProc
+    .input(z.object({
+      id: z.string(),
+      permissoes: z.object({
+        modulos: z.array(z.string()).optional(),
+        emitentes: z.array(z.string()).optional(),
+        empresas: z.array(z.string()).optional(),
+      }).nullable(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      if (ctx.role !== "admin") throw new Error("Apenas administradores podem alterar permissões");
+      return prisma.usuario.update({
+        where: { id: input.id },
+        data:  { permissoes: input.permissoes as any },
+        select: { id: true, nome: true, email: true, permissoes: true },
+      });
+    }),
+
+  listEmitentesAcessiveis: authProc.query(async ({ ctx }) => {
+    if (ctx.role !== "admin" && ctx.empresaId) {
+      return prisma.empresaEmitente.findMany({
+        where: { empresaId: ctx.empresaId },
+        select: { id: true, nome: true },
+        orderBy: { nome: "asc" },
+      });
+    }
+    return prisma.empresaEmitente.findMany({
+      select: { id: true, nome: true },
+      orderBy: { nome: "asc" },
+    });
+  }),
 });

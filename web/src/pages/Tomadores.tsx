@@ -56,12 +56,15 @@ const REGIMES_CASAMENTO = [
   { value: "part_final_aquestos", label: "Participação Final nos Aquestos" },
 ];
 
+
 type TomadorForm = {
   id?: string;
   tipo: "PF" | "PJ";
+  empresaId: string;
   nome: string; nomeFantasia: string; cpfCnpj: string;
   email: string; emailFinanceiro: string; emailGeral: string; emailDiretoria: string; telefone: string;
   inscricaoEstadual: string; inscMunicipal: string;
+  issRetido: boolean;
   // Endereço
   endereco: string; numero: string; complemento: string;
   bairro: string; cidade: string; codigoMunicipio: string; uf: string; cep: string;
@@ -76,9 +79,10 @@ type TomadorForm = {
 function emptyForm(): TomadorForm {
   return {
     tipo: "PF",
+    empresaId: "",
     nome: "", nomeFantasia: "", cpfCnpj: "",
     email: "", emailFinanceiro: "", emailGeral: "", emailDiretoria: "", telefone: "",
-    inscricaoEstadual: "", inscMunicipal: "",
+    inscricaoEstadual: "", inscMunicipal: "", issRetido: false,
     endereco: "", numero: "", complemento: "",
     bairro: "", cidade: "Vitória da Conquista", codigoMunicipio: "2933307", uf: "BA", cep: "",
     dataNascimento: "", nacionalidade: "Brasileiro(a)", estadoCivil: "", regimeCasamento: "",
@@ -214,6 +218,7 @@ export default function Tomadores() {
   const utils = trpc.useUtils();
   const [busca, setBusca] = useState("");
   const { data: tomadores, isLoading } = trpc.tomador.listar.useQuery({ busca: busca || undefined });
+  const { data: empresas } = trpc.empresa.listar.useQuery();
 
   const [form, setForm] = useState<TomadorForm | null>(null);
   const [tomadorId, setTomadorId] = useState<string | null>(null);
@@ -242,9 +247,10 @@ export default function Tomadores() {
     setForm({
       id: t.id,
       tipo: pj ? "PJ" : "PF",
+      empresaId: t.empresaId ?? "emp_psa",
       nome: t.nome ?? "", nomeFantasia: t.nomeFantasia ?? "", cpfCnpj: t.cpfCnpj ?? "",
       email: t.email ?? "", emailFinanceiro: t.emailFinanceiro ?? "", emailGeral: t.emailGeral ?? "", emailDiretoria: t.emailDiretoria ?? "", telefone: t.telefone ?? "",
-      inscricaoEstadual: t.inscricaoEstadual ?? "", inscMunicipal: t.inscMunicipal ?? "",
+      inscricaoEstadual: t.inscricaoEstadual ?? "", inscMunicipal: t.inscMunicipal ?? "", issRetido: t.issRetido ?? false,
       endereco: t.endereco ?? "", numero: t.numero ?? "", complemento: t.complemento ?? "",
       bairro: t.bairro ?? "", cidade: t.cidade ?? "", codigoMunicipio: t.codigoMunicipio ?? "", uf: t.uf ?? "BA", cep: t.cep ?? "",
       dataNascimento: t.dataNascimento ? t.dataNascimento.slice(0, 10) : "",
@@ -281,6 +287,7 @@ export default function Tomadores() {
       emailDiretoria: form.emailDiretoria || null,
       telefone: form.telefone || null,
       inscricaoEstadual: form.inscricaoEstadual || null,
+      issRetido: form.issRetido,
       endereco: form.endereco || null, numero: form.numero || null,
       complemento: form.complemento || null, bairro: form.bairro || null,
       cidade: form.cidade || null, codigoMunicipio: form.codigoMunicipio || null,
@@ -297,6 +304,8 @@ export default function Tomadores() {
       tipoSocietario: form.tipoSocietario || null,
       // PF adicional
       regimeCasamento: form.regimeCasamento || null,
+      // Emitente
+      empresaId: form.empresaId || null,
     };
     if (form.id) atualizar.mutate({ id: form.id, ...payload });
     else criar.mutate(payload);
@@ -364,8 +373,8 @@ export default function Tomadores() {
   if (isLoading) return <div className="p-8 text-gray-500">Carregando...</div>;
 
   return (
-    <div className="p-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-4 md:p-8">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <h1 className="text-2xl font-bold text-gray-900">Clientes / Tomadores</h1>
         <button onClick={abrirNovo} className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-2 rounded-lg text-sm font-medium">
           + Novo Cliente
@@ -439,6 +448,15 @@ export default function Tomadores() {
 
             <div className="px-6 py-5 space-y-5 max-h-[80vh] overflow-y-auto">
 
+              {/* ── Emitente ──────────────────────────────────────────────── */}
+              <section>
+                <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Escritório / Emitente</h3>
+                <select value={form.empresaId} onChange={s("empresaId")} className={sel + " max-w-xs"}>
+                  <option value="">Selecione o emitente...</option>
+                  {(empresas ?? []).map(e => <option key={e.id} value={e.id}>{e.nome}</option>)}
+                </select>
+              </section>
+
               {/* ── Tipo de pessoa ────────────────────────────────────────── */}
               <section>
                 <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Tipo de Cadastro</h3>
@@ -501,6 +519,17 @@ export default function Tomadores() {
                   </Field>
                   <Field label="Inscrição Municipal">
                     <input value={form.inscMunicipal} onChange={s("inscMunicipal")} className={inp} />
+                  </Field>
+                  <Field label="ISS" col2>
+                    <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer select-none mt-1">
+                      <input
+                        type="checkbox"
+                        checked={form.issRetido}
+                        onChange={e => setForm(f => f ? { ...f, issRetido: e.target.checked } : f)}
+                        className="w-4 h-4 accent-brand-500"
+                      />
+                      Substituto tributário — ISS Retido na fonte
+                    </label>
                   </Field>
                   {tipoCadastro === "PJ" && (
                     <Field label="Inscrição Estadual">

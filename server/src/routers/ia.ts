@@ -1,7 +1,10 @@
 import { z } from "zod";
+import { TRPCError } from "@trpc/server";
 import { router, authProc } from "./trpc.js";
 import { prisma } from "../db.js";
+import { whereEmpresa } from "./tenant-utils.js";
 import { invalidateClientCache } from "../agent/llm.js";
+import { fieldEncrypt } from "../lib/field-crypto.js";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Seed data — Projeto Carreteiros
@@ -88,30 +91,127 @@ Após 2 tentativas sem resposta → parar completamente.
 export const iaRouter = router({
   // ── Projetos ──────────────────────────────────────────────────────────────
 
-  listProjetos: authProc.query(() =>
-    prisma.iaProjeto.findMany({ orderBy: { criadoEm: "asc" } })
+  listProjetos: authProc.query(({ ctx }) =>
+    prisma.iaProjeto.findMany({ where: whereEmpresa(ctx), orderBy: { criadoEm: "asc" } })
   ),
 
   getProjeto: authProc
     .input(z.object({ id: z.string() }))
-    .query(({ input }) =>
-      prisma.iaProjeto.findUnique({
+    .query(async ({ input, ctx }) => {
+      const projeto = await prisma.iaProjeto.findUnique({
         where: { id: input.id },
         include: { configs: true, personas: { orderBy: { ordem: "asc" } }, fases: { orderBy: { ordem: "asc" } } },
-      })
-    ),
+      });
+      if (!projeto) throw new Error("Projeto não encontrado");
+      if (ctx.role !== "admin" || ctx.empresaId) {
+        if (projeto.empresaId !== ctx.empresaId) throw new Error("Projeto não pertence à sua empresa");
+      }
+      return projeto;
+    }),
 
   createProjeto: authProc
     .input(z.object({ nome: z.string(), descricao: z.string().optional(), whatsappInstancia: z.string().optional() }))
-    .mutation(({ input }) =>
-      prisma.iaProjeto.create({ data: input })
+    .mutation(({ input, ctx }) =>
+      prisma.iaProjeto.create({ data: { ...input, empresaId: ctx.empresaId ?? undefined } })
     ),
 
   updateProjeto: authProc
     .input(z.object({ id: z.string(), nome: z.string().optional(), ativo: z.boolean().optional(), whatsappInstancia: z.string().optional() }))
-    .mutation(({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const { id, ...data } = input;
+      if (ctx.role !== "admin" || ctx.empresaId) {
+        const p = await prisma.iaProjeto.findUnique({ where: { id }, select: { empresaId: true } });
+        if (!p || p.empresaId !== ctx.empresaId) throw new Error("Projeto não pertence à sua empresa");
+      }
       return prisma.iaProjeto.update({ where: { id }, data });
+    }),
+
+  // Cria (ou reaproveita) um CrmPipeline dedicado para o projeto e vincula via pipelineId
+  criarFunilDoProjeto: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .mutation(async ({ input }) => {
+      const projeto = await prisma.iaProjeto.findUnique({ where: { id: input.projetoId } });
+      if (!projeto) throw new Error("Projeto não encontrado");
+
+      // Reuse existing pipeline if already linked
+      if ((projeto as any).pipelineId) {
+        return { pipelineId: (projeto as any).pipelineId, criado: false };
+      }
+
+      // Gather commercial phases
+      const fases = await prisma.iaFaseFunil.findMany({
+        where: { projetoId: input.projetoId, pipelineTipo: "comercial" },
+        orderBy: { ordem: "asc" },
+      });
+
+      // Create pipeline
+      const pipeline = await prisma.crmPipeline.create({
+        data: {
+          nome: projeto.nome,
+          tipo: "comercial",
+          empresaId: projeto.empresaId ?? undefined,
+        },
+      });
+
+      // Create stages from phases
+      const coresDefault: Record<string, string> = {
+        lead_triagem: "#3b82f6", lead_rescisao_indireta: "#8b5cf6",
+        lead_direito_suprimido: "#06b6d4", lead_acidente_trabalho: "#f97316",
+        lead_reconhecimento_vinculo: "#14b8a6", lead_qualificado: "#8b5cf6",
+        lead_indeciso: "#f59e0b", com_closer: "#f97316",
+        sem_resposta_closer: "#ef4444", aguardando_reuniao: "#a855f7",
+        aguardando_docs_pessoais: "#06b6d4", aguardando_assinatura: "#10b981",
+        lead_desqualificado: "#6b7280", descartado: "#dc2626",
+      };
+
+      for (const fase of fases) {
+        const stage = await prisma.crmStage.create({
+          data: {
+            pipelineId: pipeline.id,
+            nome: fase.nomeExibicao,
+            chave: fase.chave,
+            ordem: fase.ordem,
+            cor: coresDefault[fase.chave] ?? fase.cor,
+            ehEncerramento: fase.ehEncerramento,
+            requerAcaoHumana: fase.requerAcaoHumana,
+          },
+        });
+        await prisma.iaFaseFunil.update({
+          where: { projetoId_chave: { projetoId: input.projetoId, chave: fase.chave } },
+          data: { pipelineId: pipeline.id },
+        });
+        void stage;
+      }
+
+      // Link pipeline to project
+      await prisma.iaProjeto.update({
+        where: { id: input.projetoId },
+        data: { pipelineId: pipeline.id } as any,
+      });
+
+      return { pipelineId: pipeline.id, criado: true };
+    }),
+
+  // ── Follow-up PAKT ────────────────────────────────────────────────────────
+
+  getFollowUpConfigs: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .query(async ({ input }) => {
+      const rows = await prisma.iaProjetoConfig.findMany({
+        where: { projetoId: input.projetoId, categoria: "follow_up" },
+      });
+      return Object.fromEntries(rows.map(r => [r.chave, r.valor ?? ""]));
+    }),
+
+  saveFollowUpConfig: authProc
+    .input(z.object({ projetoId: z.string(), chave: z.string(), valor: z.string() }))
+    .mutation(async ({ input }) => {
+      await prisma.iaProjetoConfig.upsert({
+        where: { projetoId_chave: { projetoId: input.projetoId, chave: input.chave } },
+        create: { projetoId: input.projetoId, categoria: "follow_up", chave: input.chave, valor: input.valor },
+        update: { valor: input.valor },
+      });
+      return { ok: true };
     }),
 
   // ── Configs ───────────────────────────────────────────────────────────────
@@ -145,6 +245,31 @@ export const iaRouter = router({
       return result;
     }),
 
+  // ── Assistente Interno — sessões ──────────────────────────────────────────
+
+  listAssistenteSessoes: authProc
+    .input(z.object({ limit: z.number().optional() }))
+    .query(async ({ input }) => {
+      const rows = await (prisma as any).assistenteSession.findMany({
+        orderBy: { updatedAt: "desc" },
+        take: input.limit ?? 30,
+      });
+      return rows.map((r: any) => ({
+        id: r.id,
+        phone: r.phone,
+        step: r.step,
+        updatedAt: r.updatedAt,
+        totalMensagens: (r.contexto as any)?.history?.length ?? 0,
+      }));
+    }),
+
+  clearAssistenteSessao: authProc
+    .input(z.object({ phone: z.string() }))
+    .mutation(async ({ input }) => {
+      await (prisma as any).assistenteSession.deleteMany({ where: { phone: input.phone } });
+      return { ok: true };
+    }),
+
   // ── Personas ──────────────────────────────────────────────────────────────
 
   listPersonas: authProc
@@ -167,6 +292,9 @@ export const iaRouter = router({
       ordem: z.number().optional(),
       ttsVoiceId: z.string().optional(),
       llmProviderChave: z.string().optional().nullable(),
+      proximaPersonaChave: z.string().optional().nullable(),
+      usarAudio: z.boolean().optional(),
+      farewellTexto: z.string().optional().nullable(),
     }))
     .mutation(({ input }) => {
       const { projetoId, chave, ...data } = input;
@@ -174,6 +302,34 @@ export const iaRouter = router({
         where: { projetoId_chave: { projetoId, chave } },
         create: { projetoId, chave, ...data } as any,
         update: data as any,
+      });
+    }),
+
+  reorderPersonas: authProc
+    .input(z.object({
+      projetoId: z.string(),
+      items: z.array(z.object({ id: z.string(), ordem: z.number().int() })),
+    }))
+    .mutation(async ({ input }) => {
+      await Promise.all(input.items.map(item =>
+        prisma.iaPersona.update({ where: { id: item.id }, data: { ordem: item.ordem } })
+      ));
+      return { ok: true };
+    }),
+
+  clearPersonaMidia: authProc
+    .input(z.object({ personaId: z.string() }))
+    .mutation(async ({ input }) => {
+      const p = await prisma.iaPersona.findUnique({
+        where: { id: input.personaId }, select: { midiaApresentacaoPath: true },
+      });
+      if (p?.midiaApresentacaoPath) {
+        const { unlinkSync } = await import("node:fs");
+        try { unlinkSync(p.midiaApresentacaoPath); } catch {}
+      }
+      return prisma.iaPersona.update({
+        where: { id: input.personaId },
+        data: { midiaApresentacaoPath: null, midiaApresentacaoTipo: null },
       });
     }),
 
@@ -204,9 +360,10 @@ export const iaRouter = router({
 
   listConversas: authProc
     .input(z.object({ projetoId: z.string().optional() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const deals = await prisma.crmDeal.findMany({
         where: {
+          ...whereEmpresa(ctx),
           ...(input.projetoId ? { projetoId: input.projetoId } : {}),
           mensagens: { some: {} },
         },
@@ -216,25 +373,69 @@ export const iaRouter = router({
             orderBy: { enviadaEm: "desc" },
             take: 1,
           },
+          stage: { select: { pipelineId: true } },
         },
         orderBy: { ultimoContatoEm: "desc" },
         take: 50,
       });
-      return deals;
+
+      // Resolve SDR names for deals with IA paused
+      const sdrIds = [...new Set(deals.map((d) => d.iaPausadaPor).filter(Boolean))] as string[];
+      const sdrUsers = sdrIds.length
+        ? await prisma.usuario.findMany({ where: { id: { in: sdrIds } }, select: { id: true, nome: true } })
+        : [];
+      const sdrMap = new Map(sdrUsers.map((u) => [u.id, u.nome]));
+
+      return deals.map((d) => ({
+        ...d,
+        sdrNome: d.iaPausadaPor ? (sdrMap.get(d.iaPausadaPor) ?? "Atendente") : null,
+      }));
     }),
 
   toggleIaPausa: authProc
     .input(z.object({ dealId: z.string(), pausar: z.boolean() }))
-    .mutation(({ input, ctx }) =>
-      prisma.crmDeal.update({
+    .mutation(async ({ input, ctx }) => {
+      if (ctx.role !== "admin" || ctx.empresaId) {
+        const d = await prisma.crmDeal.findUnique({ where: { id: input.dealId }, select: { empresaId: true } });
+        if (!d || d.empresaId !== ctx.empresaId) throw new Error("Deal não pertence à sua empresa");
+      }
+      const updated = await prisma.crmDeal.update({
         where: { id: input.dealId },
         data: {
           iaAtiva: !input.pausar,
           iaPausadaEm:  input.pausar ? new Date() : null,
           iaPausadaPor: input.pausar ? ctx.userId : null,
         },
-      })
-    ),
+        include: { contato: true },
+      });
+
+      // When reactivating: if last message is unanswered from lead, re-trigger the stage engine
+      if (!input.pausar && updated.projetoId && updated.contato?.whatsapp) {
+        const lastMsg = await prisma.crmMensagemWhatsapp.findFirst({
+          where: { dealId: input.dealId },
+          orderBy: { enviadaEm: "desc" },
+        });
+        if (lastMsg?.direcao === "in" && lastMsg.conteudo) {
+          const phone = updated.contato.whatsapp;
+          const syntheticMsg = {
+            key: {
+              id: lastMsg.evolutionMessageId ?? `reprocess_${lastMsg.id}`,
+              remoteJid: `${phone}@s.whatsapp.net`,
+              fromMe: false,
+            },
+            message: { conversation: lastMsg.conteudo },
+            messageType: "conversation",
+            pushName: updated.contato.nome ?? undefined,
+          };
+          const { processIncomingMessage } = await import("../agent/stage-engine.js");
+          processIncomingMessage(updated.projetoId, syntheticMsg).catch((e: any) =>
+            console.error("[toggleIaPausa] reprocess error:", e.message)
+          );
+        }
+      }
+
+      return updated;
+    }),
 
   sendMensagemManual: authProc
     .input(z.object({ dealId: z.string(), conteudo: z.string() }))
@@ -243,17 +444,29 @@ export const iaRouter = router({
         where: { id: input.dealId },
         include: { contato: true },
       });
-      if (!deal?.contatoId || !deal.projetoId) throw new Error("Deal sem contato ou projeto");
+      if (!deal) throw new Error("Deal não encontrado");
+      if (ctx.role !== "admin" || ctx.empresaId) {
+        if (deal.empresaId !== ctx.empresaId) throw new Error("Deal não pertence à sua empresa");
+      }
+      if (!deal?.contatoId) throw new Error("Deal sem contato vinculado");
 
       const phone = deal.contato?.whatsapp;
       if (!phone) throw new Error("Contato sem WhatsApp");
+
+      // Se o deal não tem projeto, busca o primeiro projeto da empresa
+      let projetoId = deal.projetoId;
+      if (!projetoId && deal.empresaId) {
+        const projeto = await prisma.iaProjeto.findFirst({ where: { empresaId: deal.empresaId } });
+        if (projeto) projetoId = projeto.id;
+      }
+      if (!projetoId) throw new Error("Nenhum projeto WhatsApp IA configurado para esta empresa");
 
       // Resolve display name: nomeWhatsapp (project setting) → usuario.nome → "Atendente"
       let nomeRemetente = "Atendente";
       if (ctx.userId) {
         const [membroProjeto, usuario] = await Promise.all([
           prisma.iaProjetoUsuario.findUnique({
-            where: { projetoId_usuarioId: { projetoId: deal.projetoId, usuarioId: ctx.userId } },
+            where: { projetoId_usuarioId: { projetoId: projetoId!, usuarioId: ctx.userId } },
           }),
           prisma.usuario.findUnique({ where: { id: ctx.userId } }),
         ]);
@@ -264,7 +477,7 @@ export const iaRouter = router({
       const textoEnvio = `*${nomeRemetente}*\n${input.conteudo}`;
 
       const configs = await prisma.iaProjetoConfig.findMany({
-        where: { projetoId: deal.projetoId, categoria: "whatsapp" },
+        where: { projetoId: projetoId!, categoria: "whatsapp" },
       });
       const get = (k: string) => configs.find((c) => c.chave === k)?.valor ?? "";
       const evoConfig = {
@@ -276,29 +489,285 @@ export const iaRouter = router({
       if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
 
       const { sendText } = await import("../services/evolution.js");
-      await sendText(evoConfig, phone, textoEnvio);
+      const sendResult = await sendText(evoConfig, phone, textoEnvio);
+      const evolutionMessageId = sendResult?.key?.id ?? null;
 
       return prisma.crmMensagemWhatsapp.create({
         data: {
-          dealId:       deal.id,
-          contatoId:    deal.contatoId,
-          direcao:      "out",
-          tipo:         "text",
-          conteudo:     textoEnvio,
-          usuarioId:    ctx.userId ?? null,
-          nomeRemetente,
+          dealId:             deal.id,
+          contatoId:          deal.contatoId,
+          direcao:            "out",
+          tipo:               "text",
+          conteudo:           textoEnvio,
+          remetente:          nomeRemetente,
+          evolutionMessageId: evolutionMessageId,
         },
       });
     }),
 
+  sendAudioManual: authProc
+    .input(z.object({ dealId: z.string(), audioBase64: z.string(), mimeType: z.string().optional() }))
+    .mutation(async ({ input, ctx }) => {
+      const deal = await prisma.crmDeal.findUnique({
+        where: { id: input.dealId },
+        include: { contato: true },
+      });
+      if (!deal) throw new Error("Deal não encontrado");
+      if (!deal?.contatoId || !deal.projetoId) throw new Error("Deal sem contato ou projeto");
+
+      const phone = deal.contato?.whatsapp;
+      if (!phone) throw new Error("Contato sem WhatsApp");
+
+      let nomeRemetente = "Atendente";
+      if (ctx.userId) {
+        const [membroProjeto, usuario] = await Promise.all([
+          prisma.iaProjetoUsuario.findUnique({
+            where: { projetoId_usuarioId: { projetoId: deal.projetoId, usuarioId: ctx.userId } },
+          }),
+          prisma.usuario.findUnique({ where: { id: ctx.userId } }),
+        ]);
+        nomeRemetente = membroProjeto?.nomeWhatsapp || usuario?.nome || "Atendente";
+      }
+
+      const allConfigs = await prisma.iaProjetoConfig.findMany({
+        where: { projetoId: deal.projetoId, categoria: { in: ["whatsapp", "audio"] } },
+      });
+      const get = (k: string) => allConfigs.find((c) => c.chave === k)?.valor ?? "";
+      const evoConfig = {
+        baseUrl: get("evolution_api_url"),
+        apiKey: get("evolution_api_key"),
+        instancia: get("evolution_instancia"),
+      };
+
+      if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
+
+      const { sendWhatsAppAudio } = await import("../services/evolution.js");
+      const sendResult = await sendWhatsAppAudio(evoConfig, phone, input.audioBase64, input.mimeType);
+      const evolutionMessageId = sendResult?.key?.id ?? null;
+
+      // Transcribe outgoing audio async (non-blocking)
+      let conteudo = `🎤 Áudio — ${nomeRemetente}`;
+      try {
+        const audioApiKey = get("audio_api_key") || get("groq_api_key");
+        const audioModel   = get("audio_model") || "whisper-large-v3-turbo";
+        const audioProvider = (get("audio_provider") || "groq") as "groq" | "openai";
+        if (audioApiKey) {
+          const { transcribeAudio } = await import("../services/whisper.js");
+          const audioBuffer = Buffer.from(input.audioBase64, "base64");
+          const mimeType    = input.mimeType ?? "audio/ogg";
+          const result = await transcribeAudio(audioBuffer, mimeType, audioApiKey, audioModel, audioProvider);
+          if (result.ok && result.text) conteudo = `🎤 ${result.text}`;
+        }
+      } catch (e: any) {
+        console.warn("[sendAudioManual] Transcrição falhou:", e.message);
+      }
+
+      return prisma.crmMensagemWhatsapp.create({
+        data: {
+          dealId:             deal.id,
+          contatoId:          deal.contatoId,
+          direcao:            "out",
+          tipo:               "audio",
+          conteudo,
+          remetente:          nomeRemetente,
+          evolutionMessageId: evolutionMessageId,
+        },
+      });
+    }),
+
+  sendArquivoManual: authProc
+    .input(z.object({
+      dealId:       z.string(),
+      arquivoBase64: z.string(),
+      mimeType:     z.string(),
+      fileName:     z.string(),
+      legenda:      z.string().optional(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const deal = await prisma.crmDeal.findUnique({
+        where: { id: input.dealId },
+        include: { contato: true },
+      });
+      if (!deal) throw new Error("Deal não encontrado");
+      if (!deal?.contatoId || !deal.projetoId) throw new Error("Deal sem contato ou projeto");
+      const phone = deal.contato?.whatsapp;
+      if (!phone) throw new Error("Contato sem WhatsApp");
+
+      let nomeRemetente = "Atendente";
+      if (ctx.userId) {
+        const [membroProjeto, usuario] = await Promise.all([
+          prisma.iaProjetoUsuario.findUnique({
+            where: { projetoId_usuarioId: { projetoId: deal.projetoId, usuarioId: ctx.userId } },
+          }),
+          prisma.usuario.findUnique({ where: { id: ctx.userId } }),
+        ]);
+        nomeRemetente = membroProjeto?.nomeWhatsapp || usuario?.nome || "Atendente";
+      }
+
+      const configs = await prisma.iaProjetoConfig.findMany({
+        where: { projetoId: deal.projetoId, categoria: "whatsapp" },
+      });
+      const get = (k: string) => configs.find((c) => c.chave === k)?.valor ?? "";
+      const evoConfig = { baseUrl: get("evolution_api_url"), apiKey: get("evolution_api_key"), instancia: get("evolution_instancia") };
+      if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
+
+      const { sendMediaBase64 } = await import("../services/evolution.js");
+      const sendResult = await sendMediaBase64(evoConfig, phone, input.arquivoBase64, input.mimeType, input.fileName, input.legenda);
+      const evolutionMessageId = sendResult?.key?.id ?? null;
+
+      const tipoMsg = input.mimeType.startsWith("image/") ? "image" : input.mimeType.startsWith("video/") ? "video" : "document";
+      const conteudoPlaceholder = tipoMsg === "image" ? `🖼️ ${input.fileName}` : `📎 ${input.fileName}`;
+
+      return prisma.crmMensagemWhatsapp.create({
+        data: {
+          dealId:             deal.id,
+          contatoId:          deal.contatoId,
+          direcao:            "out",
+          tipo:               tipoMsg,
+          conteudo:           conteudoPlaceholder,
+          remetente:          nomeRemetente,
+          evolutionMessageId: evolutionMessageId,
+        },
+      });
+    }),
+
+  iniciarNovaConversa: authProc
+    .input(z.object({
+      projetoId:  z.string(),
+      whatsapp:   z.string(),
+      nomeContato: z.string().optional(),
+      mensagem:   z.string(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const configs = await prisma.iaProjetoConfig.findMany({
+        where: { projetoId: input.projetoId, categoria: "whatsapp" },
+      });
+      const get = (k: string) => configs.find((c) => c.chave === k)?.valor ?? "";
+      const evoConfig = { baseUrl: get("evolution_api_url"), apiKey: get("evolution_api_key"), instancia: get("evolution_instancia") };
+      if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
+
+      // Normaliza para E.164 BR sem o +: 55DDXXXXXXXXX (13 dígitos)
+      // Aceita: 077991322975 (12d 0+DDD+9+8d), 07791322975 (11d 0+DDD+8d),
+      //         77 91322975 (10d), 77991322975 (11d), +55 77 9132-2975 (12d c/55), 5577991322975 (13d)
+      const phone = (() => {
+        let d = input.whatsapp.replace(/\D/g, "");
+        if (d.startsWith("0") && !d.startsWith("055")) d = d.slice(1); // remove 0 inicial do DDD
+        if (d.length === 13 && d.startsWith("55")) return d;           // já completo
+        if (d.length === 12 && d.startsWith("55")) return d.slice(0, 4) + "9" + d.slice(4); // 55+DDD+8d → insere 9
+        if (d.length === 11) return "55" + d;                          // DDD+9+8d
+        if (d.length === 10) return "55" + d.slice(0, 2) + "9" + d.slice(2); // DDD+8d → insere 9
+        return d; // formato não reconhecido, passa como está
+      })();
+
+      // Find or create contact
+      let contato = await prisma.crmContato.findFirst({
+        where: { whatsapp: phone, ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}) },
+      });
+      if (!contato) {
+        contato = await prisma.crmContato.create({
+          data: {
+            nome: input.nomeContato ?? `Lead ${phone}`,
+            whatsapp: phone,
+            ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}),
+          },
+        });
+      }
+
+      // Find or create deal
+      let deal = await prisma.crmDeal.findFirst({
+        where: { contatoId: contato.id, projetoId: input.projetoId, status: "aberto" },
+        orderBy: { criadoEm: "desc" },
+      });
+
+      if (!deal) {
+        const entryPhase = await prisma.iaFaseFunil.findFirst({
+          where: { projetoId: input.projetoId, ehEntrada: true, pipelineTipo: "comercial" },
+          orderBy: { ordem: "asc" },
+        });
+        const pipelineId = entryPhase?.pipelineId;
+        const entryStage = pipelineId
+          ? await prisma.crmStage.findFirst({ where: { pipelineId, ehEntrada: true }, orderBy: { ordem: "asc" } })
+            ?? await prisma.crmStage.findFirst({ where: { pipelineId }, orderBy: { ordem: "asc" } })
+          : null;
+
+        // Fallback: first pipeline of the project's empresa
+        let finalPipelineId = pipelineId;
+        let finalStageId = entryStage?.id;
+        if (!finalPipelineId || !finalStageId) {
+          const pipeline = await prisma.crmPipeline.findFirst({
+            where: ctx.empresaId ? { empresaId: ctx.empresaId } : {},
+            include: { stages: { orderBy: { ordem: "asc" }, take: 1 } },
+            orderBy: { ordem: "asc" },
+          });
+          finalPipelineId = pipeline?.id;
+          finalStageId = pipeline?.stages[0]?.id;
+        }
+        if (!finalPipelineId || !finalStageId) throw new Error("Nenhum pipeline disponível");
+
+        deal = await prisma.crmDeal.create({
+          data: {
+            titulo: contato.nome,
+            pipelineId: finalPipelineId,
+            stageId: finalStageId,
+            contatoId: contato.id,
+            projetoId: input.projetoId,
+            iaAtiva: false,
+            iaPausadaPor: ctx.userId ?? undefined,
+            iaPausadaEm: new Date(),
+            iaStageChave: entryPhase?.chave ?? null,
+            status: "aberto",
+            ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}),
+          },
+        });
+      } else {
+        // Pause IA so operator keeps control
+        await prisma.crmDeal.update({
+          where: { id: deal.id },
+          data: { iaAtiva: false, iaPausadaPor: ctx.userId ?? undefined, iaPausadaEm: new Date() },
+        });
+      }
+
+      let nomeRemetente = "Atendente";
+      if (ctx.userId) {
+        const [membroProjeto, usuario] = await Promise.all([
+          prisma.iaProjetoUsuario.findUnique({
+            where: { projetoId_usuarioId: { projetoId: input.projetoId, usuarioId: ctx.userId } },
+          }),
+          prisma.usuario.findUnique({ where: { id: ctx.userId } }),
+        ]);
+        nomeRemetente = membroProjeto?.nomeWhatsapp || usuario?.nome || "Atendente";
+      }
+
+      const textoEnvio = `*${nomeRemetente}*\n${input.mensagem}`;
+      const { sendText } = await import("../services/evolution.js");
+      const sendResult = await sendText(evoConfig, phone, textoEnvio);
+      const evolutionMessageId = sendResult?.key?.id ?? null;
+
+      await prisma.crmMensagemWhatsapp.create({
+        data: {
+          dealId:             deal.id,
+          contatoId:          contato.id,
+          direcao:            "out",
+          tipo:               "text",
+          conteudo:           textoEnvio,
+          remetente:          nomeRemetente,
+          evolutionMessageId: evolutionMessageId,
+          ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}),
+        },
+      });
+
+      await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+      return { dealId: deal.id, contatoId: contato.id };
+    }),
+
   // ── Seed ──────────────────────────────────────────────────────────────────
 
-  seedCarreteiros: authProc.mutation(async () => {
+  seedCarreteiros: authProc.mutation(async ({ ctx }) => {
     const existente = await prisma.iaProjeto.findFirst({ where: { nome: "Carreteiros" } });
     if (existente) return { ok: true, projetoId: existente.id, msg: "Já existe" };
 
     const projeto = await prisma.iaProjeto.create({
-      data: { nome: "Carreteiros", descricao: "Motoristas carreteiros — Pinheiro Silva Advogados" },
+      data: { nome: "Carreteiros", descricao: "Motoristas carreteiros", empresaId: ctx.empresaId ?? undefined },
     });
 
     // Personas
@@ -378,12 +847,12 @@ export const iaRouter = router({
     await prisma.iaPerguntaQualificacao.createMany({
       data: [
         { projetoId: projeto.id, chave: "e_carreteiro", perguntaContexto: "Se o lead é motorista carreteiro/caminhoneiro (true) ou não (false)", tipoDado: "booleano", ordem: 0, stageColeta: "lead_carreteiro" },
-        { projetoId: projeto.id, chave: "e_clt", perguntaContexto: "Se o lead tem ou tinha vínculo CLT (carteira assinada) — true/false. Autônomo dono do veículo = false", tipoDado: "booleano", ordem: 0, stageColeta: "lead_carreteiro" },
+        { projetoId: projeto.id, chave: "e_clt", perguntaContexto: "true se o lead tinha carteira assinada (CLT) OU trabalhava de forma SUBORDINADA para a empresa mesmo sem registro/sem carteira (reconhecimento de vínculo) OU foi obrigado a abrir PJ/MEI para o mesmo trabalho (pejotização). false APENAS se era autônomo DONO do próprio caminhão rodando para vários clientes, motorista de app (Uber/99/iFood), cooperado ou avulso. Não tinha carteira mas era motorista fixo da empresa = true.", tipoDado: "booleano", ordem: 0, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "nome", perguntaContexto: "Nome completo do cliente", tipoDado: "texto", ordem: 1, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "cidade", perguntaContexto: "Cidade onde mora o cliente", tipoDado: "texto", ordem: 2, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "funcao_recente", perguntaContexto: "Função no emprego mais recente como carreteiro", tipoDado: "texto", ordem: 3, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "empresa_recente", perguntaContexto: "Nome da empresa mais recente", tipoDado: "texto", ordem: 4, stageColeta: "lead_carreteiro" },
-        { projetoId: projeto.id, chave: "vinculo_recente", perguntaContexto: "Tipo de vínculo: CLT, autônomo ou avulso", tipoDado: "texto", ordem: 5, stageColeta: "lead_carreteiro" },
+        { projetoId: projeto.id, chave: "vinculo_recente", perguntaContexto: "Tipo de vínculo: CLT (carteira); informal/sem registro (motorista subordinado da empresa sem carteira, ou PJ/MEI forçado — reconhecimento de vínculo); autônomo (dono do próprio caminhão p/ vários clientes/app); avulso; cooperado", tipoDado: "texto", ordem: 5, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "saida_recente", perguntaContexto: "Motivo e data de saída do emprego mais recente", tipoDado: "texto", ordem: 6, stageColeta: "lead_carreteiro" },
         { projetoId: projeto.id, chave: "horas_extras", perguntaContexto: "Se fazia horas extras não pagas", tipoDado: "booleano", ordem: 7, stageColeta: "lead_carreteiro" },
       ],
@@ -432,6 +901,263 @@ export const iaRouter = router({
     });
 
     return { ok: true, projetoId: projeto.id, msg: "Seed criado com sucesso" };
+  }),
+
+  seedCarreteiro3: authProc.mutation(async ({ ctx }) => {
+    const empresaId = ctx.empresaId ?? ctx.empresaIds?.[0] ?? undefined;
+    const existente = await prisma.iaProjeto.findFirst({ where: { nome: "Carreteiro 3.0", empresaId: empresaId ?? null } });
+    if (existente) return { ok: true, projetoId: existente.id, msg: "Já existe" };
+
+    const projeto = await prisma.iaProjeto.create({
+      data: { nome: "Carreteiro 3.0", descricao: "SDR trabalhista com triagem inteligente (rescisão indireta, direito suprimido, reconhecimento de vínculo)", empresaId },
+    });
+
+    // Personas
+    await prisma.iaPersona.createMany({
+      data: [
+        { projetoId: projeto.id, chave: "assistente", nomeExibicao: "Ana", ordem: 1, systemPrompt: PERSONA_ASSISTENTE_PROMPT },
+        { projetoId: projeto.id, chave: "advogado", nomeExibicao: "Dra. Daniela Pires", ordem: 2, systemPrompt: PERSONA_ADVOGADO_PROMPT },
+        { projetoId: projeto.id, chave: "closer", nomeExibicao: "Dra. Daniela Pires", ordem: 3, systemPrompt: PERSONA_CLOSER_PROMPT },
+      ],
+    });
+
+    let pipelineComercial = await prisma.crmPipeline.findFirst({ where: { tipo: "comercial" } });
+    if (!pipelineComercial) {
+      pipelineComercial = await prisma.crmPipeline.create({
+        data: { nome: "Captação Carreteiros", tipo: "comercial", cor: "#6366f1" },
+      });
+    }
+    let pipelineProcessual = await prisma.crmPipeline.findFirst({ where: { tipo: "processual" } });
+    if (!pipelineProcessual) {
+      pipelineProcessual = await prisma.crmPipeline.create({
+        data: { nome: "Jurídico Processual", tipo: "processual", cor: "#059669" },
+      });
+    }
+
+    // Fases comerciais (triagem + qualificação + pós)
+    const fasesComerciais = [
+      { chave: "lead_triagem",                nomeExibicao: "Triagem",                         ordem: 0,  cor: "#3b82f6", ehEntrada: true, personaChave: "assistente" },
+      { chave: "lead_rescisao_indireta",      nomeExibicao: "Rescisão Indireta",               ordem: 1,  cor: "#8b5cf6", personaChave: "assistente" },
+      { chave: "lead_direito_suprimido",      nomeExibicao: "Direito Suprimido",               ordem: 2,  cor: "#06b6d4", personaChave: "assistente" },
+      { chave: "lead_reconhecimento_vinculo", nomeExibicao: "Reconhecimento de Vínculo",       ordem: 3,  cor: "#14b8a6", personaChave: "assistente" },
+      { chave: "lead_qualificado",            nomeExibicao: "Lead Qualificado",                ordem: 4,  cor: "#10b981", personaChave: "advogado" },
+      { chave: "lead_indeciso",               nomeExibicao: "Lead Indeciso / Futuro",          ordem: 5,  cor: "#f59e0b", personaChave: "advogado" },
+      { chave: "com_closer",                  nomeExibicao: "Lead com Contato do Closer",      ordem: 6,  cor: "#f97316", personaChave: "closer" },
+      { chave: "sem_resposta_closer",         nomeExibicao: "Lead sem Resposta ao Closer",     ordem: 7,  cor: "#ef4444", requerAcaoHumana: true, personaChave: "closer" },
+      { chave: "aguardando_docs_pessoais",    nomeExibicao: "Aguardando Documentos Pessoais",  ordem: 8,  cor: "#06b6d4", personaChave: "advogado" },
+      { chave: "aguardando_assinatura",       nomeExibicao: "Aguardando Assinatura",           ordem: 9,  cor: "#10b981", personaChave: "advogado" },
+      { chave: "lead_desqualificado",         nomeExibicao: "Desqualificado",                  ordem: 10, cor: "#6b7280", requerAcaoHumana: true, personaChave: "assistente" },
+    ];
+
+    for (const fase of fasesComerciais) {
+      await prisma.iaFaseFunil.upsert({
+        where: { projetoId_chave: { projetoId: projeto.id, chave: fase.chave } },
+        create: { projetoId: projeto.id, pipelineId: pipelineComercial.id, pipelineTipo: "comercial", ...fase },
+        update: {},
+      });
+      await prisma.crmStage.upsert({
+        where: { pipelineId_chave: { pipelineId: pipelineComercial.id, chave: fase.chave } },
+        create: { pipelineId: pipelineComercial.id, chave: fase.chave, nome: fase.nomeExibicao, ordem: fase.ordem, cor: fase.cor, ehEntrada: fase.ehEntrada ?? false, requerAcaoHumana: (fase as any).requerAcaoHumana ?? false },
+        update: {},
+      });
+    }
+
+    // Fases processuais (reutiliza as mesmas do seedCarreteiros se existirem)
+    const fasesProcessuais = [
+      { chave: "aguardando_reuniao",         nomeExibicao: "Aguardando Reunião",             ordem: 0, cor: "#6366f1", requerAcaoHumana: true, ehEntrada: true },
+      { chave: "elaboracao_inicial",         nomeExibicao: "Elaboração da Inicial",          ordem: 1, cor: "#3b82f6", requerAcaoHumana: true },
+      { chave: "ajuizado_audiencia",         nomeExibicao: "Ajuizado / Aguardando Audiência",ordem: 2, cor: "#f59e0b", requerAcaoHumana: true },
+      { chave: "aguardando_sentenca",        nomeExibicao: "Aguardando Sentença",            ordem: 3, cor: "#06b6d4", requerAcaoHumana: true },
+      { chave: "aguardando_faturamento",     nomeExibicao: "Aguardando Faturamento",         ordem: 4, cor: "#10b981", requerAcaoHumana: true, ehGanho: true },
+    ];
+
+    for (const fase of fasesProcessuais) {
+      await prisma.iaFaseFunil.upsert({
+        where: { projetoId_chave: { projetoId: projeto.id, chave: fase.chave } },
+        create: { projetoId: projeto.id, pipelineId: pipelineProcessual.id, pipelineTipo: "processual", ...fase },
+        update: {},
+      });
+      await prisma.crmStage.upsert({
+        where: { pipelineId_chave: { pipelineId: pipelineProcessual.id, chave: fase.chave } },
+        create: { pipelineId: pipelineProcessual.id, chave: fase.chave, nome: fase.nomeExibicao, ordem: fase.ordem, cor: fase.cor, ehGanho: (fase as any).ehGanho ?? false, ehEntrada: (fase as any).ehEntrada ?? false, requerAcaoHumana: fase.requerAcaoHumana },
+        update: {},
+      });
+    }
+
+    // ── IaFlowStep: questões determinísticas por fase ─────────────────────────
+
+    // Fase: triagem (3 perguntas de roteamento)
+    const stepsTriagem = [
+      { chave: "triagem_nome",          ordem: 1,  label: "Nome",          pergunta: "Olá! Sou a Ana, analista jurídica da equipe. Pode me dizer seu nome?", stepType: "saudacao", campoColetar: "nome" },
+      { chave: "triagem_status",        ordem: 2,  label: "Status emprego", pergunta: "Você ainda está trabalhando nessa empresa ou já saiu?", campoColetar: "ainda_na_empresa" },
+      { chave: "triagem_data_saida",    ordem: 3,  label: "Data saída",     pergunta: "Há quanto tempo você saiu desse emprego?", campoColetar: "data_saida_recente" },
+      { chave: "triagem_tinha_clt",     ordem: 4,  label: "CLT",            pergunta: "Você tinha carteira assinada (CLT) nesse emprego?", campoColetar: "tinha_clt" },
+    ];
+
+    // Fase: rescisao_indireta (8 perguntas sobre irregularidades em vigência do contrato)
+    const stepsRescisaoIndireta = [
+      { chave: "ri_salario",       ordem: 1, label: "Salário atraso",    pergunta: "Seu salário estava sendo pago em dia?", campoColetar: "ri_salario_atrasado" },
+      { chave: "ri_reclamacao",    ordem: 2, label: "Reclamação",        pergunta: "Qual é a sua maior reclamação sobre a empresa atualmente?", campoColetar: "ri_maior_reclamacao", stepType: "llm_generated" },
+      { chave: "ri_pressao",       ordem: 3, label: "Pressão",           pergunta: "Você sofre pressão excessiva ou humilhação no trabalho?", campoColetar: "ri_pressao_humilhacao" },
+      { chave: "ri_desvio",        ordem: 4, label: "Desvio de função",  pergunta: "Você exerce funções diferentes do que foi contratado, ou houve transferência sem sua concordância?", campoColetar: "ri_desvio_funcao" },
+      { chave: "ri_insalubridade", ordem: 5, label: "Insalubridade",     pergunta: "Você trabalha com agentes nocivos (químicos, ruído, calor) sem receber o adicional de insalubridade?", campoColetar: "ri_insalubridade" },
+      { chave: "ri_horas_extras",  ordem: 6, label: "Horas extras",      pergunta: "Você faz horas extras e não recebe por elas?", campoColetar: "ri_horas_extras" },
+      { chave: "ri_ferias",        ordem: 7, label: "Férias",            pergunta: "Suas férias estão sendo concedidas dentro do prazo legal (a cada 12 meses)?", campoColetar: "ri_ferias" },
+      { chave: "ri_beneficios",    ordem: 8, label: "Benefícios",        pergunta: "Algum benefício (vale-alimentação, plano de saúde, etc.) foi cortado sem aviso?", campoColetar: "ri_beneficios_cortados" },
+    ];
+
+    // Fase: direito_suprimido (11 perguntas sobre violações pós-rescisão)
+    const stepsDireitoSuprimido = [
+      { chave: "ds_justa_causa",    ordem: 1,  label: "Justa causa",       pergunta: "Como foi o seu desligamento? Você foi demitido por justa causa?", campoColetar: "ds_justa_causa" },
+      { chave: "ds_coacao",         ordem: 2,  label: "Coação",             pergunta: "Houve alguma pressão ou coação para você pedir demissão?", campoColetar: "ds_coacao" },
+      { chave: "ds_salario_fora",   ordem: 3,  label: "Salário por fora",   pergunta: "Você recebia algum valor por fora da folha de pagamento (em dinheiro ou separado)?", campoColetar: "ds_salario_por_fora" },
+      { chave: "ds_horas_extras",   ordem: 4,  label: "Horas extras",       pergunta: "Durante o emprego, você fazia horas extras e não recebia por elas?", campoColetar: "ds_horas_extras" },
+      { chave: "ds_assedio",        ordem: 5,  label: "Assédio",            pergunta: "Sofreu algum tipo de assédio moral ou sexual no trabalho?", campoColetar: "ds_assedio" },
+      { chave: "ds_acidente",       ordem: 6,  label: "Acidente",           pergunta: "Sofreu algum acidente de trabalho ou desenvolveu alguma doença por causa do trabalho?", campoColetar: "ds_acidente" },
+      { chave: "ds_verbas",         ordem: 7,  label: "Verbas rescisórias", pergunta: "Você recebeu todas as verbas rescisórias corretamente (FGTS, aviso prévio, férias, 13°)?", campoColetar: "ds_verbas_rescisorias" },
+      { chave: "ds_desvio",         ordem: 8,  label: "Desvio de função",   pergunta: "Você exercia funções além do que foi contratado, sem receber por isso?", campoColetar: "ds_desvio_funcao" },
+      { chave: "ds_descontos",      ordem: 9,  label: "Descontos",          pergunta: "Havia descontos indevidos no seu salário (além de INSS e IR)?", campoColetar: "ds_descontos_indevidos" },
+      { chave: "ds_adicionais",     ordem: 10, label: "Adicionais",         pergunta: "Você recebia todos os adicionais devidos, como noturno, insalubridade ou periculosidade?", campoColetar: "ds_adicionais" },
+      { chave: "ds_relato",         ordem: 11, label: "Relato livre",       pergunta: "Há alguma outra situação irregular que você vivenciou nesse emprego e que considera importante mencionar?", campoColetar: "ds_relato_livre", stepType: "llm_generated" },
+    ];
+
+    // Fase: reconhecimento_vinculo (10 perguntas sobre os 4 elementos do vínculo)
+    const stepsReconhecimento = [
+      { chave: "rv_inicio",      ordem: 1,  label: "Data início",       pergunta: "Quando você começou a trabalhar para essa empresa (mês e ano)?", campoColetar: "rv_data_inicio" },
+      { chave: "rv_tipo_reg",    ordem: 2,  label: "PF ou PJ",          pergunta: "Como você era remunerado? Recebia como pessoa física (CPF) ou pessoa jurídica (CNPJ)?", campoColetar: "rv_pf_pj" },
+      { chave: "rv_horario",     ordem: 3,  label: "Horário fixo",      pergunta: "Você tinha horário fixo de trabalho (entrada e saída no mesmo horário todos os dias)?", campoColetar: "rv_horario_fixo" },
+      { chave: "rv_pagamento",   ordem: 4,  label: "Forma pagamento",   pergunta: "Como você recebia o pagamento? Depósito bancário, PIX, dinheiro ou outra forma?", campoColetar: "rv_forma_pagamento" },
+      { chave: "rv_tempo",       ordem: 5,  label: "Tempo de serviço",  pergunta: "Por quanto tempo você trabalhou para essa empresa?", campoColetar: "rv_tempo_servico" },
+      { chave: "rv_ausencias",   ordem: 6,  label: "Ausências",         pergunta: "Você precisava justificar suas ausências ou pedir autorização para faltar?", campoColetar: "rv_justificar_ausencias" },
+      { chave: "rv_sancoes",     ordem: 7,  label: "Sanções",           pergunta: "Você já recebeu alguma advertência, suspensão ou foi ameaçado de punição?", campoColetar: "rv_sancoes" },
+      { chave: "rv_frequencia",  ordem: 8,  label: "Frequência",        pergunta: "Com que frequência você trabalhava? Era mais de 4 dias por semana regularmente?", campoColetar: "rv_frequencia_trabalho" },
+      { chave: "rv_ordens",      ordem: 9,  label: "Ordens",            pergunta: "Você recebia ordens diretas de como executar seu trabalho (horário, modo de fazer, etc.)?", campoColetar: "rv_recebia_ordens" },
+      { chave: "rv_substituto",  ordem: 10, label: "Substituto",        pergunta: "Você poderia mandar outra pessoa no seu lugar para trabalhar, ou precisava ser sempre você?", campoColetar: "rv_substituto" },
+    ];
+
+    const toFlowStep = (projetoId: string, personaChave: string, fase: string) =>
+      (s: { chave: string; ordem: number; label: string; pergunta: string; stepType?: string; campoColetar?: string }) => ({
+        projetoId, personaChave, fase,
+        chave: s.chave, ordem: s.ordem, label: s.label, pergunta: s.pergunta,
+        stepType: s.stepType ?? "question",
+        campoColetar: s.campoColetar ?? null,
+      });
+
+    await prisma.iaFlowStep.createMany({
+      data: [
+        ...stepsTriagem.map(toFlowStep(projeto.id, "assistente", "triagem")),
+        ...stepsRescisaoIndireta.map(toFlowStep(projeto.id, "assistente", "rescisao_indireta")),
+        ...stepsDireitoSuprimido.map(toFlowStep(projeto.id, "assistente", "direito_suprimido")),
+        ...stepsReconhecimento.map(toFlowStep(projeto.id, "assistente", "reconhecimento_vinculo")),
+      ],
+      skipDuplicates: true,
+    });
+
+    // ── IaPerguntaQualificacao — extração LLM por stage ───────────────────────
+
+    const pergsTriagem = [
+      { chave: "nome",               perguntaContexto: "Nome completo do cliente", tipoDado: "texto",    ordem: 1, stageColeta: "lead_triagem" },
+      { chave: "ainda_na_empresa",   perguntaContexto: "O cliente ainda está empregado nessa empresa? true = sim, false = não", tipoDado: "booleano", ordem: 2, stageColeta: "lead_triagem" },
+      { chave: "data_saida_recente", perguntaContexto: "Data ou período em que o cliente saiu do emprego (ex: há 6 meses, jan/2024)", tipoDado: "texto", ordem: 3, stageColeta: "lead_triagem" },
+      { chave: "prescrito",          perguntaContexto: "Faz mais de 2 anos (730 dias) que o cliente saiu? true = sim (prescrito), false = não", tipoDado: "booleano", ordem: 4, stageColeta: "lead_triagem" },
+      { chave: "tempo_muito_curto",  perguntaContexto: "O cliente trabalhou menos de 2 meses (60 dias)? true = sim, false = não", tipoDado: "booleano", ordem: 5, stageColeta: "lead_triagem" },
+      { chave: "tinha_clt",          perguntaContexto: "O cliente tinha carteira assinada (CLT)? true = sim, false = não", tipoDado: "booleano", ordem: 6, stageColeta: "lead_triagem" },
+    ];
+
+    const pergsRi = [
+      { chave: "ri_salario_atrasado",  perguntaContexto: "Salário atrasado/não pago? true = sim (há problema), false = não", tipoDado: "booleano", ordem: 1, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_pressao_humilhacao",perguntaContexto: "Há pressão excessiva ou humilhação no trabalho? true = sim", tipoDado: "booleano", ordem: 2, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_desvio_funcao",     perguntaContexto: "Exerce funções diferentes do contratado ou foi transferido? true = sim", tipoDado: "booleano", ordem: 3, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_insalubridade",     perguntaContexto: "Trabalha com agentes nocivos sem adicional de insalubridade? true = sim", tipoDado: "booleano", ordem: 4, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_horas_extras",      perguntaContexto: "Faz horas extras não remuneradas? true = sim", tipoDado: "booleano", ordem: 5, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_ferias",            perguntaContexto: "Férias concedidas no prazo legal? true = sim (sem problema), false = atrasadas (problema)", tipoDado: "booleano", ordem: 6, stageColeta: "lead_rescisao_indireta" },
+      { chave: "ri_beneficios_cortados",perguntaContexto: "Algum benefício foi cortado sem aviso? true = sim (há problema)", tipoDado: "booleano", ordem: 7, stageColeta: "lead_rescisao_indireta" },
+      { chave: "caso_viavel",          perguntaContexto: "Caso juridicamente viável para rescisão indireta? true = sim (há irregularidade), false = não determinado", tipoDado: "booleano", ordem: 8, stageColeta: "lead_rescisao_indireta" },
+    ];
+
+    const pergsDs = [
+      { chave: "ds_coacao",           perguntaContexto: "Houve coação ou pressão para pedir demissão? true = sim", tipoDado: "booleano", ordem: 1, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_salario_por_fora", perguntaContexto: "Recebia valor por fora da folha? true = sim", tipoDado: "booleano", ordem: 2, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_horas_extras",     perguntaContexto: "Fazia horas extras não pagas? true = sim", tipoDado: "booleano", ordem: 3, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_assedio",          perguntaContexto: "Sofreu assédio moral ou sexual? true = sim", tipoDado: "booleano", ordem: 4, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_acidente",         perguntaContexto: "Acidente de trabalho ou doença ocupacional? true = sim", tipoDado: "booleano", ordem: 5, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_verbas_rescisorias",perguntaContexto: "Recebeu todas as verbas rescisórias corretamente? true = sim (sem problema), false = não (problema)", tipoDado: "booleano", ordem: 6, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_desvio_funcao",    perguntaContexto: "Exercia funções além do contratado? true = sim", tipoDado: "booleano", ordem: 7, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_descontos_indevidos",perguntaContexto: "Havia descontos indevidos no salário? true = sim", tipoDado: "booleano", ordem: 8, stageColeta: "lead_direito_suprimido" },
+      { chave: "ds_adicionais",       perguntaContexto: "Recebia todos os adicionais devidos? true = sim (sem problema), false = não recebia (problema)", tipoDado: "booleano", ordem: 9, stageColeta: "lead_direito_suprimido" },
+      { chave: "caso_viavel",         perguntaContexto: "Caso viável para direito suprimido? true = há irregularidades identificadas", tipoDado: "booleano", ordem: 10, stageColeta: "lead_direito_suprimido" },
+    ];
+
+    const pergsRv = [
+      { chave: "rv_frequencia_trabalho",perguntaContexto: "Trabalhava mais de 4 dias por semana regularmente? true = sim", tipoDado: "booleano", ordem: 1, stageColeta: "lead_reconhecimento_vinculo" },
+      { chave: "rv_recebia_ordens",     perguntaContexto: "Recebia ordens diretas sobre como executar o trabalho? true = sim", tipoDado: "booleano", ordem: 2, stageColeta: "lead_reconhecimento_vinculo" },
+      { chave: "rv_substituto",         perguntaContexto: "Podia mandar substituto no seu lugar? true = sim (enfraquece vínculo), false = não podia (reforça pessoalidade)", tipoDado: "booleano", ordem: 3, stageColeta: "lead_reconhecimento_vinculo" },
+      { chave: "rv_forma_pagamento",    perguntaContexto: "Forma de pagamento (depósito, PIX, dinheiro, etc.)", tipoDado: "texto", ordem: 4, stageColeta: "lead_reconhecimento_vinculo" },
+      { chave: "caso_viavel",           perguntaContexto: "Caso viável para reconhecimento de vínculo empregatício? true = 3+ elementos presentes", tipoDado: "booleano", ordem: 5, stageColeta: "lead_reconhecimento_vinculo" },
+    ];
+
+    await prisma.iaPerguntaQualificacao.createMany({
+      data: [
+        ...pergsTriagem.map(p => ({ projetoId: projeto.id, ...p })),
+        ...pergsRi.map(p => ({ projetoId: projeto.id, ...p })),
+        ...pergsDs.map(p => ({ projetoId: projeto.id, ...p })),
+        ...pergsRv.map(p => ({ projetoId: projeto.id, ...p })),
+      ],
+      skipDuplicates: true,
+    });
+
+    // ── Regras de transição ───────────────────────────────────────────────────
+
+    const regras = [
+      // Triagem → branches (handled directly by triagem-router, but keep DB rules as fallback)
+      { stageOrigemChave: "lead_triagem",                stageDestinoChave: "lead_rescisao_indireta",      condicao: "goto_lead_rescisao_indireta",      ordem: 1 },
+      { stageOrigemChave: "lead_triagem",                stageDestinoChave: "lead_direito_suprimido",      condicao: "goto_lead_direito_suprimido",      ordem: 2 },
+      { stageOrigemChave: "lead_triagem",                stageDestinoChave: "lead_reconhecimento_vinculo", condicao: "goto_lead_reconhecimento_vinculo", ordem: 3 },
+      { stageOrigemChave: "lead_triagem",                stageDestinoChave: "lead_desqualificado",         condicao: "goto_lead_desqualificado",         ordem: 4 },
+      // Qualification → qualificado
+      { stageOrigemChave: "lead_rescisao_indireta",      stageDestinoChave: "lead_qualificado",            condicao: "qualificacao_completa", acaoAdicional: "trocar_persona:advogado", ordem: 5 },
+      { stageOrigemChave: "lead_direito_suprimido",      stageDestinoChave: "lead_qualificado",            condicao: "qualificacao_completa", acaoAdicional: "trocar_persona:advogado", ordem: 6 },
+      { stageOrigemChave: "lead_reconhecimento_vinculo", stageDestinoChave: "lead_qualificado",            condicao: "qualificacao_completa", acaoAdicional: "trocar_persona:advogado", ordem: 7 },
+      // Qualification → desqualificado
+      { stageOrigemChave: "lead_rescisao_indireta",      stageDestinoChave: "lead_desqualificado",         condicao: "goto_lead_desqualificado",         ordem: 8 },
+      { stageOrigemChave: "lead_direito_suprimido",      stageDestinoChave: "lead_desqualificado",         condicao: "goto_lead_desqualificado",         ordem: 9 },
+      { stageOrigemChave: "lead_reconhecimento_vinculo", stageDestinoChave: "lead_desqualificado",         condicao: "goto_lead_desqualificado",         ordem: 10 },
+      // Post-qualification flow
+      { stageOrigemChave: "lead_qualificado",            stageDestinoChave: "lead_indeciso",               condicao: "sem_resposta_Xhoras",  parametros: { horas: 48 }, ordem: 11 },
+      { stageOrigemChave: "lead_indeciso",               stageDestinoChave: "com_closer",                  condicao: "sem_resposta_Xhoras",  parametros: { horas: 72 }, acaoAdicional: "trocar_persona:closer", ordem: 12 },
+      { stageOrigemChave: "com_closer",                  stageDestinoChave: "sem_resposta_closer",         condicao: "closer_tentativas_esgotadas", ordem: 13 },
+      { stageOrigemChave: "lead_qualificado",            stageDestinoChave: "aguardando_docs_pessoais",    condicao: "interesse_confirmado", acaoAdicional: "solicitar_documentos", ordem: 14 },
+      { stageOrigemChave: "aguardando_docs_pessoais",    stageDestinoChave: "aguardando_assinatura",       condicao: "docs_confirmados",     acaoAdicional: "gerar_proposta_automatica", ordem: 15 },
+    ];
+
+    await prisma.iaRegraTransicao.createMany({
+      data: regras.map(r => ({ projetoId: projeto.id, ...r })),
+    });
+
+    // ── Configs ───────────────────────────────────────────────────────────────
+
+    const configs = [
+      { chave: "modo_sdr",              valor: "triagem",                        tipo: "texto",  categoria: "comportamento", descricao: "Modo SDR: triagem = triagem inteligente LiderHub-style" },
+      { chave: "modo_coleta",           valor: "sequencial",                     tipo: "texto",  categoria: "comportamento", descricao: "Modo coleta: sequencial | conversacional" },
+      { chave: "anthropic_api_key",     valor: "",                               tipo: "senha",  categoria: "llm",           descricao: "Claude API Key" },
+      { chave: "llm_model_principal",   valor: "claude-haiku-4-5-20251001",      tipo: "texto",  categoria: "llm",           descricao: "Modelo Claude principal" },
+      { chave: "evolution_api_url",     valor: "",                               tipo: "texto",  categoria: "whatsapp",      descricao: "URL base da Evolution API" },
+      { chave: "evolution_api_key",     valor: "",                               tipo: "senha",  categoria: "whatsapp",      descricao: "Evolution API Key" },
+      { chave: "evolution_instancia",   valor: "",                               tipo: "texto",  categoria: "whatsapp",      descricao: "Nome da instância Evolution" },
+      { chave: "audio_provider",        valor: "groq",                           tipo: "texto",  categoria: "audio",         descricao: "Provedor de transcrição de áudio (groq | openai)" },
+      { chave: "audio_api_key",         valor: "",                               tipo: "senha",  categoria: "audio",         descricao: "API Key do provedor de áudio" },
+      { chave: "audio_model",           valor: "whisper-large-v3-turbo",         tipo: "texto",  categoria: "audio",         descricao: "Modelo Whisper" },
+      { chave: "ocr_mistral_api_key",   valor: "",                               tipo: "senha",  categoria: "ocr",           descricao: "API Key Mistral OCR" },
+      { chave: "timeout_sem_resposta_h",valor: "24",                             tipo: "numero", categoria: "comportamento", descricao: "Horas sem resposta para mover stage" },
+      { chave: "honorarios_percentual", valor: "30",                             tipo: "numero", categoria: "comportamento", descricao: "% de honorários de êxito" },
+      { chave: "nome_escritorio",       valor: "Pinheiro Silva Advogados",       tipo: "texto",  categoria: "comportamento", descricao: "Nome do escritório" },
+    ];
+
+    await prisma.iaProjetoConfig.createMany({
+      data: configs.map(c => ({ projetoId: projeto.id, ...c })),
+    });
+
+    return { ok: true, projetoId: projeto.id, msg: "Carreteiro 3.0 criado com sucesso" };
   }),
 
   // ── WhatsApp status + QR code ─────────────────────────────────────────────
@@ -547,6 +1273,24 @@ export const iaRouter = router({
       return { ok: true };
     }),
 
+  seedTtsConfigs: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .mutation(async ({ input }) => {
+      const ttsConfigs = [
+        { chave: "tts_api_key",        valor: "", tipo: "senha",  categoria: "tts", descricao: "API Key ElevenLabs para envio de áudio" },
+        { chave: "tts_model",          valor: "eleven_multilingual_v2", tipo: "texto", categoria: "tts", descricao: "Modelo TTS ElevenLabs (eleven_multilingual_v2 | eleven_turbo_v2_5)" },
+        { chave: "tts_momentos_audio", valor: "", tipo: "texto",  categoria: "tts", descricao: "Momentos para envio de áudio (ex: primeira_mensagem,parecer)" },
+      ];
+      for (const c of ttsConfigs) {
+        await prisma.iaProjetoConfig.upsert({
+          where: { projetoId_chave: { projetoId: input.projetoId, chave: c.chave } },
+          update: {},
+          create: { projetoId: input.projetoId, ...c },
+        });
+      }
+      return { ok: true };
+    }),
+
   // ── Testar transcrição de áudio ───────────────────────────────────────────
 
   testarAudio: authProc
@@ -639,7 +1383,8 @@ export const iaRouter = router({
       ativo:     z.boolean().optional(),
     }))
     .mutation(async ({ input }) => {
-      const { id, ...data } = input;
+      const { id, ...data }: any = input;
+      if (data.apiKey) data.apiKey = fieldEncrypt(data.apiKey);
       const result = id
         ? await prisma.iaLlmProvedor.update({ where: { id }, data })
         : await prisma.iaLlmProvedor.create({ data: { ...data, ativo: data.ativo ?? true } });
@@ -668,9 +1413,9 @@ export const iaRouter = router({
       return membros;
     }),
 
-  listTodosUsuarios: authProc.query(async () => {
+  listTodosUsuarios: authProc.query(async ({ ctx }) => {
     return prisma.usuario.findMany({
-      where: { ativo: true },
+      where: { ativo: true, ...whereEmpresa(ctx) },
       select: { id: true, nome: true, email: true },
       orderBy: { nome: "asc" },
     });
@@ -728,8 +1473,8 @@ export const iaRouter = router({
         const [mensagensEnviadas, conversasTomadas, mudancasStage] = await Promise.all([
           // Manual messages sent
           prisma.crmMensagemWhatsapp.count({
-            where: { usuarioId: m.usuarioId, direcao: "out", enviadaEm: { gte: de, lte: ate },
-              deal: { projetoId: input.projetoId } },
+            where: { direcao: "out", enviadaEm: { gte: de, lte: ate },
+              deal: { projetoId: input.projetoId, iaPausadaPor: m.usuarioId } },
           }),
           // Deals taken over (paused by this user)
           prisma.crmDeal.count({
@@ -828,15 +1573,16 @@ export const iaRouter = router({
       stageDestinoChave:    z.string().min(1),
       condicao:             z.string().min(1),
       acaoAdicional:        z.string().optional(),
+      parametros:           z.record(z.unknown()).optional(),
       ordem:                z.number().int().default(0),
       requerPrescricaoAtiva: z.boolean().default(false),
     }))
     .mutation(async ({ input }) => {
       const { id, projetoId, ...data } = input;
       if (id) {
-        return prisma.iaRegraTransicao.update({ where: { id }, data });
+        return prisma.iaRegraTransicao.update({ where: { id }, data: data as any });
       }
-      return prisma.iaRegraTransicao.create({ data: { ...data, projetoId } });
+      return prisma.iaRegraTransicao.create({ data: { ...data, projetoId } as any });
     }),
 
   deleteRegra: authProc
@@ -860,7 +1606,7 @@ export const iaRouter = router({
         const defaults = [
           { chave: "empresa",        campoColetar: "empresa",        ordemPadrao: 1,  pergunta: "Em qual empresa você trabalhou (ou trabalha)?",                         skipSe: null, tipoEspecial: null },
           { chave: "funcao",         campoColetar: "funcao",         ordemPadrao: 2,  pergunta: "Qual era sua função lá?",                                               skipSe: null, tipoEspecial: null },
-          { chave: "vinculo",        campoColetar: "vinculo",        ordemPadrao: 3,  pergunta: "Você tinha carteira assinada (CLT) ou era autônomo?",                    skipSe: null, tipoEspecial: null },
+          { chave: "vinculo",        campoColetar: "vinculo",        ordemPadrao: 3,  pergunta: "Nessa empresa você tinha carteira assinada, trabalhava sem registro (sem carteira) ou era autônomo com o seu próprio caminhão?", skipSe: null, tipoEspecial: null },
           { chave: "saida",          campoColetar: "saida",          ordemPadrao: 4,  pergunta: "Como foi o desligamento — foi demitido, pediu demissão ou ainda está lá?", skipSe: null, tipoEspecial: null },
           { chave: "horas_extras",   campoColetar: "horas_extras",   ordemPadrao: 5,  pergunta: "Trabalhava além da jornada normal? Recebia por essas horas?",            skipSe: null, tipoEspecial: null },
           { chave: "pagamento_fora", campoColetar: "pagamento_fora", ordemPadrao: 6,  pergunta: "Recebia algum valor fora do holerite, como Pix, Pamcard ou dinheiro?",   skipSe: null, tipoEspecial: null },
@@ -943,6 +1689,7 @@ export const iaRouter = router({
       return prisma.iaFlowStep.findMany({
         where: {
           projetoId: input.projetoId,
+          ativo: true,
           ...(input.personaChave ? { personaChave: input.personaChave } : {}),
         },
         orderBy: [{ personaChave: "asc" }, { ordem: "asc" }],
@@ -1058,7 +1805,6 @@ export const iaRouter = router({
       // ── Ana — Marketing (fase separada, sem bloquear o fluxo principal) ──────
       const marketingSteps: AnaStep[] = [
         { chave: "cidade_anuncio",   ordem: 1, label: "Cidade do anúncio",    stepType: "question", campoColetar: "cidade_anuncio",   pergunta: "Em qual cidade você viu o nosso anúncio?" },
-        { chave: "plataforma_origem", ordem: 2, label: "Plataforma do anúncio", stepType: "question", campoColetar: "plataforma_anuncio", pergunta: "Você viu nosso anúncio onde? Instagram, Facebook, TikTok, ou foi uma indicação?" },
       ];
 
       for (const s of marketingSteps) {
@@ -1252,5 +1998,348 @@ export const iaRouter = router({
       }
 
       return { ok: true };
+    }),
+
+  // ── Fluxo pós-reunião: coleta docs + gera proposta ──────────────────────────
+
+  dispararFluxoColetaDocs: authProc
+    .input(z.object({ dealId: z.string() }))
+    .mutation(async ({ input }) => {
+      const deal = await prisma.crmDeal.findUnique({
+        where: { id: input.dealId },
+        include: { contato: { select: { id: true, nome: true, whatsapp: true } } },
+      });
+      if (!deal) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!deal.projetoId) throw new TRPCError({ code: "BAD_REQUEST", message: "Deal sem projeto IA" });
+
+      // Reset to coleta_docs persona at beginning of flow
+      await (prisma.crmDeal as any).update({
+        where: { id: input.dealId },
+        data: {
+          iaPersonaChave: "coleta_docs",
+          iaFlowStepChave: null,
+          iaFlowStepData: null,
+          iaAtiva: true,
+          iaPersonaTrocadaEm: new Date(),
+        },
+      });
+
+      // Send the first flow step message via WhatsApp (always cd_nome, never skip)
+      if (deal.contato?.whatsapp) {
+        const { getEvolutionConfig } = await import("../agent/message-handler.js");
+        const evo = await getEvolutionConfig(deal.projetoId!);
+        if (evo) {
+          const { sendHumanized } = await import("../agent/message-handler.js");
+          const nome = deal.contato.nome ?? "cliente";
+
+          // First non-internal step (cd_nome) always has the intro + name question
+          const firstStep = await prisma.iaFlowStep.findFirst({
+            where: { projetoId: deal.projetoId!, personaChave: "coleta_docs", ativo: true, stepType: { not: "context_load" }, pergunta: { not: "" } },
+            orderBy: { ordem: "asc" },
+          });
+
+          if (firstStep) {
+            const texto = firstStep.pergunta.replace(/\{nome\}/g, nome);
+            await sendHumanized(evo, deal.contato.whatsapp, texto, 0);
+            await prisma.crmMensagemWhatsapp.create({
+              data: { dealId: deal.id, contatoId: deal.contato.id, direcao: "out", personaChave: "coleta_docs", remetente: "Ana", tipo: "text", conteudo: texto },
+            });
+            // Mark first step as sent so next incoming message processes the step
+            // (not reinitializes the flow with the greeting again)
+            await (prisma.crmDeal as any).update({
+              where: { id: deal.id },
+              data: {
+                iaFlowStepChave: firstStep.chave,
+                iaFlowStepData: { apresentacao_enviado: true },
+              },
+            });
+          }
+        }
+      }
+
+      await prisma.crmNota.create({
+        data: { dealId: input.dealId, conteudo: `[IA] Fluxo pós-reunião iniciado — coletando dados para procuração/contrato` },
+      });
+
+      return { ok: true };
+    }),
+
+  dispararFluxoMarcarReuniao: authProc
+    .input(z.object({ dealId: z.string() }))
+    .mutation(async ({ input }) => {
+      const deal = await prisma.crmDeal.findUnique({
+        where: { id: input.dealId },
+        include: { contato: { select: { id: true, nome: true, whatsapp: true } } },
+      });
+      if (!deal) throw new TRPCError({ code: "NOT_FOUND" });
+      if (!deal.contato?.whatsapp) throw new TRPCError({ code: "BAD_REQUEST", message: "Deal sem WhatsApp no contato" });
+
+      // Se o deal não tem projetoId, usa o primeiro projeto da empresa
+      let projetoId = deal.projetoId;
+      if (!projetoId) {
+        const projeto = await prisma.iaProjeto.findFirst({
+          where: { empresaId: deal.empresaId ?? undefined },
+          orderBy: { criadoEm: "asc" },
+        });
+        if (!projeto) throw new TRPCError({ code: "BAD_REQUEST", message: "Nenhum projeto IA configurado para esta empresa" });
+        projetoId = projeto.id;
+        await prisma.crmDeal.update({ where: { id: input.dealId }, data: { projetoId } });
+      }
+
+      const secPersona = await prisma.iaPersona.findUnique({
+        where: { projetoId_chave: { projetoId, chave: "secretaria" } },
+      });
+      if (!secPersona) throw new TRPCError({ code: "BAD_REQUEST", message: "Persona secretaria não configurada" });
+
+      // Troca para persona secretaria com estado limpo
+      await (prisma.crmDeal as any).update({
+        where: { id: input.dealId },
+        data: {
+          projetoId,
+          iaPersonaChave: "secretaria",
+          iaFlowStepChave: null,
+          iaFlowStepData: {},
+          iaAtiva: true,
+          iaPersonaTrocadaEm: new Date(),
+        },
+      });
+
+      // Remove stale meeting fields from qualificacao so encontrarSlotPorTexto
+      // doesn't match a previously chosen (possibly hallucinated) horario_reuniao.
+      await prisma.$executeRaw`UPDATE "CrmDeal" SET qualificacao = qualificacao - 'horario_reuniao' - '_reuniao_criada' - '_reuniao_link' WHERE id = ${input.dealId}`;
+
+      await prisma.crmNota.create({
+        data: { dealId: input.dealId, conteudo: `[IA] Fluxo de agendamento iniciado pelo SDR humano — Ana assumirá o agendamento com o lead` },
+      });
+
+      // Dispara processIncomingMessage com mensagem sintética do lead,
+      // exatamente como o stage-engine faria ao receber uma mensagem real.
+      // O stage-engine detecta persona=secretaria, busca slots reais e gera a abertura.
+      const phone = deal.contato.whatsapp;
+      const syntheticMsg = {
+        key: {
+          id: `secretaria_trigger_${Date.now()}`,
+          remoteJid: `${phone}@s.whatsapp.net`,
+          fromMe: false,
+        },
+        message: { conversation: "." },
+        messageType: "conversation",
+        pushName: deal.contato.nome ?? undefined,
+      };
+      const { processIncomingMessage } = await import("../agent/stage-engine.js");
+      processIncomingMessage(projetoId, syntheticMsg).catch((e: any) =>
+        console.error("[dispararFluxoMarcarReuniao] stage-engine error:", e.message)
+      );
+
+      return { ok: true };
+    }),
+
+  // ── Follow-up por stage (conversa) ───────────────────────────────────────────
+
+  getStageFollowUp: authProc
+    .input(z.object({ projetoId: z.string(), stageChave: z.string() }))
+    .query(async ({ input }) => {
+      const { projetoId, stageChave } = input;
+      const regras = await prisma.iaRegraTransicao.findMany({
+        where: { projetoId, stageOrigemChave: stageChave, condicao: "follow_up_timed" },
+        orderBy: { ordem: "asc" },
+      });
+      const templates = await prisma.iaMensagemTemplate.findMany({
+        where: { projetoId, chave: { startsWith: `${stageChave}_follow_up_` } },
+      });
+      const tplMap = Object.fromEntries(templates.map(t => [t.chave, t.template]));
+      const defaults = [
+        { delayHoras: 24, template: "" },
+        { delayHoras: 48, template: "" },
+        { delayHoras: 72, template: "" },
+      ];
+      return {
+        ativo: regras.length > 0,
+        mensagens: regras.length > 0
+          ? regras.map((r, i) => ({
+              delayHoras: (r.parametros as any)?.delayHoras ?? 24,
+              template: tplMap[`${stageChave}_follow_up_${i + 1}`] ?? "",
+            }))
+          : defaults,
+      };
+    }),
+
+  saveStageFollowUp: authProc
+    .input(z.object({
+      projetoId:  z.string(),
+      stageChave: z.string(),
+      ativo:      z.boolean(),
+      mensagens:  z.array(z.object({ delayHoras: z.number(), template: z.string() })),
+    }))
+    .mutation(async ({ input }) => {
+      const { projetoId, stageChave, ativo, mensagens } = input;
+      await prisma.iaRegraTransicao.deleteMany({
+        where: { projetoId, stageOrigemChave: stageChave, condicao: "follow_up_timed" },
+      });
+      if (ativo && mensagens.length > 0) {
+        await prisma.iaRegraTransicao.createMany({
+          data: mensagens.map((m, i) => ({
+            projetoId,
+            stageOrigemChave:  stageChave,
+            stageDestinoChave: stageChave,
+            condicao:          "follow_up_timed",
+            acaoAdicional:     `follow_up_${i + 1}`,
+            parametros:        { delayHoras: m.delayHoras },
+            ordem:             i + 1,
+          })),
+        });
+      }
+      for (let i = 0; i < mensagens.length; i++) {
+        const chave = `${stageChave}_follow_up_${i + 1}`;
+        if (mensagens[i].template.trim()) {
+          await prisma.iaMensagemTemplate.upsert({
+            where:  { projetoId_chave: { projetoId, chave } },
+            create: { projetoId, chave, template: mensagens[i].template, ativo: true },
+            update: { template: mensagens[i].template },
+          });
+        }
+      }
+      return { ok: true };
+    }),
+
+  // ── IaMensagemTemplate CRUD ───────────────────────────────────────────────────
+
+  listMensagemTemplates: authProc
+    .input(z.object({ projetoId: z.string(), prefixo: z.string().optional() }))
+    .query(async ({ input }) => {
+      return prisma.iaMensagemTemplate.findMany({
+        where: {
+          projetoId: input.projetoId,
+          ...(input.prefixo ? { chave: { startsWith: input.prefixo } } : {}),
+        },
+        orderBy: { chave: "asc" },
+      });
+    }),
+
+  upsertMensagemTemplate: authProc
+    .input(z.object({
+      projetoId:    z.string(),
+      chave:        z.string().min(1),
+      template:     z.string(),
+      descricao:    z.string().optional(),
+      personaChave: z.string().optional(),
+    }))
+    .mutation(async ({ input }) => {
+      const { projetoId, chave, ...rest } = input;
+      return prisma.iaMensagemTemplate.upsert({
+        where:  { projetoId_chave: { projetoId, chave } },
+        create: { projetoId, chave, ...rest, ativo: true },
+        update: { ...rest },
+      });
+    }),
+
+  deleteMensagemTemplate: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      return prisma.iaMensagemTemplate.delete({ where: { id: input.id } });
+    }),
+
+  // ── Deal Anexos (document folder) ────────────────────────────────────────────
+
+  listarAnexosDeal: authProc
+    .input(z.object({ dealId: z.string() }))
+    .query(async ({ input }) => {
+      return prisma.dealAnexo.findMany({
+        where: { dealId: input.dealId },
+        orderBy: { criadoEm: "desc" },
+        select: {
+          id: true,
+          nomeArquivo: true,
+          mimetype: true,
+          tamanho: true,
+          tipoDocumento: true,
+          dadosExtraidos: true,
+          criadoEm: true,
+        },
+      });
+    }),
+
+  // ── Gates de Desqualificação SDR ─────────────────────────────────────────────
+
+  listGatesSdr: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .query(async ({ input }) => {
+      return prisma.iaGateSdr.findMany({
+        where: { projetoId: input.projetoId },
+        orderBy: { ordem: "asc" },
+      });
+    }),
+
+  toggleGateSdr: authProc
+    .input(z.object({ id: z.string(), ativo: z.boolean() }))
+    .mutation(async ({ input }) => {
+      return prisma.iaGateSdr.update({
+        where: { id: input.id },
+        data: { ativo: input.ativo },
+      });
+    }),
+
+  deleteGateSdr: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      return prisma.iaGateSdr.delete({ where: { id: input.id } });
+    }),
+
+  updateGateSdr: authProc
+    .input(z.object({ id: z.string(), mensagemLead: z.string(), mesesMin: z.number().int().positive().optional() }))
+    .mutation(async ({ input }) => {
+      const { id, mensagemLead, mesesMin } = input;
+      const current = await prisma.iaGateSdr.findUnique({ where: { id }, select: { condicaoJson: true } });
+      const condicaoJson = mesesMin !== undefined
+        ? { ...((current?.condicaoJson as Record<string, unknown>) ?? {}), mesesMin }
+        : undefined;
+      return prisma.iaGateSdr.update({
+        where: { id },
+        data: { mensagemLead, ...(condicaoJson !== undefined ? { condicaoJson } : {}) },
+      });
+    }),
+
+  // ── Empresas Bloqueadas SDR ───────────────────────────────────────────────────
+
+  listEmpresasBloqueadas: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .query(async ({ input }) => {
+      return prisma.iaEmpresaBloqueada.findMany({
+        where: { projetoId: input.projetoId },
+        orderBy: { nome: "asc" },
+      });
+    }),
+
+  criarEmpresaBloqueada: authProc
+    .input(z.object({ projetoId: z.string(), nome: z.string().min(1), motivo: z.string().optional() }))
+    .mutation(async ({ input }) => {
+      const nomeNorm = input.nome
+        .toLowerCase()
+        .normalize("NFD").replace(/[̀-ͯ]/g, "")
+        .replace(/\b(transportadora|transporte|transportes|logistica|distribuidora|industria|broker|ltda|s\.?a|mei)\b/g, "")
+        .replace(/[.\-,]/g, " ").replace(/\s+/g, " ").trim();
+      return prisma.iaEmpresaBloqueada.create({
+        data: {
+          projetoId: input.projetoId,
+          nome: input.nome,
+          nomeNorm,
+          motivo: input.motivo ?? "prescricao_coletiva",
+        },
+      });
+    }),
+
+  toggleEmpresaBloqueada: authProc
+    .input(z.object({ id: z.string(), ativo: z.boolean() }))
+    .mutation(async ({ input }) => {
+      return prisma.iaEmpresaBloqueada.update({
+        where: { id: input.id },
+        data: { ativo: input.ativo },
+      });
+    }),
+
+  deleteEmpresaBloqueada: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      return prisma.iaEmpresaBloqueada.delete({ where: { id: input.id } });
     }),
 });

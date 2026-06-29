@@ -1,7 +1,12 @@
 import { resolve, join } from "node:path";
-import { writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { extrairMetaCert, invalidarCacheCert } from "./lib/nfse.js";
+import { invalidarCacheSicoobBoleto } from "./lib/sicoob-boleto.js";
+import { invalidarCacheSicoobPix }    from "./lib/sicoob-pix.js";
 import { prisma } from "./db.js";
+import { fieldEncrypt } from "./lib/field-crypto.js";
 
 export const CERTS_DIR  = resolve(process.env.CERTS_DIR  ?? "./certs");
 export const LOGOS_DIR  = resolve(process.env.LOGOS_DIR  ?? "./logos");
@@ -30,6 +35,29 @@ export async function salvarLogo(
   return logoPath;
 }
 
+// Converte PKCS12 legado (RC2-40-CBC) → moderno (AES-256) via openssl -legacy
+// Certificados ICP-Brasil antigos usam RC2-40, que o OpenSSL 3.x desativou.
+function normalizarPkcs12(input: Buffer, senha: string): Buffer {
+  const tmp   = join(tmpdir(), `cert_${Date.now()}`);
+  const tmpIn = `${tmp}_in.p12`;
+  const tmpPem= `${tmp}.pem`;
+  const tmpOut= `${tmp}_out.p12`;
+  try {
+    writeFileSync(tmpIn, input);
+    execSync(
+      `openssl pkcs12 -legacy -in "${tmpIn}" -out "${tmpPem}" -passin pass:${JSON.stringify(senha)} -passout pass:temp_conv123`,
+      { stdio: "pipe" }
+    );
+    execSync(
+      `openssl pkcs12 -export -in "${tmpPem}" -out "${tmpOut}" -passin pass:temp_conv123 -passout pass:${JSON.stringify(senha)}`,
+      { stdio: "pipe" }
+    );
+    return readFileSync(tmpOut);
+  } finally {
+    for (const f of [tmpIn, tmpPem, tmpOut]) try { unlinkSync(f); } catch {}
+  }
+}
+
 export async function salvarCertificado(
   empresaId: string,
   fileBuffer: Buffer,
@@ -41,8 +69,26 @@ export async function salvarCertificado(
   mkdirSync(CERTS_DIR, { recursive: true });
   const certPath = certPathForEmpresa(empresaId);
 
-  writeFileSync(certPath, fileBuffer);
+  // Tenta usar diretamente; se falhar com algoritmo legado, converte
+  let certData = fileBuffer;
+  try {
+    // Verifica se o Node.js consegue abrir o PKCS12 (cria contexto TLS de teste)
+    const { createSecureContext } = await import("node:tls");
+    createSecureContext({ pfx: fileBuffer, passphrase: senha });
+  } catch (err: any) {
+    if (/unsupported|rc2|legacy/i.test(String(err?.message ?? ""))) {
+      console.log(`[Upload] Certificado legado detectado (${err.message}) — convertendo para AES-256...`);
+      certData = normalizarPkcs12(fileBuffer, senha);
+      console.log("[Upload] Certificado convertido com sucesso");
+    } else {
+      throw err;
+    }
+  }
+
+  writeFileSync(certPath, certData);
   invalidarCacheCert(certPath);
+  invalidarCacheSicoobBoleto(certPath);
+  invalidarCacheSicoobPix(certPath);
 
   // Salva senha em variável de ambiente (acesso em runtime) e no banco (persistência)
   process.env[`CERT_PASS_${empresaId}`] = senha;
@@ -50,7 +96,7 @@ export async function salvarCertificado(
   // Atualiza metadados + senha no banco
   await prisma.empresaEmitente.update({
     where: { id: empresaId },
-    data:  { certNome: meta.nome, certValidade: meta.validade, certPass: senha },
+    data:  { certNome: meta.nome, certValidade: meta.validade, certPass: fieldEncrypt(senha) },
   });
 
   return meta;

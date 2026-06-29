@@ -1,13 +1,15 @@
 import { z }                from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma }           from "../db.js";
+import { whereEmitenteFilter, assertEmitenteAccess } from "./tenant-utils.js";
 import { criarPix, consultarPix, registrarWebhookPix, consultarWebhookPix, sicoobPixConfigurado } from "../lib/sicoob-pix.js";
 import type { SicoobPixConfig }    from "../lib/sicoob-pix.js";
-import { criarBoleto, consultarBoleto, sicoobBoletoConfigurado } from "../lib/sicoob-boleto.js";
+import { criarBoleto, consultarBoleto, baixarBoleto, sicoobBoletoConfigurado } from "../lib/sicoob-boleto.js";
 import type { SicoobBoletoConfig } from "../lib/sicoob-boleto.js";
 import { renderTemplate }          from "../lib/template.js";
 import { certPathForEmpresa }      from "../upload.js";
 import { enviarEmailCobranca }     from "../lib/email-cobranca.js";
+import { fieldDecrypt }           from "../lib/field-crypto.js";
 
 type Emitente = Awaited<ReturnType<typeof prisma.empresaEmitente.findUniqueOrThrow>>;
 
@@ -16,7 +18,7 @@ function pixCfg(emp: Emitente): SicoobPixConfig {
     clientId: emp.pixClientId ?? "",
     pixChave: emp.pixChave || emp.cnpj.replace(/\D/g, ""),
     certPath: certPathForEmpresa(emp.id),
-    certPass: emp.certPass    ?? "",
+    certPass: fieldDecrypt(emp.certPass),
   };
 }
 
@@ -43,8 +45,10 @@ export const cobrancaRouter = router({
       page:        z.number().int().default(1),
       pageSize:    z.number().int().default(20),
     }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const where = {
+        ...emitenteFilter,
         ...(input.contratoId  ? { contratoId:  input.contratoId  } : {}),
         ...(input.emitenteId  ? { emitenteId:  input.emitenteId  } : {}),
         ...(input.competencia ? { competencia: input.competencia } : {}),
@@ -81,11 +85,12 @@ export const cobrancaRouter = router({
       forcar:      z.boolean().default(false),
       enviarEmail: z.boolean().default(true),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const contrato = await prisma.contrato.findUniqueOrThrow({
         where: { id: input.contratoId },
         include: { emitente: true, tomador: true },
       });
+      assertEmitenteAccess(ctx, contrato.emitenteId);
 
       // Bloquear duplicata por vencimento — sempre, mesmo com forcar=true
       const duplicataVenc = await prisma.cobranca.findFirst({
@@ -93,12 +98,27 @@ export const cobrancaRouter = router({
       });
       if (duplicataVenc) throw new Error(`Já existe cobrança com vencimento ${input.vencimento} para este contrato`);
 
-      // Verificar duplicata por competência (apenas sem forcar)
-      if (!input.forcar) {
-        const existente = await prisma.cobranca.findFirst({
-          where: { contratoId: input.contratoId, competencia: input.competencia },
-        });
-        if (existente) throw new Error(`Já existe cobrança para ${input.competencia}`);
+      // Duplicata por competência. Mesmo com forcar=true NÃO permitimos criar uma
+      // segunda cobrança quando já existe uma com boleto ou PIX ATIVO na mesma
+      // competência — foi assim que nasceram os boletos duplicados de 15/06 (o
+      // modal "Gerar e Abrir" envia forcar:true). O forcar só libera quando a
+      // cobrança existente não tem nada ativo (ex.: boleto cancelado / geração
+      // anterior que falhou e não chegou a registrar boleto/PIX).
+      const existente = await prisma.cobranca.findFirst({
+        where: { contratoId: input.contratoId, competencia: input.competencia },
+      });
+      if (existente) {
+        const boletoAtivo = !!existente.boletoNossoNumero && existente.boletoStatus !== "CANCELADO";
+        const pixAtivo    = !!existente.pixTxid && existente.pixStatus !== "CANCELADO";
+        if (boletoAtivo || pixAtivo) {
+          throw new Error(
+            `Já existe cobrança ativa para ${input.competencia} neste contrato (boleto/PIX em aberto). ` +
+            `Cancele ou altere a cobrança existente antes de gerar outra — evita duplicar no banco.`,
+          );
+        }
+        if (!input.forcar) {
+          throw new Error(`Já existe cobrança para ${input.competencia}`);
+        }
       }
 
       const [mm, yyyy] = input.competencia.split("/");
@@ -230,7 +250,9 @@ export const cobrancaRouter = router({
   // ── Reenviar e-mail de cobrança ───────────────────────────────────────────
   reenviarEmail: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({ where: { id: input.id }, select: { emitenteId: true } });
+      assertEmitenteAccess(ctx, c.emitenteId);
       enviarEmailCobranca(input.id).catch(err =>
         console.error(`[Email-Cob] Erro ao reenviar cobrança ${input.id}:`, err)
       );
@@ -243,10 +265,12 @@ export const cobrancaRouter = router({
     .input(z.object({
       id: z.string().optional(), // se omitido, verifica todas pendentes
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const emitenteFilter = whereEmitenteFilter(ctx);
       const where = input.id
         ? { id: input.id }
         : {
+            ...emitenteFilter,
             OR: [
               { pixStatus: "PENDENTE", pixTxid: { not: null } },
               { boletoStatus: "AGUARDANDO", boletoNossoNumero: { not: null } },
@@ -310,8 +334,9 @@ export const cobrancaRouter = router({
       dataInicio:   z.string().optional(), // "YYYY-MM-DD"
       dataFim:      z.string().optional(), // "YYYY-MM-DD"
     }))
-    .query(async ({ input }) => {
-      const where: Record<string, unknown> = {};
+    .query(async ({ input, ctx }) => {
+      const emitenteFilter = whereEmitenteFilter(ctx);
+      const where: Record<string, unknown> = { ...emitenteFilter };
       if (input.emitenteId)  where["emitenteId"]  = input.emitenteId;
       if (input.competencia) where["competencia"] = input.competencia;
       if (input.dataInicio || input.dataFim) {
@@ -348,6 +373,9 @@ export const cobrancaRouter = router({
         } else if (c.pixStatus === "PAGO") {
           qtdPagoPix++;
           totalPagoPix += c.valor;
+        } else if (c.baixaManualStatus === "PAGO") {
+          qtdPagoPix++; // contabiliza junto com PIX no total
+          totalPagoPix += c.baixaManualValorPago ?? c.valor;
         } else if (c.boletoStatus === "CANCELADO") {
           qtdCancelado++;
         } else if (c.boletoStatus === "VENCIDO") {
@@ -361,7 +389,7 @@ export const cobrancaRouter = router({
       // Marcar como vencido localmente (sem salvar) as que passaram do prazo
       const cobrancasEnriquecidas = cobrancas.map(c => ({
         ...c,
-        statusEfetivo: c.boletoStatus === "PAGO" || c.pixStatus === "PAGO"
+        statusEfetivo: c.boletoStatus === "PAGO" || c.pixStatus === "PAGO" || c.baixaManualStatus === "PAGO"
           ? "PAGO"
           : c.boletoStatus === "CANCELADO"
           ? "CANCELADO"
@@ -390,23 +418,317 @@ export const cobrancaRouter = router({
   // ── Webhook PIX — registrar URL no Sicoob ────────────────────────────────
   registrarWebhook: authProc
     .input(z.object({ emitenteId: z.string(), webhookUrl: z.string().url() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const emp = await prisma.empresaEmitente.findUniqueOrThrow({ where: { id: input.emitenteId } });
+      assertEmitenteAccess(ctx, emp.id);
       await registrarWebhookPix(pixCfg(emp), input.webhookUrl);
       return { ok: true, webhookUrl: input.webhookUrl };
     }),
 
   consultarWebhook: authProc
     .input(z.object({ emitenteId: z.string() }))
-    .query(async ({ input }) => {
+    .query(async ({ input, ctx }) => {
       const emp = await prisma.empresaEmitente.findUniqueOrThrow({ where: { id: input.emitenteId } });
+      assertEmitenteAccess(ctx, emp.id);
       return consultarWebhookPix(pixCfg(emp));
+    }),
+
+  // ── Cancelar boleto no Sicoob ─────────────────────────────────────────────
+  cancelarBoleto: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({
+        where: { id: input.id },
+        include: { emitente: true },
+      });
+      assertEmitenteAccess(ctx, c.emitenteId);
+
+      if (!c.boletoNossoNumero) throw new Error("Cobrança não possui boleto registrado");
+      if (c.boletoStatus === "PAGO")      throw new Error("Boleto já pago — não pode ser cancelado");
+      if (c.boletoStatus === "CANCELADO") throw new Error("Boleto já cancelado");
+
+      const bCfg = boletoCfg(c.emitente);
+      if (!sicoobBoletoConfigurado(bCfg)) throw new Error("Sicoob Boleto não configurado para esta empresa");
+
+      await baixarBoleto(bCfg, c.boletoNossoNumero);
+
+      return prisma.cobranca.update({
+        where: { id: c.id },
+        data: { boletoStatus: "CANCELADO" },
+      });
+    }),
+
+  // ── Alterar valor (cancela boleto, recria com novo valor) ─────────────────
+  alterarValor: authProc
+    .input(z.object({
+      id:             z.string(),
+      novoValor:      z.number().int().positive(),       // em centavos
+      novoVencimento: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      enviarEmail:    z.boolean().default(true),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({
+        where: { id: input.id },
+        include: { emitente: true, contrato: { include: { tomador: true } } },
+      });
+      assertEmitenteAccess(ctx, c.emitenteId);
+
+      if (c.boletoStatus === "PAGO") throw new Error("Boleto já pago — não é possível alterar");
+
+      const bCfg = boletoCfg(c.emitente);
+      if (!sicoobBoletoConfigurado(bCfg)) throw new Error("Sicoob Boleto não configurado para esta empresa");
+
+      // Baixar boleto existente se ainda estiver ativo. NÃO engolir a falha: se o
+      // baixar não confirmar, abortamos — caso contrário o boleto antigo continua
+      // ativo no Sicoob e o novo é criado por cima, gerando cobrança duplicada
+      // (foi assim que o nossoNumero 81 ficou órfão).
+      if (c.boletoNossoNumero && c.boletoStatus !== "CANCELADO") {
+        try {
+          await baixarBoleto(bCfg, c.boletoNossoNumero);
+        } catch (e) {
+          // Tolerar apenas quando o boleto já está efetivamente baixado/cancelado no Sicoob.
+          let jaBaixado = false;
+          try {
+            const st = await consultarBoleto(bCfg, c.boletoNossoNumero);
+            jaBaixado = /baixad|cancelad|liquidad|pago/i.test(st.situacao);
+          } catch { /* ignora erro de consulta */ }
+          if (!jaBaixado) {
+            throw new Error(
+              `Falha ao cancelar o boleto anterior ${c.boletoNossoNumero} no Sicoob — alteração abortada para não duplicar a cobrança. Detalhe: ${(e as Error).message}`,
+            );
+          }
+        }
+      }
+
+      const vencimento = input.novoVencimento ?? c.vencimento;
+
+      // Atualizar valor e vencimento no DB, limpar dados do boleto anterior
+      await prisma.cobranca.update({
+        where: { id: c.id },
+        data: {
+          valor:                input.novoValor,
+          vencimento,
+          boletoNossoNumero:    null,
+          boletoLinhaDigitavel: null,
+          boletoCodigoBarras:   null,
+          boletoUrlPdf:         null,
+          boletoStatus:         "AGUARDANDO",
+        },
+      });
+
+      // Recriar boleto com novo valor
+      const instrucoes = [
+        `Ref: ${c.competencia} — ${c.contrato.nomeServico || c.emitente.nome}`,
+        `Vencimento: ${vencimento}`,
+      ];
+
+      let boletoData: Awaited<ReturnType<typeof criarBoleto>> | null = null;
+      try {
+        boletoData = await criarBoleto(bCfg, {
+          valor:          input.novoValor,
+          dataVencimento: vencimento,
+          seuNumero:      c.id.slice(0, 15),
+          instrucoes,
+          comPix:         false,
+          multaPercent:   c.emitente.boletoMultaPercent    ?? 2,
+          jurosDiaPercent: c.emitente.boletoJurosDiaPercent ?? 0.033,
+          pagador: {
+            nome:     c.contrato.tomador.nome,
+            cpfCnpj:  c.contrato.tomador.cpfCnpj,
+            endereco: c.contrato.tomador.endereco || "Endereço não informado",
+            bairro:   c.contrato.tomador.bairro   || "Centro",
+            cidade:   c.contrato.tomador.cidade   || "Vitória da Conquista",
+            uf:       c.contrato.tomador.uf       || "BA",
+            cep:      c.contrato.tomador.cep      || "45000000",
+            email:    c.contrato.tomador.email    ?? undefined,
+          },
+        });
+      } catch (e) {
+        console.error("[Cobrança] Falha ao recriar boleto:", e);
+        throw new Error(`Valor atualizado mas falha ao emitir novo boleto: ${(e as Error).message}`);
+      }
+
+      const cobAtualizada = await prisma.cobranca.update({
+        where: { id: c.id },
+        data: {
+          boletoNossoNumero:    boletoData.nossoNumero,
+          boletoLinhaDigitavel: boletoData.linhaDigitavel,
+          boletoCodigoBarras:   boletoData.codigoBarras,
+          boletoUrlPdf:         boletoData.urlPdf ?? null,
+        },
+      });
+
+      if (input.enviarEmail) {
+        enviarEmailCobranca(cobAtualizada.id).catch(err =>
+          console.error(`[Email-Cob] Erro ao reenviar após alteração ${cobAtualizada.id}:`, err)
+        );
+      }
+
+      return cobAtualizada;
     }),
 
   // ── Excluir cobrança ──────────────────────────────────────────────────────
   excluir: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({ where: { id: input.id }, include: { emitente: true } });
+      assertEmitenteAccess(ctx, c.emitenteId);
+
+      // Cancelar (baixar) o boleto no Sicoob ANTES de excluir. Caso contrário, o
+      // boleto continua ativo no banco sem registro no Avoce — vira boleto órfão
+      // e o cliente recebe cobrança duplicada. (Foi assim que os nossoNumero 91 e
+      // 124 ficaram órfãos no faturamento 06/2026.)
+      if (c.boletoNossoNumero && c.boletoStatus !== "PAGO" && c.boletoStatus !== "CANCELADO") {
+        const bCfg = boletoCfg(c.emitente);
+        if (sicoobBoletoConfigurado(bCfg)) {
+          try {
+            await baixarBoleto(bCfg, c.boletoNossoNumero);
+          } catch (e) {
+            throw new Error(
+              `Falha ao cancelar o boleto ${c.boletoNossoNumero} no Sicoob — exclusão abortada para evitar boleto órfão. ` +
+              `Cancele o boleto primeiro ou verifique o Sicoob. Detalhe: ${(e as Error).message}`,
+            );
+          }
+        }
+      }
+
       return prisma.cobranca.delete({ where: { id: input.id } });
+    }),
+
+  // ── Baixa manual (depósito / PIX avulso) ─────────────────────────────────
+  baixaManual: authProc
+    .input(z.object({
+      id:               z.string(),
+      formaPagamento:   z.enum(["PIX", "DEPOSITO", "TRANSFERENCIA", "OUTRO"]),
+      valorPago:        z.number().int().positive(),
+      dataRecebimento:  z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      pagadorNome:      z.string().optional(),
+      pagadorDoc:       z.string().optional(),
+      banco:            z.string().optional(),
+      obs:              z.string().optional(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true, pixStatus: true, boletoStatus: true, baixaManualStatus: true },
+      });
+      assertEmitenteAccess(ctx, c.emitenteId);
+
+      if (c.pixStatus === "PAGO" || c.boletoStatus === "PAGO") {
+        throw new Error("Cobrança já registrada como paga (via Sicoob)");
+      }
+      if (c.baixaManualStatus === "PAGO") {
+        throw new Error("Baixa manual já registrada para esta cobrança");
+      }
+
+      const usuario = await prisma.usuario.findUniqueOrThrow({
+        where: { id: ctx.userId! },
+        select: { nome: true, email: true },
+      });
+
+      const [cobranca] = await prisma.$transaction([
+        prisma.cobranca.update({
+          where: { id: input.id },
+          data: {
+            baixaManualStatus:          "PAGO",
+            baixaManualEm:              new Date(),
+            baixaManualPorId:           ctx.userId,
+            baixaManualPorNome:         usuario.nome,
+            baixaManualPorEmail:        usuario.email,
+            baixaManualFormaPagamento:  input.formaPagamento,
+            baixaManualValorPago:       input.valorPago,
+            baixaManualDataRecebimento: input.dataRecebimento,
+            baixaManualPagadorNome:     input.pagadorNome ?? null,
+            baixaManualPagadorDoc:      input.pagadorDoc  ?? null,
+            baixaManualBanco:           input.banco       ?? null,
+            baixaManualObs:             input.obs         ?? null,
+          },
+        }),
+        prisma.cobrancaBaixaLog.create({
+          data: {
+            cobrancaId:     input.id,
+            acao:           "BAIXA_MANUAL",
+            usuarioId:      ctx.userId!,
+            usuarioNome:    usuario.nome,
+            usuarioEmail:   usuario.email,
+            formaPagamento: input.formaPagamento,
+            valorPago:      input.valorPago,
+            dataRecebimento: input.dataRecebimento,
+            pagadorNome:    input.pagadorNome ?? null,
+            pagadorDoc:     input.pagadorDoc  ?? null,
+            banco:          input.banco       ?? null,
+            obs:            input.obs         ?? null,
+          },
+        }),
+      ]);
+
+      return cobranca;
+    }),
+
+  // ── Estornar baixa manual ─────────────────────────────────────────────────
+  estornarBaixaManual: authProc
+    .input(z.object({ id: z.string(), obs: z.string().optional() }))
+    .mutation(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true, baixaManualStatus: true },
+      });
+      assertEmitenteAccess(ctx, c.emitenteId);
+
+      if (c.baixaManualStatus !== "PAGO") {
+        throw new Error("Esta cobrança não possui baixa manual ativa");
+      }
+
+      const usuario = await prisma.usuario.findUniqueOrThrow({
+        where: { id: ctx.userId! },
+        select: { nome: true, email: true },
+      });
+
+      const [cobranca] = await prisma.$transaction([
+        prisma.cobranca.update({
+          where: { id: input.id },
+          data: {
+            baixaManualStatus:          "ESTORNADO",
+            baixaManualEm:              null,
+            baixaManualPorId:           null,
+            baixaManualPorNome:         null,
+            baixaManualPorEmail:        null,
+            baixaManualFormaPagamento:  null,
+            baixaManualValorPago:       null,
+            baixaManualDataRecebimento: null,
+            baixaManualPagadorNome:     null,
+            baixaManualPagadorDoc:      null,
+            baixaManualBanco:           null,
+            baixaManualObs:             null,
+          },
+        }),
+        prisma.cobrancaBaixaLog.create({
+          data: {
+            cobrancaId:   input.id,
+            acao:         "ESTORNO_BAIXA_MANUAL",
+            usuarioId:    ctx.userId!,
+            usuarioNome:  usuario.nome,
+            usuarioEmail: usuario.email,
+            obs:          input.obs ?? null,
+          },
+        }),
+      ]);
+
+      return cobranca;
+    }),
+
+  // ── Histórico de baixas manuais ───────────────────────────────────────────
+  historicoBaixa: authProc
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const c = await prisma.cobranca.findUniqueOrThrow({
+        where: { id: input.id },
+        select: { emitenteId: true },
+      });
+      assertEmitenteAccess(ctx, c.emitenteId);
+      return prisma.cobrancaBaixaLog.findMany({
+        where: { cobrancaId: input.id },
+        orderBy: { criadoEm: "asc" },
+      });
     }),
 });

@@ -26,6 +26,8 @@ vi.mock("../db.js", () => ({
     },
     iaPersona: {
       findUnique: vi.fn().mockResolvedValue({ systemPrompt: "", nomeExibicao: "Daniela", llmProviderChave: null }),
+      // getPersonaNomeExibicao (transition-engine.ts:51) agora usa findFirst
+      findFirst: vi.fn().mockResolvedValue({ nomeExibicao: "Daniela" }),
     },
     iaMensagemTemplate: {
       findFirst: vi.fn().mockResolvedValue(null),

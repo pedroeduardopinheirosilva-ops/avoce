@@ -1,6 +1,8 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { useEffect } from "react";
 import Layout     from "./components/Layout";
 import LoginPage  from "./pages/Login";
+import { VoipProvider } from "./contexts/VoipContext";
 import Dashboard  from "./pages/Dashboard";
 import Empresas   from "./pages/Empresas";
 import Tomadores  from "./pages/Tomadores";
@@ -15,18 +17,46 @@ import Whatsapp            from "./pages/Whatsapp";
 import ConfigIA            from "./pages/ConfigIA";
 import Pipedrive           from "./pages/Pipedrive";
 import Reengajamento       from "./pages/Reengajamento";
+import CampanhaAtiva       from "./pages/CampanhaAtiva";
 import Financeiro          from "./pages/Financeiro";
 import Usuarios           from "./pages/Usuarios";
+import AssistenteInterno  from "./pages/AssistenteInterno";
+import MarketingAutopilot from "./pages/MarketingAutopilot";
 import ContasBancarias    from "./pages/Financeiro/ContasBancarias";
 import ContaBancariaForm  from "./pages/Financeiro/ContaBancariaForm";
 import Extrato            from "./pages/Financeiro/Extrato";
 import Conciliacao        from "./pages/Financeiro/Conciliacao";
 import FluxoCaixa         from "./pages/Financeiro/FluxoCaixa";
+import Reunioes           from "./pages/Reunioes";
+import Telefone           from "./pages/Telefone";
+import SalaPublica        from "./pages/SalaPublica";
+import Tenants            from "./pages/Tenants";
+import { trpc } from "./lib/trpc";
+import { AuthContext, type AuthUser } from "./lib/usePermission";
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const token = localStorage.getItem("avoce_token");
+  const { data: user, isLoading, error } = trpc.auth.me.useQuery(undefined, {
+    enabled: !!token,
+    retry: false,
+    staleTime: 0,
+  });
+
+  useEffect(() => {
+    if (error) {
+      localStorage.removeItem("avoce_token");
+    }
+  }, [error]);
+
   if (!token) return <Navigate to="/login" replace />;
-  return <>{children}</>;
+  if (isLoading) return <div style={{ padding: "2rem", textAlign: "center", color: "#666" }}>Carregando…</div>;
+  if (error) return <Navigate to="/login" replace />;
+
+  return (
+    <AuthContext.Provider value={{ user: user as AuthUser, isLoading: false }}>
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
 export default function App() {
@@ -34,7 +64,8 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
-        <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
+        <Route path="/sala/:token" element={<SalaPublica />} />
+        <Route path="/" element={<PrivateRoute><VoipProvider><Layout /></VoipProvider></PrivateRoute>}>
           <Route index element={<Navigate to="/crm" replace />} />
           <Route path="crm" element={<Crm />} />
           <Route path="whatsapp"   element={<Whatsapp />} />
@@ -50,6 +81,7 @@ export default function App() {
           <Route path="templates-documentos" element={<TemplatesDocumentos />} />
           <Route path="pipedrive"           element={<Pipedrive />} />
           <Route path="reengajamento"       element={<Reengajamento />} />
+          <Route path="campanha-ativa"      element={<CampanhaAtiva />} />
           <Route path="financeiro"          element={<Financeiro />} />
           <Route path="financeiro/contas"   element={<ContasBancarias />} />
           <Route path="financeiro/contas/nova" element={<ContaBancariaForm />} />
@@ -58,6 +90,11 @@ export default function App() {
           <Route path="financeiro/conciliacao" element={<Conciliacao />} />
           <Route path="financeiro/fluxo-caixa" element={<FluxoCaixa />} />
           <Route path="usuarios"            element={<Usuarios />} />
+          <Route path="tenants"             element={<Tenants />} />
+          <Route path="assistente-interno"  element={<AssistenteInterno />} />
+          <Route path="marketing-autopilot" element={<MarketingAutopilot />} />
+          <Route path="reunioes"           element={<Reunioes />} />
+          <Route path="telefone"           element={<Telefone />} />
         </Route>
       </Routes>
     </BrowserRouter>

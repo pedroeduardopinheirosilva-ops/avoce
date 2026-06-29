@@ -12,6 +12,7 @@ import {
   fetchActivities,
   fetchActivitiesDone,
   fetchDealFlow,
+  getRateLimitStatus,
 } from "../lib/pipedrive.js";
 
 const CONFIG_KEY = "pipedrive_api_token";
@@ -26,8 +27,15 @@ export const pipedriveRouter = router({
   // ── Token management ──────────────────────────────────────────────────────
 
   getConfig: authProc.query(async () => {
-    const cfg = await prisma.configuracao.findUnique({ where: { chave: CONFIG_KEY } });
-    return { hasToken: !!cfg?.valor, token: cfg?.valor ? `${cfg.valor.slice(0, 6)}...` : null };
+    const [cfg, lastSync] = await Promise.all([
+      prisma.configuracao.findUnique({ where: { chave: CONFIG_KEY } }),
+      prisma.configuracao.findUnique({ where: { chave: "pipedrive_last_sync" } }),
+    ]);
+    return {
+      hasToken: !!cfg?.valor,
+      token: cfg?.valor ? `${cfg.valor.slice(0, 6)}...` : null,
+      lastSync: lastSync?.valor ?? null,
+    };
   }),
 
   saveToken: authProc
@@ -55,7 +63,7 @@ export const pipedriveRouter = router({
     const [pipelines, stages, persons, deals] = await Promise.all([
       fetchPipelines(token),
       fetchStages(token),
-      fetchPersons(token).then(p => p.filter(x => x.active_flag)),
+      fetchPersons(token).then(p => p.filter(x => !x.is_deleted)),
       fetchDeals(token),
     ]);
     return {
@@ -75,30 +83,31 @@ export const pipedriveRouter = router({
     .input(z.object({
       overwrite: z.boolean().default(false),
       importarPerdidos: z.boolean().default(false),
+      importarHistoricoEtapas: z.boolean().default(false),
+      forceFull: z.boolean().default(false),
     }))
     .mutation(async ({ input }) => {
       const token = await getToken();
       if (!token) throw new Error("Token não configurado");
 
-      const log: string[] = [];
+      // Verify token + check rate limit before starting the full import
+      const conn = await testConnection(token);
+      if (!conn.ok) throw new Error(`Pipedrive: ${conn.error ?? "token inválido ou rate limit atingido"}`);
 
-      // 0. Buscar definições de campos customizados dos deals
+      // Load last sync timestamp for incremental mode
+      const lastSyncCfg = await prisma.configuracao.findUnique({ where: { chave: "pipedrive_last_sync" } });
+      const sinceTimestamp = (!input.forceFull && lastSyncCfg?.valor) ? lastSyncCfg.valor : undefined;
+      const syncStartedAt = new Date().toISOString().replace("T", " ").slice(0, 19);
+
+      const log: string[] = [];
+      log.push(sinceTimestamp
+        ? `🔄 Sync incremental desde ${sinceTimestamp} (Brasília)`
+        : `📥 Importação completa (primeira vez ou forçada)`);
+
+      // 0. Buscar definições de campos customizados dos deals (v1, para mapear key → nome legível)
       const dealFields = await fetchDealFields(token);
-      // Campos padrão do Pipedrive — ignorar ao salvar camposCustom
-      const CAMPOS_PADRAO = new Set([
-        "id","title","value","currency","status","stage_id","pipeline_id",
-        "person_id","org_id","update_time","add_time","close_time","won_time",
-        "lost_time","expected_close_date","lost_reason","visible_to","owner_id",
-        "cc_email","notes_count","activities_count","done_activities_count",
-        "undone_activities_count","email_messages_count","formatted_value",
-        "stage_change_time","active","deleted","weighted_value","rotten_time",
-        "stage_order_nr","person_name","org_name","next_activity_date",
-        "next_activity_time","next_activity_id","last_activity_id","last_activity_date",
-        "last_incoming_mail_time","last_outgoing_mail_time","label","renewal_type",
-        "person_phone","person_email","creator_user_id","user_id","followers_count",
-        "participants_count","products_count","contract_duration",
-      ]);
-      // Mapa key → {name, options}
+      log.push(`ℹ ${getRateLimitStatus()}`);
+      // Mapa key → {name, field_type}
       const fieldDefs = new Map(dealFields.map(f => [f.key, f]));
 
       // 1. Pipelines
@@ -159,55 +168,98 @@ export const pipedriveRouter = router({
       }
 
       // 3. Persons → CrmContato
-      const pdPersons = await fetchPersons(token);
+      const pdPersons = await fetchPersons(token, sinceTimestamp);
       const contatoMap = new Map<number, string>(); // pdId → localId
       let contatosCriados = 0;
       let contatosAtualizados = 0;
 
-      for (const pp of pdPersons) {
-        if (!pp.active_flag) continue;
-        // Prioridade: WhatsApp > mobile > primary > primeiro
-        const whatsapp = (
-          pp.phone.find(p => p.label?.toLowerCase().includes("whatsapp"))?.value ??
-          pp.phone.find(p => p.label?.toLowerCase().includes("mobile") || p.label?.toLowerCase().includes("celular"))?.value ??
-          pp.phone.find(p => p.primary)?.value ??
-          pp.phone[0]?.value
-        ) || undefined;
-        const email = pp.email.find(p => p.primary)?.value ?? pp.email[0]?.value ?? undefined;
+      // Bulk-load all existing contacts that came from Pipedrive
+      const existingContatoRows = await prisma.crmContato.findMany({
+        where: { pipedriveId: { not: null } },
+        select: { id: true, pipedriveId: true, whatsapp: true },
+      });
+      const existingContatoByPdId = new Map(existingContatoRows.map(r => [r.pipedriveId!, r]));
 
-        // Telefone fixo/comercial separado do WhatsApp
-        const telefone = pp.phone.find(p =>
+      // Prepare rows for new contacts
+      type ContatoRow = { nome: string; whatsapp?: string; email?: string; telefone?: string; empresa?: string; pipedriveId: number };
+      const newContatoRows: ContatoRow[] = [];
+      const overwriteContatoUpdates: Array<{ id: string; data: Omit<ContatoRow, "pipedriveId"> }> = [];
+
+      for (const pp of pdPersons) {
+        if (pp.is_deleted) continue;
+        const phones = pp.phone ?? [];
+        const emails = pp.email ?? [];
+        const whatsapp = (
+          phones.find((p: any) => p.label?.toLowerCase().includes("whatsapp"))?.value ??
+          phones.find((p: any) => p.label?.toLowerCase().includes("mobile") || p.label?.toLowerCase().includes("celular"))?.value ??
+          phones.find((p: any) => p.primary)?.value ??
+          phones[0]?.value
+        ) || undefined;
+        const email = emails.find((p: any) => p.primary)?.value ?? emails[0]?.value ?? undefined;
+        const telefone = phones.find((p: any) =>
           !p.label?.toLowerCase().includes("whatsapp") && p.value && p.value !== whatsapp
         )?.value || undefined;
         const empresa = pp.org_name || undefined;
 
-        const existing = await prisma.crmContato.findUnique({ where: { pipedriveId: pp.id } });
+        const existing = existingContatoByPdId.get(pp.id);
         if (existing) {
           contatoMap.set(pp.id, existing.id);
           if (input.overwrite) {
-            await (prisma.crmContato as any).update({
-              where: { id: existing.id },
-              data: { nome: pp.name, whatsapp, email, telefone, empresa },
-            });
-            contatosAtualizados++;
+            overwriteContatoUpdates.push({ id: existing.id, data: { nome: pp.name, whatsapp, email, telefone, empresa } });
           }
         } else {
-          const created = await (prisma.crmContato as any).create({
-            data: { nome: pp.name, whatsapp, email, telefone, empresa, pipedriveId: pp.id },
-          });
-          contatoMap.set(pp.id, created.id);
-          contatosCriados++;
+          newContatoRows.push({ nome: pp.name, whatsapp, email, telefone, empresa, pipedriveId: pp.id });
         }
       }
+
+      // Bulk create new contacts
+      if (newContatoRows.length > 0) {
+        await (prisma.crmContato as any).createMany({ data: newContatoRows, skipDuplicates: true });
+        contatosCriados = newContatoRows.length;
+        // Re-fetch to get local IDs
+        const created = await prisma.crmContato.findMany({
+          where: { pipedriveId: { in: newContatoRows.map(r => r.pipedriveId) } },
+          select: { id: true, pipedriveId: true },
+        });
+        for (const c of created) contatoMap.set(c.pipedriveId!, c.id);
+      }
+
+      // Bulk overwrite updates (batches of 50 parallel)
+      if (overwriteContatoUpdates.length > 0) {
+        const BATCH = 50;
+        for (let i = 0; i < overwriteContatoUpdates.length; i += BATCH) {
+          await Promise.all(overwriteContatoUpdates.slice(i, i + BATCH).map(u =>
+            (prisma.crmContato as any).update({ where: { id: u.id }, data: u.data })
+          ));
+        }
+        contatosAtualizados = overwriteContatoUpdates.length;
+      }
+
       log.push(`Contatos: ${contatosCriados} criados, ${contatosAtualizados} atualizados`);
 
       // 4. Deals → CrmDeal
-      const pdDeals = await fetchDeals(token);
+      const pdDeals = await fetchDeals(token, "all_not_deleted", sinceTimestamp);
       let dealsCriados = 0;
       let dealsAtualizados = 0;
 
       // Mapa pdDealId → localDealId (para linkar notas/atividades)
       const dealMap = new Map<number, string>();
+
+      // Bulk-load existing deals
+      const existingDealRows = await prisma.crmDeal.findMany({
+        where: { pipedriveId: { not: null } },
+        select: { id: true, pipedriveId: true },
+      });
+      const existingDealByPdId = new Map(existingDealRows.map(r => [r.pipedriveId!, r.id]));
+
+      type DealRow = Record<string, any>;
+      const newDealRows: DealRow[] = [];
+      // pdId → stageLocalId for stagelog creation after bulk insert
+      const newDealStageMap = new Map<number, string>();
+      // pdId → { contatoId, dealPhone } for whatsapp fill
+      const dealContactPhone = new Map<number, { contatoId: string; phone: string }>();
+      const overwriteDealUpdates: Array<{ id: string; data: DealRow; contatoId?: string; phone?: string }> = [];
+      let ignorados = 0;
 
       for (const pd of pdDeals) {
         if (pd.status === "deleted") continue;
@@ -215,168 +267,227 @@ export const pipedriveRouter = router({
 
         const pipelineLocalId = pipelineMap.get(pd.pipeline_id);
         const stageLocalId = stageMap.get(pd.stage_id);
-        if (!pipelineLocalId || !stageLocalId) continue;
+        if (!pipelineLocalId || !stageLocalId) {
+          ignorados++;
+          continue;
+        }
 
         const status = pd.status === "won" ? "ganho" : pd.status === "lost" ? "perdido" : "aberto";
-        const contatoId = pd.person_id ? contatoMap.get(pd.person_id.value) : undefined;
+        // v2: person_id is a plain integer (v1 was { value: number })
+        const contatoId = pd.person_id ? contatoMap.get(pd.person_id as number) : undefined;
 
-        // Extrair campos customizados (não-padrão com valor preenchido)
+        // v2: custom_fields is isolated; include_option_labels=true resolves labels in response
         const camposCustom: Record<string, string> = {};
-        for (const [key, val] of Object.entries(pd)) {
-          if (CAMPOS_PADRAO.has(key) || val === null || val === undefined || val === "") continue;
-          if (typeof val === "object" || Array.isArray(val)) continue;
+        for (const [key, val] of Object.entries(pd.custom_fields ?? {})) {
+          if (val === null || val === undefined || val === "") continue;
           const def = fieldDefs.get(key);
           if (!def || def.field_type === "org" || def.field_type === "people") continue;
-          // Resolver enum options
-          let displayVal = String(val);
-          if (def.options) {
-            const opt = def.options.find(o => String(o.id) === String(val));
-            if (opt) displayVal = opt.label;
+          let displayVal: string;
+          if (Array.isArray(val)) {
+            displayVal = val.map((v: any) => (typeof v === "object" ? (v.label ?? String(v.value ?? v)) : String(v))).join(", ");
+          } else if (typeof val === "object" && val !== null) {
+            displayVal = val.label ?? val.formatted ?? String(val.value ?? JSON.stringify(val));
+          } else {
+            displayVal = String(val);
           }
           camposCustom[def.name] = displayVal;
         }
 
-        // Telefone do deal (person_phone vem junto no deal)
-        const dealPhone = pd.person_phone?.find((p: any) => p.primary)?.value
-          ?? pd.person_phone?.[0]?.value ?? null;
+        // v2: person_phone not included in deal response; phones come from person import
+        const dealPhone: string | null = null;
 
         const dealExtra = {
-          organizacao:             pd.org_id?.name ?? null,
-          motivoPerda:             pd.lost_reason ?? null,
-          dataFechamentoEsperada:  pd.expected_close_date ? new Date(pd.expected_close_date) : null,
-          rotulo:                  pd.label ? String(pd.label) : null,
-          probabilidade:           pd.probability ? Number(pd.probability) : null,
-          moeda:                   pd.currency ?? null,
+          organizacao:           pd.org_name ?? null,  // v2: org_name is a root string field
+          motivoPerda:           pd.lost_reason ?? null,
+          dataFechamentoEsperada: pd.expected_close_date ? new Date(pd.expected_close_date) : null,
+          rotulo:                pd.label_ids?.[0] != null ? String(pd.label_ids[0]) : null,
+          probabilidade:         pd.probability ? Number(pd.probability) : null,
+          moeda:                 pd.currency ?? null,
           ...(Object.keys(camposCustom).length ? { camposCustom } : {}),
         };
 
-        const existing = await prisma.crmDeal.findUnique({ where: { pipedriveId: pd.id } });
-        if (existing) {
-          dealMap.set(pd.id, existing.id);
+        const existingId = existingDealByPdId.get(pd.id);
+        if (existingId) {
+          dealMap.set(pd.id, existingId);
           dealsAtualizados++;
           if (input.overwrite) {
-            await prisma.crmDeal.update({
-              where: { id: existing.id },
-              data: {
-                titulo: pd.title,
-                valor: pd.value || undefined,
-                status,
-                stageId: stageLocalId,
-                contatoId,
-                ...dealExtra,
-              },
+            overwriteDealUpdates.push({
+              id: existingId,
+              data: { titulo: pd.title, valor: pd.value || undefined, status, stageId: stageLocalId, contatoId, ...dealExtra },
+              contatoId: contatoId ?? undefined,
+              phone: dealPhone ?? undefined,
             });
-            // Atualizar whatsapp do contato com telefone do deal se não tiver
-            if (contatoId && dealPhone) {
-              const c = await prisma.crmContato.findUnique({ where: { id: contatoId } });
-              if (c && !c.whatsapp) {
-                await prisma.crmContato.update({ where: { id: contatoId }, data: { whatsapp: dealPhone } });
+          }
+        } else {
+          newDealRows.push({
+            titulo: pd.title,
+            pipelineId: pipelineLocalId,
+            stageId: stageLocalId,
+            contatoId: contatoId ?? null,
+            valor: pd.value || undefined,
+            status,
+            pipedriveId: pd.id,
+            fonteLead: "Pipedrive",
+            ...dealExtra,
+          });
+          newDealStageMap.set(pd.id, stageLocalId);
+          if (contatoId && dealPhone) dealContactPhone.set(pd.id, { contatoId, phone: dealPhone });
+        }
+      }
+
+      if (ignorados > 0) log.push(`⚠ ${ignorados} deals ignorados (pipeline/stage não mapeado)`);
+
+      // Bulk create new deals
+      if (newDealRows.length > 0) {
+        await prisma.crmDeal.createMany({ data: newDealRows as any, skipDuplicates: true });
+        dealsCriados = newDealRows.length;
+
+        // Re-fetch to get local IDs for stageLog + whatsapp fill
+        const newPdIds = newDealRows.map(r => r.pipedriveId as number);
+        const createdDeals = await prisma.crmDeal.findMany({
+          where: { pipedriveId: { in: newPdIds } },
+          select: { id: true, pipedriveId: true },
+        });
+        const stageLogs: Array<{ dealId: string; stageNovoId: string }> = [];
+        for (const d of createdDeals) {
+          dealMap.set(d.pipedriveId!, d.id);
+          const stageId = newDealStageMap.get(d.pipedriveId!);
+          if (stageId) stageLogs.push({ dealId: d.id, stageNovoId: stageId });
+        }
+        if (stageLogs.length > 0) {
+          await prisma.crmDealStageLog.createMany({ data: stageLogs, skipDuplicates: true });
+        }
+
+        // Fill whatsapp on contacts that don't have it yet
+        const contatosParaWhatsapp = [...dealContactPhone.entries()]
+          .map(([pdId, { contatoId, phone }]) => {
+            const localDeal = dealMap.get(pdId);
+            return localDeal ? { contatoId, phone } : null;
+          })
+          .filter((x): x is { contatoId: string; phone: string } => x !== null);
+
+        if (contatosParaWhatsapp.length > 0) {
+          const contatoIds = [...new Set(contatosParaWhatsapp.map(x => x.contatoId))];
+          const semWhatsapp = await prisma.crmContato.findMany({
+            where: { id: { in: contatoIds }, whatsapp: null },
+            select: { id: true },
+          });
+          const semWhatsappSet = new Set(semWhatsapp.map(c => c.id));
+          const BATCH = 50;
+          const updates = contatosParaWhatsapp.filter(x => semWhatsappSet.has(x.contatoId));
+          for (let i = 0; i < updates.length; i += BATCH) {
+            await Promise.all(updates.slice(i, i + BATCH).map(u =>
+              prisma.crmContato.update({ where: { id: u.contatoId }, data: { whatsapp: u.phone } })
+            ));
+          }
+        }
+      }
+
+      // Overwrite updates (batches of 50 parallel)
+      if (overwriteDealUpdates.length > 0) {
+        const BATCH = 50;
+        for (let i = 0; i < overwriteDealUpdates.length; i += BATCH) {
+          await Promise.all(overwriteDealUpdates.slice(i, i + BATCH).map(u =>
+            prisma.crmDeal.update({ where: { id: u.id }, data: u.data as any })
+          ));
+        }
+      }
+
+      log.push(`Deals: ${dealsCriados} criados, ${dealsAtualizados} já existiam`);
+
+      // 4.5. Histórico de etapas (deal flow) → CrmDealStageLog (opcional)
+      let stageHistoriaCriados = 0;
+      if (input.importarHistoricoEtapas && dealMap.size > 0) {
+        log.push(`Buscando histórico de etapas para ${dealMap.size} deals...`);
+
+        // Busca em paralelo com concorrência máxima de 5 para respeitar rate limit
+        const entries = [...dealMap.entries()];
+        const CONCURRENCY = 5;
+        for (let i = 0; i < entries.length; i += CONCURRENCY) {
+          const batch = entries.slice(i, i + CONCURRENCY);
+          const flows = await Promise.all(
+            batch.map(([pdDealId, localDealId]) =>
+              fetchDealFlow(token, pdDealId)
+                .then(flow => ({ localDealId, flow }))
+                .catch(() => ({ localDealId, flow: [] }))
+            )
+          );
+
+          for (const { localDealId, flow } of flows) {
+            for (const item of flow) {
+              if (item.object !== "dealChange") continue;
+              if (item.data.field_key !== "stage_id") continue;
+              if (!item.data.new_value) continue;
+
+              const pdStageNovoId = parseInt(item.data.new_value, 10);
+              const localStageNovoId = stageMap.get(pdStageNovoId);
+              if (!localStageNovoId) continue;
+
+              const localStageAnteriorId = item.data.old_value
+                ? stageMap.get(parseInt(item.data.old_value, 10))
+                : undefined;
+
+              const ts = new Date(item.data.log_time ?? item.timestamp);
+
+              const exists = await prisma.crmDealStageLog.findFirst({
+                where: { dealId: localDealId, stageNovoId: localStageNovoId, criadoEm: ts },
+              });
+              if (!exists) {
+                await prisma.crmDealStageLog.create({
+                  data: {
+                    dealId: localDealId,
+                    stageNovoId: localStageNovoId,
+                    stageAnteriorId: localStageAnteriorId ?? null,
+                    criadoEm: ts,
+                  },
+                });
+                stageHistoriaCriados++;
               }
             }
           }
-        } else {
-          const deal = await prisma.crmDeal.create({
-            data: {
-              titulo: pd.title,
-              pipelineId: pipelineLocalId,
-              stageId: stageLocalId,
-              contatoId,
-              valor: pd.value || undefined,
-              status,
-              pipedriveId: pd.id,
-              fonteLead: "Pipedrive",
-              ...dealExtra,
-            },
-          });
-          dealMap.set(pd.id, deal.id);
-          await prisma.crmDealStageLog.create({
-            data: { dealId: deal.id, stageNovoId: stageLocalId },
-          });
-          // Salvar telefone do deal no contato se não tiver
-          if (contatoId && dealPhone) {
-            const c = await prisma.crmContato.findUnique({ where: { id: contatoId } });
-            if (c && !c.whatsapp) {
-              await prisma.crmContato.update({ where: { id: contatoId }, data: { whatsapp: dealPhone } });
-            }
-          }
-          dealsCriados++;
         }
+        log.push(`Histórico de etapas: ${stageHistoriaCriados} movimentações importadas`);
+      } else if (!input.importarHistoricoEtapas) {
+        log.push(`Histórico de etapas: ignorado (opção desativada)`);
       }
-      log.push(`Deals: ${dealsCriados} criados, ${dealsAtualizados} já existiam`);
 
-      // 4.5. Histórico de etapas (deal flow) → CrmDealStageLog
-      let stageHistoriaCriados = 0;
-      for (const [pdDealId, localDealId] of dealMap) {
-        try {
-          const flow = await fetchDealFlow(token, pdDealId);
-          for (const item of flow) {
-            if (item.object !== "dealChange") continue;
-            if (item.data.field_key !== "stage_id") continue;
-            if (!item.data.new_value) continue;
-
-            const pdStageNovoId = parseInt(item.data.new_value, 10);
-            const localStageNovoId = stageMap.get(pdStageNovoId);
-            if (!localStageNovoId) continue;
-
-            const localStageAnteriorId = item.data.old_value
-              ? stageMap.get(parseInt(item.data.old_value, 10))
-              : undefined;
-
-            const ts = new Date(item.data.log_time ?? item.timestamp);
-
-            // Deduplicar por dealId + stageNovoId + criadoEm
-            const exists = await prisma.crmDealStageLog.findFirst({
-              where: { dealId: localDealId, stageNovoId: localStageNovoId, criadoEm: ts },
-            });
-            if (!exists) {
-              await prisma.crmDealStageLog.create({
-                data: {
-                  dealId: localDealId,
-                  stageNovoId: localStageNovoId,
-                  stageAnteriorId: localStageAnteriorId ?? null,
-                  criadoEm: ts,
-                },
-              });
-              stageHistoriaCriados++;
-            }
-          }
-        } catch {
-          // ignora erros individuais de flow
-        }
-      }
-      log.push(`Histórico de etapas: ${stageHistoriaCriados} movimentações importadas`);
-
-      // 5. Notas → CrmNota
+      // 5. Notas + Atividades → CrmNota (bulk)
       let notasCriadas = 0;
+      let atividadesCriadas = 0;
       try {
-        const pdNotes = await fetchNotes(token);
+        const localDealIds = [...new Set(dealMap.values())];
+
+        // Fetch notes + activities from Pipedrive in parallel
+        const [pdNotes, atPendentes, atFeitas] = await Promise.all([
+          fetchNotes(token, sinceTimestamp),
+          fetchActivities(token, sinceTimestamp),
+          fetchActivitiesDone(token, sinceTimestamp),
+        ]);
+
+        // Load existing notes for all relevant deals in one query
+        const existingNotas = localDealIds.length > 0
+          ? await (prisma as any).crmNota.findMany({
+              where: { dealId: { in: localDealIds } },
+              select: { dealId: true, conteudo: true },
+            })
+          : [];
+        const existingNotaKeys = new Set<string>(
+          existingNotas.map((n: any) => `${n.dealId}|||${n.conteudo}`)
+        );
+
+        const notasParaCriar: Array<{ dealId: string; conteudo: string }> = [];
+
         for (const note of pdNotes) {
           if (!note.deal_id || !note.content?.trim()) continue;
           const dealLocalId = dealMap.get(note.deal_id);
           if (!dealLocalId) continue;
-          // Evitar duplicar
-          const exists = await (prisma as any).crmNota.findFirst({
-            where: { dealId: dealLocalId, conteudo: note.content },
-          });
-          if (!exists) {
-            await (prisma as any).crmNota.create({
-              data: { dealId: dealLocalId, conteudo: note.content },
-            });
-            notasCriadas++;
+          const key = `${dealLocalId}|||${note.content}`;
+          if (!existingNotaKeys.has(key)) {
+            notasParaCriar.push({ dealId: dealLocalId, conteudo: note.content });
+            existingNotaKeys.add(key); // prevent duplicates within same batch
           }
         }
-        log.push(`Notas: ${notasCriadas} importadas`);
-      } catch (e: any) {
-        log.push(`Notas: erro — ${e.message}`);
-      }
 
-      // 6. Atividades → CrmNota (como registro de atividade)
-      let atividadesCriadas = 0;
-      try {
-        const [atPendentes, atFeitas] = await Promise.all([
-          fetchActivities(token),
-          fetchActivitiesDone(token),
-        ]);
         for (const at of [...atPendentes, ...atFeitas]) {
           if (!at.deal_id) continue;
           const dealLocalId = dealMap.get(at.deal_id);
@@ -387,20 +498,33 @@ export const pipedriveRouter = router({
             at.due_date ? `Data: ${at.due_date}${at.due_time ? " " + at.due_time : ""}` : null,
             `Status: ${at.done ? "Concluída" : "Pendente"}`,
           ].filter(Boolean).join("\n");
-          const exists = await (prisma as any).crmNota.findFirst({
-            where: { dealId: dealLocalId, conteudo },
-          });
-          if (!exists) {
-            await (prisma as any).crmNota.create({
-              data: { dealId: dealLocalId, conteudo },
-            });
+          const key = `${dealLocalId}|||${conteudo}`;
+          if (!existingNotaKeys.has(key)) {
+            notasParaCriar.push({ dealId: dealLocalId, conteudo });
+            existingNotaKeys.add(key);
             atividadesCriadas++;
           }
         }
+
+        notasCriadas = notasParaCriar.length - atividadesCriadas;
+
+        if (notasParaCriar.length > 0) {
+          await (prisma as any).crmNota.createMany({ data: notasParaCriar, skipDuplicates: true });
+        }
+
+        log.push(`Notas: ${notasCriadas} importadas`);
         log.push(`Atividades: ${atividadesCriadas} importadas`);
       } catch (e: any) {
-        log.push(`Atividades: erro — ${e.message}`);
+        log.push(`Notas/Atividades: erro — ${e.message}`);
       }
+
+      // Save last sync timestamp (UTC → stored in Brasilia format for display)
+      await prisma.configuracao.upsert({
+        where: { chave: "pipedrive_last_sync" },
+        update: { valor: syncStartedAt },
+        create: { chave: "pipedrive_last_sync", valor: syncStartedAt },
+      });
+      log.push(`✅ Sync salvo: próxima execução será incremental desde ${syncStartedAt}`);
 
       return { ok: true, log };
     }),

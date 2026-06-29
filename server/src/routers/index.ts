@@ -13,11 +13,17 @@ import { pipedriveRouter }              from "./pipedrive.js";
 import { reengajamentoRouter }          from "./reengajamento.js";
 import { financeiroRouter }             from "./financeiro.js";
 import { bankingRouter }               from "../modules/banking/banking.router.js";
+import { marketingAutopilotRouter }    from "./marketingAutopilot.js";
+import { ligacoesRouter }              from "./ligacoes.js";
+import { reunioesRouter }              from "./reunioes.js";
+import { agendaRouter }               from "./agenda.js";
+import { tenantRouter }               from "./tenants.js";
 
 export type { Context } from "./trpc.js";
 
 export const appRouter = router({
   auth:              authRouter,
+  tenant:            tenantRouter,
   empresa:           empresaRouter,
   tomador:           tomadorRouter,
   contrato:          contratoRouter,
@@ -31,6 +37,10 @@ export const appRouter = router({
   reengajamento:     reengajamentoRouter,
   financeiro:        financeiroRouter,
   banking:           bankingRouter,
+  mkt:               marketingAutopilotRouter,
+  ligacoes:          ligacoesRouter,
+  reunioes:          reunioesRouter,
+  agenda:            agendaRouter,
 });
 
 export type AppRouter = typeof appRouter;

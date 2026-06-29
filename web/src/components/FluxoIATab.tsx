@@ -1,15 +1,20 @@
 import { useState, useMemo } from "react";
 import { trpc } from "../lib/trpc";
+import { DndContext, closestCenter, PointerSensor, KeyboardSensor, useSensor, useSensors } from "@dnd-kit/core";
+import type { DragEndEvent } from "@dnd-kit/core";
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy, horizontalListSortingStrategy } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 
 // ─── FASE CONFIG ──────────────────────────────────────────────────────────────
-const FASE_ORDER = ["pre_vinculos", "vinculos_loop", "advogado", "pos_vinculos", "pos_vinculos_curto", "marketing"];
+const FASE_ORDER = ["pre_vinculos", "vinculos_loop", "advogado", "secretaria", "pos_vinculos", "pos_vinculos_curto", "marketing"];
 
 const FASE_META: Record<string, { label: string; desc: string; color: string; border: string; bg: string; badge: string }> = {
   pre_vinculos:       { label: "Pré-Vínculos",        desc: "triagem inicial",               color: "text-indigo-600",  border: "border-indigo-400",  bg: "bg-indigo-50",  badge: "bg-indigo-100 text-indigo-700" },
   vinculos_loop:      { label: "Coleta de Vínculos",   desc: "loop de empregos",              color: "text-purple-600",  border: "border-purple-400",  bg: "bg-purple-50",  badge: "bg-purple-100 text-purple-700" },
   advogado:           { label: "Fluxo Daniela",        desc: "qualificação e fechamento",     color: "text-pink-600",    border: "border-pink-400",    bg: "bg-pink-50",    badge: "bg-pink-100 text-pink-700" },
-  pos_vinculos:       { label: "Pós-Vínculos Longo",   desc: "tempo de serviço > 18m",        color: "text-emerald-600", border: "border-emerald-400", bg: "bg-emerald-50", badge: "bg-emerald-100 text-emerald-700" },
-  pos_vinculos_curto: { label: "Pós-Vínculos Curto",   desc: "tempo de serviço ≤ 18m",        color: "text-teal-600",    border: "border-teal-400",    bg: "bg-teal-50",    badge: "bg-teal-100 text-teal-700" },
+  secretaria:         { label: "Secretária",           desc: "agendamento de reunião",        color: "text-sky-600",     border: "border-sky-400",     bg: "bg-sky-50",     badge: "bg-sky-100 text-sky-700" },
+  pos_vinculos:       { label: "Pós-Vínculos Longo",   desc: "tempo de serviço > 2 anos",     color: "text-emerald-600", border: "border-emerald-400", bg: "bg-emerald-50", badge: "bg-emerald-100 text-emerald-700" },
+  pos_vinculos_curto: { label: "Pós-Vínculos Curto",   desc: "tempo de serviço ≤ 2 anos",     color: "text-teal-600",    border: "border-teal-400",    bg: "bg-teal-50",    badge: "bg-teal-100 text-teal-700" },
   marketing:          { label: "Marketing",            desc: "origem do lead — não bloqueia", color: "text-rose-600",    border: "border-rose-300",    bg: "bg-rose-50",    badge: "bg-rose-100 text-rose-600" },
 };
 
@@ -29,18 +34,19 @@ const STEP_TYPE_META: Record<string, { label: string; badge: string }> = {
 };
 
 const ACTION_META: Record<string, { label: string; badge: string }> = {
-  continue:   { label: "Continua",        badge: "bg-green-100 text-green-700" },
-  repeat:     { label: "Repete",          badge: "bg-amber-100 text-amber-700" },
-  end:        { label: "Encerra",         badge: "bg-red-100 text-red-600" },
-  goto_agent: { label: "Muda fase",       badge: "bg-purple-100 text-purple-700" },
-  goto_step:  { label: "Pula etapa",      badge: "bg-indigo-100 text-indigo-700" },
-  notify:     { label: "Notifica equipe", badge: "bg-blue-100 text-blue-700" },
-  wait:       { label: "Aguarda",         badge: "bg-gray-100 text-gray-600" },
-  discard:    { label: "Ignora e segue",  badge: "bg-gray-100 text-gray-600" },
+  continue:   { label: "Continua",              badge: "bg-green-100 text-green-700" },
+  repeat:     { label: "Repete",                badge: "bg-amber-100 text-amber-700" },
+  end:        { label: "Encerra",               badge: "bg-red-100 text-red-600" },
+  end_notify: { label: "Encerra + Notifica SDR", badge: "bg-orange-100 text-orange-700" },
+  goto_agent: { label: "Muda fase",             badge: "bg-purple-100 text-purple-700" },
+  goto_step:  { label: "Pula etapa",            badge: "bg-indigo-100 text-indigo-700" },
+  notify:     { label: "Notifica equipe",        badge: "bg-blue-100 text-blue-700" },
+  wait:       { label: "Aguarda",               badge: "bg-gray-100 text-gray-600" },
+  discard:    { label: "Ignora e segue",         badge: "bg-gray-100 text-gray-600" },
 };
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
-type Persona = { id: string; chave: string; nomeExibicao: string; cor?: string | null; ativo?: boolean };
+type Persona = { id: string; chave: string; nomeExibicao: string; cor?: string | null; ativo?: boolean; proximaPersonaChave?: string | null };
 type Gate    = { id: string; condicao: string; actionType: string; actionValue?: string | null; label?: string | null; cor?: string | null; ordem: number };
 type Step    = { id: string; personaChave: string; fase: string; chave: string; ordem: number; label: string; pergunta: string; stepType: string; campoColetar?: string | null; ativo: boolean; gates: Gate[] };
 type NewStep = { label: string; pergunta: string; stepType: string; campoColetar: string };
@@ -333,6 +339,96 @@ function FlowTab({ steps, projetoId, onMutated }: { steps: Step[]; projetoId: st
   );
 }
 
+// ─── SORTABLE STEP ROW ────────────────────────────────────────────────────────
+type SortableStepRowProps = {
+  orig: Step;
+  step: Step;
+  fase: string;
+  fm: ReturnType<typeof faseMeta>;
+  setDrafts: React.Dispatch<React.SetStateAction<Record<string, Partial<Step>>>>;
+  del: { mutate: (args: { id: string; projetoId: string }) => void; isPending: boolean };
+  projetoId: string;
+};
+
+function SortableStepRow({ orig, step, fase, fm, setDrafts, del, projetoId }: SortableStepRowProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: orig.id });
+  const tm = STEP_TYPE_META[step.stepType] ?? { label: step.stepType, badge: "bg-gray-100 text-gray-600" };
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.45 : 1,
+    zIndex: isDragging ? 10 : undefined,
+    position: isDragging ? "relative" : undefined,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} className="px-4 py-3">
+      <div className="flex gap-3 items-start">
+        {/* Drag handle + ordem badge */}
+        <div className="flex flex-col items-center gap-1 flex-shrink-0 pt-0.5">
+          <div
+            {...attributes}
+            {...listeners}
+            className="w-6 h-6 flex items-center justify-center cursor-grab active:cursor-grabbing text-gray-300 hover:text-gray-500 select-none rounded hover:bg-gray-100 transition-colors"
+            title="Arrastar para reordenar"
+          >
+            <svg width="10" height="14" viewBox="0 0 10 14" fill="currentColor">
+              <circle cx="3" cy="2" r="1.2"/><circle cx="7" cy="2" r="1.2"/>
+              <circle cx="3" cy="7" r="1.2"/><circle cx="7" cy="7" r="1.2"/>
+              <circle cx="3" cy="12" r="1.2"/><circle cx="7" cy="12" r="1.2"/>
+            </svg>
+          </div>
+          <div className={`w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold ${fm.badge}`}>
+            {step.ordem}
+          </div>
+        </div>
+
+        {/* Fields */}
+        <div className="flex-1 min-w-0 space-y-2">
+          <div className="flex gap-2 items-center">
+            <input
+              value={step.label}
+              onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], label: e.target.value } }))}
+              className="flex-1 border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-300"
+            />
+            <select
+              value={step.stepType}
+              onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], stepType: e.target.value } }))}
+              className={`border rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-300 ${tm.badge}`}
+            >
+              {Object.entries(STEP_TYPE_META).map(([v, m]) => <option key={v} value={v}>{m.label}</option>)}
+            </select>
+            {step.stepType === "saudacao" && (
+              <span className="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded px-1.5 py-0.5">1ª msg</span>
+            )}
+          </div>
+          <textarea
+            value={step.pergunta}
+            onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], pergunta: e.target.value } }))}
+            rows={2}
+            placeholder="Texto da pergunta / mensagem"
+            className="w-full border rounded-lg px-3 py-2 text-sm text-gray-600 focus:outline-none focus:ring-1 focus:ring-indigo-300 resize-y"
+          />
+          <input
+            value={step.campoColetar ?? ""}
+            onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], campoColetar: e.target.value || null } }))}
+            placeholder="campoColetar (ex: nome, cidade) — vazio se não coletar dado"
+            className="w-full border rounded-lg px-3 py-1.5 text-xs text-gray-500 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-300"
+          />
+        </div>
+
+        {/* Delete */}
+        <button
+          onClick={() => { if (confirm(`Excluir etapa "${orig.label}"?`)) del.mutate({ id: orig.id, projetoId }); }}
+          className="text-red-400 hover:text-red-600 text-lg leading-none flex-shrink-0 mt-1"
+          title="Excluir etapa"
+        >×</button>
+      </div>
+    </div>
+  );
+}
+
 // ─── CONFIG TAB ───────────────────────────────────────────────────────────────
 function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
   steps: Step[]; projetoId: string; personaChave: string; onMutated: () => void;
@@ -346,9 +442,14 @@ function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
   const [newDraft, setNewDraft] = useState<NewStep>(blankNew());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
-  const upsert   = trpc.ia.upsertFlowStep.useMutation({ onSuccess: () => { onMutated(); setSaving(false); setSaved(true); setTimeout(() => setSaved(false), 2500); setDrafts({}); } });
-  const del      = trpc.ia.deleteFlowStep.useMutation({ onSuccess: onMutated });
-  const reorder  = trpc.ia.reorderFlowSteps.useMutation({ onSuccess: onMutated });
+  const upsert  = trpc.ia.upsertFlowStep.useMutation({ onSuccess: () => { onMutated(); setSaving(false); setSaved(true); setTimeout(() => setSaved(false), 2500); setDrafts({}); } });
+  const del     = trpc.ia.deleteFlowStep.useMutation({ onSuccess: onMutated });
+  const reorder = trpc.ia.reorderFlowSteps.useMutation({ onSuccess: onMutated });
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   function getStep(s: Step): Step { const d = drafts[s.id]; return d ? { ...s, ...d } : s; }
 
@@ -361,12 +462,15 @@ function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
     }
   }
 
-  function move(fase: string, id: string, dir: -1 | 1) {
+  function handleDragEnd(fase: string, event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
     const arr = groups.find(g => g.fase === fase)?.steps ?? [];
-    const i   = arr.findIndex(s => s.id === id);
-    const j   = i + dir;
-    if (i < 0 || j < 0 || j >= arr.length) return;
-    reorder.mutate({ projetoId, items: [{ id: arr[i].id, ordem: arr[j].ordem }, { id: arr[j].id, ordem: arr[i].ordem }] });
+    const oldIdx = arr.findIndex(s => s.id === active.id);
+    const newIdx = arr.findIndex(s => s.id === over.id);
+    if (oldIdx < 0 || newIdx < 0) return;
+    const reordered = arrayMove(arr, oldIdx, newIdx);
+    reorder.mutate({ projetoId, items: reordered.map((s, i) => ({ id: s.id, ordem: i + 1 })) });
   }
 
   function addStep(fase: string) {
@@ -402,76 +506,26 @@ function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
 
             {!isCollapsed && (
               <div className="divide-y divide-gray-100">
-                {faseSteps.map((orig, i) => {
-                  const step    = getStep(orig);
-                  const tm      = STEP_TYPE_META[step.stepType] ?? { label: step.stepType, badge: "bg-gray-100 text-gray-600" };
-                  const isFirst = i === 0;
-                  const isLast  = i === faseSteps.length - 1;
-
-                  return (
-                    <div key={orig.id} className="px-4 py-3">
-                      <div className="flex gap-3 items-start">
-                        {/* Order + arrows */}
-                        <div className="flex flex-col items-center gap-1 flex-shrink-0 pt-0.5">
-                          <button
-                            onClick={() => move(fase, orig.id, -1)}
-                            disabled={isFirst || reorder.isPending}
-                            className={`w-6 h-5 rounded text-xs border flex items-center justify-center transition-colors ${isFirst ? "border-gray-200 text-gray-300 cursor-default" : `border-gray-300 text-gray-500 hover:${fm.color} hover:border-current`}`}
-                          >▲</button>
-                          <div className={`w-6 h-6 rounded-md flex items-center justify-center text-xs font-bold ${fm.badge}`}>
-                            {step.ordem}
-                          </div>
-                          <button
-                            onClick={() => move(fase, orig.id, 1)}
-                            disabled={isLast || reorder.isPending}
-                            className={`w-6 h-5 rounded text-xs border flex items-center justify-center transition-colors ${isLast ? "border-gray-200 text-gray-300 cursor-default" : `border-gray-300 text-gray-500 hover:${fm.color} hover:border-current`}`}
-                          >▼</button>
-                        </div>
-
-                        {/* Fields */}
-                        <div className="flex-1 min-w-0 space-y-2">
-                          <div className="flex gap-2 items-center">
-                            <input
-                              value={step.label}
-                              onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], label: e.target.value } }))}
-                              className="flex-1 border rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-indigo-300"
-                            />
-                            <select
-                              value={step.stepType}
-                              onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], stepType: e.target.value } }))}
-                              className={`border rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-300 ${tm.badge}`}
-                            >
-                              {Object.entries(STEP_TYPE_META).map(([v, m]) => <option key={v} value={v}>{m.label}</option>)}
-                            </select>
-                            {step.stepType === "saudacao" && (
-                              <span className="text-xs text-orange-600 bg-orange-50 border border-orange-200 rounded px-1.5 py-0.5">1ª msg</span>
-                            )}
-                          </div>
-                          <textarea
-                            value={step.pergunta}
-                            onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], pergunta: e.target.value } }))}
-                            rows={2}
-                            placeholder="Texto da pergunta / mensagem"
-                            className="w-full border rounded-lg px-3 py-2 text-sm text-gray-600 focus:outline-none focus:ring-1 focus:ring-indigo-300 resize-y"
-                          />
-                          <input
-                            value={step.campoColetar ?? ""}
-                            onChange={e => setDrafts(p => ({ ...p, [orig.id]: { ...p[orig.id], campoColetar: e.target.value || null } }))}
-                            placeholder="campoColetar (ex: nome, cidade) — vazio se não coletar dado"
-                            className="w-full border rounded-lg px-3 py-1.5 text-xs text-gray-500 font-mono focus:outline-none focus:ring-1 focus:ring-indigo-300"
-                          />
-                        </div>
-
-                        {/* Delete */}
-                        <button
-                          onClick={() => { if (confirm(`Excluir etapa "${orig.label}"?`)) del.mutate({ id: orig.id, projetoId }); }}
-                          className="text-red-400 hover:text-red-600 text-lg leading-none flex-shrink-0 mt-1"
-                          title="Excluir etapa"
-                        >×</button>
-                      </div>
-                    </div>
-                  );
-                })}
+                <DndContext
+                  sensors={sensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={e => handleDragEnd(fase, e)}
+                >
+                  <SortableContext items={faseSteps.map(s => s.id)} strategy={verticalListSortingStrategy}>
+                    {faseSteps.map(orig => (
+                      <SortableStepRow
+                        key={orig.id}
+                        orig={orig}
+                        step={getStep(orig)}
+                        fase={fase}
+                        fm={fm}
+                        setDrafts={setDrafts}
+                        del={del}
+                        projetoId={projetoId}
+                      />
+                    ))}
+                  </SortableContext>
+                </DndContext>
 
                 {/* Add step */}
                 {addingIn === fase ? (
@@ -539,7 +593,45 @@ function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
         >
           {saved ? "✓ Alterações salvas" : saving ? "Salvando…" : hasDrafts ? `Salvar alterações (${Object.keys(drafts).length})` : "Sem alterações pendentes"}
         </button>
-        <p className="text-xs text-gray-400 text-center mt-1.5">↑↓ reordena · × exclui · + adiciona etapa ao final do fluxo</p>
+        <p className="text-xs text-gray-400 text-center mt-1.5">⠿ arraste para reordenar · × exclui · + adiciona etapa ao final do fluxo</p>
+      </div>
+    </div>
+  );
+}
+
+// ─── SORTABLE PERSONA CARD ────────────────────────────────────────────────────
+function SortablePersonaCard({ p, active, nextP, onSelect }: {
+  p: Persona; active: boolean; nextP: Persona | null; onSelect: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: p.id });
+  const style: React.CSSProperties = { transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.4 : 1, zIndex: isDragging ? 10 : undefined };
+
+  return (
+    <div ref={setNodeRef} style={style} className="flex-1 min-w-0">
+      <div className={`rounded-xl border text-sm font-medium transition-all ${active ? "border-indigo-300 bg-indigo-50 text-indigo-700 shadow-sm" : "border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-gray-50"}`}>
+        {/* Drag handle strip */}
+        <div
+          {...attributes}
+          {...listeners}
+          className="flex justify-center pt-1.5 pb-0.5 cursor-grab active:cursor-grabbing"
+          title="Arrastar para reordenar"
+        >
+          <svg width="12" height="8" viewBox="0 0 12 8" fill="currentColor" className={active ? "text-indigo-300" : "text-gray-300"}>
+            <rect x="0" y="0" width="12" height="1.5" rx="1"/>
+            <rect x="0" y="3.25" width="12" height="1.5" rx="1"/>
+            <rect x="0" y="6.5" width="12" height="1.5" rx="1"/>
+          </svg>
+        </div>
+        {/* Click area */}
+        <button onClick={onSelect} className="w-full px-3 pb-2.5 text-left">
+          <div>{p.nomeExibicao}</div>
+          <div className={`text-xs font-normal mt-0.5 ${active ? "text-indigo-400" : "text-gray-400"}`}>{p.chave}</div>
+          {nextP && (
+            <div className={`text-xs font-normal mt-0.5 ${active ? "text-emerald-500" : "text-emerald-600"}`}>
+              → {nextP.nomeExibicao}
+            </div>
+          )}
+        </button>
       </div>
     </div>
   );
@@ -547,14 +639,37 @@ function ConfigTab({ steps, projetoId, personaChave, onMutated }: {
 
 // ─── MAIN EXPORT ──────────────────────────────────────────────────────────────
 export function FluxoIATab({ projetoId, personas }: { projetoId: string; personas: Persona[] }) {
-  const activePersonas = personas.filter(p => p.ativo !== false);
   const [_sel, setSel]         = useState("");
   const [innerTab, setInnerTab] = useState<"flow" | "config">("flow");
 
-  const selectedChave = _sel || activePersonas[0]?.chave || "";
+  // Local ordered personas — seeded from prop, reordered via DnD
+  const [orderedPersonas, setOrderedPersonas] = useState<Persona[]>(() => personas.filter(p => p.ativo !== false));
+
+  // Re-sync when the set of personas changes (add/remove), but not on order changes
+  const personaIdsKey = personas.filter(p => p.ativo !== false).map(p => p.id).sort().join(",");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useMemo(() => { setOrderedPersonas(personas.filter(p => p.ativo !== false)); }, [personaIdsKey]);
+
+  const selectedChave = _sel || orderedPersonas[0]?.chave || "";
 
   const flowStepsQ = trpc.ia.listFlowSteps.useQuery({ projetoId }, { enabled: !!projetoId });
   const seedMut    = trpc.ia.seedFlowSteps.useMutation({ onSuccess: () => flowStepsQ.refetch() });
+  const reorderPersonasMut = trpc.ia.reorderPersonas.useMutation();
+
+  const personaSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+  );
+
+  function handlePersonaDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIdx = orderedPersonas.findIndex(p => p.id === active.id);
+    const newIdx = orderedPersonas.findIndex(p => p.id === over.id);
+    if (oldIdx < 0 || newIdx < 0) return;
+    const next = arrayMove(orderedPersonas, oldIdx, newIdx);
+    setOrderedPersonas(next);
+    reorderPersonasMut.mutate({ projetoId, items: next.map((p, i) => ({ id: p.id, ordem: i + 1 })) });
+  }
 
   const allSteps = (flowStepsQ.data as unknown as Step[] | undefined) ?? [];
 
@@ -590,22 +705,22 @@ export function FluxoIATab({ projetoId, personas }: { projetoId: string; persona
         )}
       </div>
 
-      {/* Persona selector */}
-      <div className="flex gap-2">
-        {activePersonas.map(p => {
-          const active = p.chave === selectedChave;
-          return (
-            <button
-              key={p.chave}
-              onClick={() => { setSel(p.chave); setInnerTab("flow"); }}
-              className={`flex-1 py-2.5 px-3 rounded-xl border text-sm font-medium transition-all ${active ? "border-indigo-300 bg-indigo-50 text-indigo-700 shadow-sm" : "border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-gray-50"}`}
-            >
-              <div>{p.nomeExibicao}</div>
-              <div className={`text-xs font-normal mt-0.5 ${active ? "text-indigo-400" : "text-gray-400"}`}>{p.chave}</div>
-            </button>
-          );
-        })}
-      </div>
+      {/* Persona selector — draggable */}
+      <DndContext sensors={personaSensors} collisionDetection={closestCenter} onDragEnd={handlePersonaDragEnd}>
+        <SortableContext items={orderedPersonas.map(p => p.id)} strategy={horizontalListSortingStrategy}>
+          <div className="flex gap-2">
+            {orderedPersonas.map(p => (
+              <SortablePersonaCard
+                key={p.id}
+                p={p}
+                active={p.chave === selectedChave}
+                nextP={p.proximaPersonaChave ? orderedPersonas.find(ap => ap.chave === p.proximaPersonaChave) ?? null : null}
+                onSelect={() => { setSel(p.chave); setInnerTab("flow"); }}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
 
       {/* Content */}
       {flowStepsQ.isLoading ? (

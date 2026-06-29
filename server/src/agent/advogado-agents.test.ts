@@ -5,6 +5,10 @@ vi.mock("../db.js", () => ({
     iaFlowStep: {
       findMany: vi.fn(),
     },
+    // runAdvogadoAgent → getPersonaNomeExibicao (transition-engine.ts:51) usa iaPersona.findFirst
+    iaPersona: {
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
   },
 }));
 
@@ -86,15 +90,18 @@ describe("runAdvogadoAgent", () => {
   });
 });
 
-// P2 — valor_estimado instruction must cover all vínculos
-describe("runAdvogadoAgent — P2 valor_estimado instruction", () => {
-  it("mentions each vínculo separately when step is valor_estimado", async () => {
+// P2 (atualizado) — o step especial "valor_estimado" foi removido do advogado-agents.
+// A fase autoridade agora PROÍBE mencionar valores (cálculo de valor migrou para os steps
+// llm_generated + calculo-agents/valueInjection). As instruções devem listar os vínculos
+// como contexto e vetar menção a valores monetários.
+describe("runAdvogadoAgent — fase autoridade com múltiplos vínculos", () => {
+  it("lista todos os vínculos no contexto e proíbe mencionar valores", async () => {
     const pid = "proj-p2-val-" + Date.now();
     mockFindMany.mockResolvedValue([{ chave: "valor_estimado", fase: "autoridade" }]);
     const { runAdvogadoAgent } = await import("./advogado-agents.js");
     const vinculos = [
-      { empresa: "ABCDE Ltda", funcao: "motorista", vinculo: "CLT", tempo: "2 anos" },
-      { empresa: "Transporte Azul", funcao: "motorista", vinculo: "autônomo", tempo: "1 ano" },
+      { ordem: 0, empresa: "ABCDE Ltda", funcao: "motorista", vinculo: "CLT", tempo: "2 anos" },
+      { ordem: 1, empresa: "Transporte Azul", funcao: "motorista", vinculo: "autônomo", tempo: "1 ano" },
     ];
     const result = await runAdvogadoAgent({
       projetoId: pid,
@@ -102,12 +109,12 @@ describe("runAdvogadoAgent — P2 valor_estimado instruction", () => {
       merged: { nome: "Pedro" },
       vinculos,
     });
-    expect(result.systemInstructions).toMatch(/cada vínculo/i);
     expect(result.systemInstructions).toContain("ABCDE Ltda");
     expect(result.systemInstructions).toContain("Transporte Azul");
+    expect(result.systemInstructions).toMatch(/não calcule nem mencione valores monetários/i);
   });
 
-  it("mentions total sum when multiple vínculos present", async () => {
+  it("não promete soma/total de valores — fase autoridade não fala em valores", async () => {
     const pid = "proj-p2-total-" + Date.now();
     mockFindMany.mockResolvedValue([{ chave: "valor_estimado", fase: "autoridade" }]);
     const { runAdvogadoAgent } = await import("./advogado-agents.js");
@@ -116,10 +123,11 @@ describe("runAdvogadoAgent — P2 valor_estimado instruction", () => {
       iaFlowStepChave: "valor_estimado",
       merged: { nome: "Maria" },
       vinculos: [
-        { empresa: "Empresa A", funcao: "op", vinculo: "CLT", tempo: "1 ano" },
-        { empresa: "Empresa B", funcao: "op", vinculo: "CLT", tempo: "2 anos" },
+        { ordem: 0, empresa: "Empresa A", funcao: "op", vinculo: "CLT", tempo: "1 ano" },
+        { ordem: 1, empresa: "Empresa B", funcao: "op", vinculo: "CLT", tempo: "2 anos" },
       ],
     });
-    expect(result.systemInstructions).toMatch(/total/i);
+    expect(result.systemInstructions).not.toMatch(/total estimado|some os valores/i);
+    expect(result.systemInstructions).toMatch(/não calcule nem mencione valores monetários/i);
   });
 });

@@ -10,6 +10,7 @@ import { sendText, sendTyping, sendWhatsAppAudio } from "../services/evolution.j
 import { textToSpeech } from "../services/elevenlabs.js";
 import { assertSendable, handleBlockedSend, PromptLeakError, type SendableContext } from "./output-guard.js";
 import { buildInstrucaoBase } from "./persona-router.js";
+import { getCurrentStepQuestion } from "./flow-controller.js";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -40,7 +41,7 @@ export function limparResposta(text: string, nomePersona: string): string {
   const semPrefixo = text
     .replace(new RegExp(`^\\*?${escaped}[^\\S\\n]*\\*?[:\\n\\s]\\s*`, ""), "")
     .trim();
-  return semPrefixo.replace(EMOJI_REGEX, "").replace(/\s{2,}/g, " ").trim();
+  return semPrefixo.replace(EMOJI_REGEX, "").replace(/[^\S\n]{2,}/g, " ").trim();
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -64,7 +65,12 @@ export async function sendHumanized(
     // typing indicator is best-effort
   }
   await new Promise(r => setTimeout(r, typingMs));
-  await sendText(evoConfig, phone, text);
+  try {
+    await sendText(evoConfig, phone, text);
+  } catch (err) {
+    console.error(`[sendHumanized] sendText falhou para ${phone}:`, err);
+    throw err;
+  }
 }
 
 export async function sendHumanizedSafe(
@@ -73,7 +79,7 @@ export async function sendHumanizedSafe(
   text: string,
   readDelayMs = 0,
   guardCtx: { deal: { id: string }; persona: { chave: string; nomeExibicao: string }; projetoId: string; currentStep?: { stepType: string; pergunta: string; chave: string } | null }
-): Promise<void> {
+): Promise<boolean> {
   const ctx: SendableContext = {
     text,
     currentStep: guardCtx.currentStep ?? null,
@@ -90,12 +96,47 @@ export async function sendHumanizedSafe(
       if (outcome.fallbackText) {
         await sendHumanized(evoConfig, phone, outcome.fallbackText, readDelayMs);
       }
-      return;
+      return false;
     }
     throw err;
   }
 
   await sendHumanized(evoConfig, phone, text, readDelayMs);
+  return true;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Audio or text send — uses ElevenLabs when persona.usarAudio is enabled
+// ──────────────────────────────────────────────────────────────────────────────
+
+export async function sendHumanizedOrAudio(
+  projetoId: string,
+  evoConfig: EvolutionConfig,
+  phone: string,
+  text: string,
+  readDelayMs: number,
+  persona: { nomeExibicao: string; usarAudio?: boolean; ttsVoiceId?: string | null },
+  guardCtx: { deal: { id: string }; persona: { chave: string; nomeExibicao: string }; projetoId: string },
+): Promise<{ sent: boolean; tipoEnvio: "audio" | "text" }> {
+  if (persona.usarAudio && persona.ttsVoiceId) {
+    const keyCfg = await prisma.iaProjetoConfig.findFirst({
+      where: { projetoId, chave: "tts_api_key" },
+    });
+    const apiKey = keyCfg?.valor ?? null;
+    if (apiKey) {
+      try {
+        if (readDelayMs > 0) await new Promise(r => setTimeout(r, readDelayMs));
+        const audioBuffer = await textToSpeech(apiKey, persona.ttsVoiceId, text);
+        const audioBase64 = audioBuffer.toString("base64");
+        await sendWhatsAppAudio(evoConfig, phone, audioBase64, "audio/ogg");
+        return { sent: true, tipoEnvio: "audio" };
+      } catch (err) {
+        console.warn(`[sendHumanizedOrAudio] ElevenLabs falhou — fallback para texto:`, err);
+      }
+    }
+  }
+  const sent = await sendHumanizedSafe(evoConfig, phone, text, readDelayMs, guardCtx);
+  return { sent, tipoEnvio: "text" };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -126,13 +167,94 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
   const fase = await prisma.iaFaseFunil.findUnique({
     where: { projetoId_chave: { projetoId, chave: stageChave } },
   });
-  if (!fase || fase.requerAcaoHumana) return;
+  const AUTONOMOUS_PERSONAS = new Set(["coleta_docs", "secretaria", "advogado"]);
+  const autonomousPersonaOverride = !!deal.iaPersonaChave && AUTONOMOUS_PERSONAS.has(deal.iaPersonaChave);
+  if (!fase || (fase.requerAcaoHumana && !autonomousPersonaOverride)) return;
 
   const personaChave = deal.iaPersonaChave ?? fase.personaChave ?? "assistente";
   const persona = await prisma.iaPersona.findUnique({
     where: { projetoId_chave: { projetoId, chave: personaChave } },
   });
   if (!persona) return;
+
+  // ── Deterministic flow step re-send ──────────────────────────────────────
+  // When the deal is in an active flow step, re-send the step's pergunta directly
+  // instead of letting the LLM hallucinate a response.
+  const flowStepChave = (deal as any).iaFlowStepChave as string | null | undefined;
+  const FLOW_DONE = new Set(["__done__", "__discarded__"]);
+  if (flowStepChave && !FLOW_DONE.has(flowStepChave)) {
+    const personaFase =
+      personaChave === "coleta_docs"
+        ? { personaChave: "coleta_docs", fase: "coleta_docs" }
+        : personaChave === "advogado"
+          ? { personaChave: "advogado", fase: "advogado" }
+          : personaChave === "secretaria"
+            ? { personaChave: "secretaria", fase: "secretaria" }
+            : null;
+
+    if (personaFase) {
+      const { pergunta, stepType } = await getCurrentStepQuestion(projetoId, flowStepChave, personaFase);
+      if (pergunta && stepType !== "llm_generated") {
+        const evoConfig = await getEvolutionConfig(projetoId);
+        if (!evoConfig) return;
+
+        const textoLimpo = limparResposta(
+          pergunta.replace(/\{nome_persona\}/g, persona.nomeExibicao),
+          persona.nomeExibicao
+        );
+        const respostaWA = `*${persona.nomeExibicao}*\n${textoLimpo}`;
+        await sendHumanized(evoConfig, phone, respostaWA, 3000);
+
+        const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
+        if (contato) {
+          await prisma.crmMensagemWhatsapp.create({
+            data: {
+              dealId,
+              contatoId: contato.id,
+              direcao: "out",
+              remetente: persona.nomeExibicao,
+              tipo: "text",
+              conteudo: textoLimpo,
+            },
+          });
+        }
+        return;
+      }
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // For assistente persona: re-send the last outgoing message instead of a free LLM call.
+  // A free LLM call here has no flow context and generates wrong follow-up questions
+  // (e.g. jumping to "cidade" instead of repeating the pending "Me conta tudo").
+  if (personaChave === "assistente") {
+    const ultimaOut = await prisma.crmMensagemWhatsapp.findFirst({
+      where: { dealId, direcao: "out" },
+      orderBy: { enviadaEm: "desc" },
+    });
+    if (!ultimaOut?.conteudo) return;
+
+    const evoConfig = await getEvolutionConfig(projetoId);
+    if (!evoConfig) return;
+
+    await sendHumanized(evoConfig, phone, `*${persona.nomeExibicao}*\n${ultimaOut.conteudo}`, 3000);
+
+    const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
+    if (contato) {
+      await (prisma.crmMensagemWhatsapp as any).create({
+        data: {
+          dealId,
+          contatoId: contato.id,
+          direcao: "out",
+          remetente: persona.nomeExibicao,
+          personaChave,
+          tipo: "text",
+          conteudo: ultimaOut.conteudo,
+        },
+      });
+    }
+    return;
+  }
 
   const history = await prisma.crmMensagemWhatsapp.findMany({
     where: { dealId },
@@ -146,12 +268,26 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
     content: m.conteudo ?? "",
   }));
 
-  const INSTRUCAO_BASE = buildInstrucaoBase();
+  const { getPersonaNomeExibicao: getPN } = await import("./transition-engine.js");
+  const [advNomeMH, secNomeMH, assistNomeMH] = await Promise.all([
+    getPN(projetoId, "advogado"),
+    getPN(projetoId, "secretaria"),
+    getPN(projetoId, "assistente"),
+  ]);
+  const INSTRUCAO_BASE = buildInstrucaoBase(advNomeMH);
   let userSystem = persona.systemPrompt
     .replace("{INSTRUÇÃO BASE}", INSTRUCAO_BASE)
-    .replace(/\{nome_persona\}/g, persona.nomeExibicao);
+    .replace(/\{nome_persona\}/g, persona.nomeExibicao)
+    .replace(/\{nome_advogado\}/g, advNomeMH)
+    .replace(/\{nome_secretaria\}/g, secNomeMH)
+    .replace(/\{nome_assistente\}/g, assistNomeMH);
   if (!userSystem.includes("DATA E HORA ATUAL")) {
     userSystem = INSTRUCAO_BASE + "\n\n" + userSystem;
+  }
+
+  // Inject step context for llm_generated steps
+  if (flowStepChave && !FLOW_DONE.has(flowStepChave)) {
+    userSystem += `\n\nO lead está aguardando resposta no passo "${flowStepChave}" do fluxo. Responda de acordo com esse contexto sem pular etapas.`;
   }
 
   const result = await callLlm({
@@ -303,10 +439,15 @@ export async function checkAndNotifySolicitaLigacao(
   if (!palavras.some(p => norm(text).includes(norm(p)))) return { notificado: false };
   const ultimaNotif = merged._notif_ligacao_at as string | undefined;
   if (ultimaNotif && (Date.now() - new Date(ultimaNotif).getTime() < 2 * 60 * 60 * 1000)) return { notificado: false };
+  const { buildLeadBriefing } = await import("./lead-briefing.js");
+  const briefingLigacao = await buildLeadBriefing(dealId, {
+    titulo: "📞 LEAD PEDIU LIGAÇÃO",
+    acao: `Ligar agora — ele pediu: "${text.slice(0, 80)}"`,
+  }).catch(() => "");
   dispararNotificacoes(projetoId, "solicita_ligacao", {
     nome: String(merged.nome ?? ""), telefone: phone, stage: stageChave, mensagem: text,
     empresa: String(merged.empresa_recente ?? (Array.isArray(merged.vinculos) && (merged.vinculos as any[])[0]?.empresa) ?? ""),
-    cidade: String(merged.cidade ?? ""),
+    cidade: String(merged.cidade ?? ""), briefing: briefingLigacao, dealId,
   }).catch(() => {});
   console.log(`[StageEngine] Cliente ${phone} pediu ligação — notificação disparada`);
   return { notificado: true, timestamp: new Date().toISOString() };

@@ -43,7 +43,8 @@ function normalizar(text: string): string {
 
 const PATTERNS: Record<FrustrationType, RegExp[]> = {
   repeticao: [
-    /(ja|ja)\s+(falei|disse|informei|passei|respondi|tinha?\s+falado)/,
+    // "já falei", "já te falei", "já lhe disse", "já havia falado" — com ou sem pronome no meio
+    /ja\s+(\w{1,5}\s+)?(falei|disse|informei|passei|respondi|havia\s+falado|tinha\s+falado)/,
     /(ta|esta)\s+(repetindo|perguntando)\s+(de\s+novo|igual|mesma\s+coisa)/,
     /(voce|vc)\s+nao\s+(ta|esta)\s+(lendo|prestando\s+atencao)/,
     /ja\s+respondi\s+isso/,
@@ -51,6 +52,26 @@ const PATTERNS: Record<FrustrationType, RegExp[]> = {
     /ja\s+falei\s+isso/,
     /ja\s+disse\s+isso/,
     /falei\s+(isso|pra|para)\s+(a\s+)?(ana|voce|vc)/,
+    // repete a pergunta — lead menciona que a IA está fazendo a mesma coisa
+    /mesma\s+pergunta/,
+    /perguntou\s+(isso|mesma|de\s+novo|outra\s+vez)/,
+    /voce\s+ja\s+perguntou/,
+    /ja\s+te\s+falei/,
+    /ja\s+respondi\s+(essa|isso|essa\s+pergunta)/,
+    // "não te disse", "não lhe falei" — lead reafirma informação já dada
+    /n[aã]o\s+(te\s+|lhe\s+)?(disse|falei|informei|avisei|contei)/,
+    // "perguntas inúteis / desnecessárias / sem sentido / vc repete"
+    /perguntas?\s+(in[uú]teis?|desnecessar|sem\s+sentido|bobas?|rid[ií]cul|irrelevante)/,
+    /(vc|voce)\s+repete/,
+    /repete\s+(as\s+)?(perguntas?|isso|tudo|mesma)/,
+    /ta\s+repetindo\s+(as\s+)?perguntas?/,
+    // Padrões específicos para o público carreteiro nordestino
+    /(ja|já)\s+falei\s+(no\s+)?(audio|áudio|aúdio)/,
+    /(a\s+)?(senhora?|senhor|moca|moça|rapariga|menina)\s+n[aã]o\s+(t[aá]|est[aá])\s+(ouvindo|prestando|lendo)/,
+    /(voce|vc|senhora)\s+(e|é)\s+(burr|idiota|lerda?|lerd[ao]|bobinha?|incompat|urr[ao]|bobo)/,
+    /n[aã]o\s+prestou\s+aten/,
+    /eu\s+ja\s+respondi\s+isso\s+(tudo|ali|antes)/,
+    /falei\s+isso\s+no\s+come[cç]o/,
   ],
   demora: [
     /(demorou|demora\s+muito|ta\s+demorando)/,
@@ -72,6 +93,10 @@ const PATTERNS: Record<FrustrationType, RegExp[]> = {
     /nao\s+vai\s+dar\s+certo/,
     /vou\s+desistir/,
     /esquece\s+isso/,
+    // Rejeição/xingamento severo — escalada imediata
+    /vai\s+tomar\s+(banho|no\b)/,
+    /^vtnc$|^vsf$|^vtc$|^foda[\s-]?se$/,
+    /vai\s+(se\s+)?(foder|fuder|embora|pra\s+casa\s+do\s+diabo)/,
   ],
 };
 

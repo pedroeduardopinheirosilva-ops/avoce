@@ -10,6 +10,7 @@ type Empresa = {
   uf: string | null; cep: string | null;
   regime: string; aliquotaIss: number; itemListaServico: string; codTributacao: string;
   codigoServicoNacional: string | null; codigoNbs: string | null; regimeTributacao: string | null;
+  nfseProvider: "el_vdc" | "issnet_df" | null; codigoCnae: string | null;
   certNome: string | null; certValidade: Date | null; certPass: string | null;
   logoPath: string | null; ativo: boolean;
   pixClientId: string | null; pixChave: string | null;
@@ -18,6 +19,9 @@ type Empresa = {
   boletoMultaPercent: number | null; boletoJurosDiaPercent: number | null;
   smtpHost: string | null; smtpPort: number | null; smtpSecure: boolean;
   smtpUser: string | null; smtpPass: string | null; smtpFrom: string | null;
+  voipDid: string | null; voipDid2: string | null; voipAsteriskWss: string | null;
+  voipDid1Label: string | null; voipDid2Label: string | null;
+  voipSipExtension: string | null; voipSipPassword: string | null; voipSipDomain: string | null;
 };
 
 const REGIMES: Record<string, string> = { "1": "Simples Nacional", "2": "Lucro Presumido", "3": "Lucro Real" };
@@ -30,7 +34,7 @@ export default function Empresas() {
   const utils = trpc.useUtils();
   const { data: empresas, isLoading } = trpc.empresa.listar.useQuery();
   const [form, setForm] = useState<Partial<Empresa> | null>(null);
-  const [formTab, setFormTab] = useState<"dados" | "cobranca" | "smtp">("dados");
+  const [formTab, setFormTab] = useState<"dados" | "cobranca" | "smtp" | "voip">("dados");
   const [certUpload, setCertUpload] = useState<{ id: string; nome: string } | null>(null);
   const [certSenha, setCertSenha] = useState("");
   const [certFile, setCertFile] = useState<File | null>(null);
@@ -51,8 +55,8 @@ export default function Empresas() {
   const [buscandoCnpj, setBuscandoCnpj] = useState(false);
   const [buscaCnpjMsg, setBuscaCnpjMsg] = useState<string | null>(null);
 
-  const criar           = trpc.empresa.criar.useMutation({ onSuccess: () => { utils.empresa.listar.invalidate(); setForm(null); } });
-  const atualizar       = trpc.empresa.atualizar.useMutation({ onSuccess: () => { utils.empresa.listar.invalidate(); setForm(null); } });
+  const criar           = trpc.empresa.criar.useMutation({ onSuccess: () => { utils.empresa.listar.invalidate(); setForm(null); }, onError: (e) => alert(`Erro ao criar empresa: ${e.message}`) });
+  const atualizar       = trpc.empresa.atualizar.useMutation({ onSuccess: () => { utils.empresa.listar.invalidate(); setForm(null); }, onError: (e) => alert(`Erro ao salvar empresa: ${e.message}`) });
   const excluir         = trpc.empresa.excluir.useMutation({ onSuccess: () => utils.empresa.listar.invalidate() });
   const salvarSenhaCert = trpc.empresa.salvarSenhaCert.useMutation({
     onSuccess: () => { setSenhaCertMsg({ ok: true,  msg: "✅ Senha salva e validada com sucesso" }); utils.empresa.listar.invalidate(); setSenhaCertInput(""); },
@@ -150,12 +154,23 @@ export default function Empresas() {
       codigoServicoNacional: form.codigoServicoNacional || null,
       codigoNbs:             form.codigoNbs             || null,
       regimeTributacao:      form.regimeTributacao      || null,
+      nfseProvider:          (form.nfseProvider as "el_vdc" | "issnet_df" | null | undefined) || null,
+      codigoCnae:            form.codigoCnae            || null,
       smtpHost:   form.smtpHost  || null,
       smtpPort:   form.smtpPort  ?? null,
       smtpSecure: form.smtpSecure ?? false,
       smtpUser:   form.smtpUser  || null,
       smtpPass:   form.smtpPass  || null,
       smtpFrom:   form.smtpFrom  || null,
+      // VoIP
+      voipDid:          form.voipDid          || null,
+      voipDid2:         form.voipDid2         || null,
+      voipAsteriskWss:  form.voipAsteriskWss  || null,
+      voipDid1Label:    form.voipDid1Label    || null,
+      voipDid2Label:    form.voipDid2Label    || null,
+      voipSipExtension: form.voipSipExtension || null,
+      voipSipPassword:  form.voipSipPassword  || null,
+      voipSipDomain:    form.voipSipDomain    || null,
       // Cobrança
       pixClientId:            form.pixClientId            || null,
       pixChave:               form.pixChave               || null,
@@ -239,8 +254,8 @@ export default function Empresas() {
   if (isLoading) return <div className="p-8 text-gray-500">Carregando...</div>;
 
   return (
-    <div className="p-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-4 md:p-8">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <h1 className="text-2xl font-bold text-gray-900">Empresas Emitentes</h1>
         <button onClick={() => abrirForm()} className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-2 rounded-lg text-sm font-medium">
           + Nova Empresa
@@ -282,16 +297,19 @@ export default function Empresas() {
 
       {/* Modal Form */}
       {form && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={(e) => { if (e.target === e.currentTarget) setForm(null); }}>
           <div className="bg-white rounded-2xl shadow-2xl p-6 w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-            <h2 className="text-lg font-bold mb-3">{form.id ? "Editar Empresa" : "Nova Empresa"}</h2>
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-lg font-bold">{form.id ? "Editar Empresa" : "Nova Empresa"}</h2>
+              <button onClick={() => setForm(null)} className="text-gray-400 hover:text-gray-700 text-xl leading-none p-1">✕</button>
+            </div>
 
             {/* Abas */}
             <div className="flex gap-1 mb-4 border-b border-gray-200">
-              {(["dados", "cobranca", "smtp"] as const).map(t => (
+              {(["dados", "cobranca", "smtp", "voip"] as const).map(t => (
                 <button key={t} onClick={() => setFormTab(t)}
                   className={`text-sm px-4 py-2 -mb-px border-b-2 transition-colors ${formTab === t ? "border-brand-600 text-brand-700 font-medium" : "border-transparent text-gray-500 hover:text-gray-700"}`}>
-                  {t === "dados" ? "Dados Fiscais" : t === "cobranca" ? "PIX / Boleto" : "E-mail / SMTP"}
+                  {t === "dados" ? "Dados Fiscais" : t === "cobranca" ? "PIX / Boleto" : t === "smtp" ? "E-mail / SMTP" : "📞 VoIP"}
                 </button>
               ))}
             </div>
@@ -417,6 +435,109 @@ export default function Empresas() {
               </div>
             )}
 
+            {formTab === "voip" && (
+              <div className="space-y-4">
+                <p className="text-xs text-gray-500">Configure os números de origem (DID) e a URL do servidor Asterisk para chamadas VoIP. Após configurar, o botão "📞 Ligar" aparecerá nos deals do CRM.</p>
+
+                <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-4">
+                  <p className="text-xs font-semibold text-indigo-800 uppercase tracking-wide mb-3">Números de Origem (DID)</p>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">DID Principal *</label>
+                      <input
+                        value={form?.voipDid ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipDid: e.target.value || null }))}
+                        placeholder="+5561XXXXXXXXX"
+                        className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                      />
+                      <p className="text-xs text-gray-400 mt-0.5">Número com DDI+DDD, ex: +5561999990000</p>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Label DID Principal</label>
+                      <input
+                        value={form?.voipDid1Label ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipDid1Label: e.target.value || null }))}
+                        placeholder="Brasília (61)"
+                        className="w-full border rounded-lg px-3 py-2 text-sm"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">DID Alternativo</label>
+                      <input
+                        value={form?.voipDid2 ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipDid2: e.target.value || null }))}
+                        placeholder="+5511XXXXXXXXX"
+                        className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                      />
+                      <p className="text-xs text-gray-400 mt-0.5">Opcional — aparece seletor de DDD no dialer</p>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Label DID Alternativo</label>
+                      <input
+                        value={form?.voipDid2Label ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipDid2Label: e.target.value || null }))}
+                        placeholder="São Paulo (11)"
+                        className="w-full border rounded-lg px-3 py-2 text-sm"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                  <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-3">Servidor Asterisk (WebRTC)</p>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">URL WebSocket (WSS)</label>
+                      <input
+                        value={form?.voipAsteriskWss ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipAsteriskWss: e.target.value || null }))}
+                        placeholder="wss://avoce.capium.com.br/asterisk-ws"
+                        className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                      />
+                      <p className="text-xs text-gray-400 mt-0.5">Endereço WSS do Asterisk via nginx proxy.</p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Ramal SIP</label>
+                        <input
+                          value={form?.voipSipExtension ?? ""}
+                          onChange={e => setForm(f => ({ ...f, voipSipExtension: e.target.value || null }))}
+                          placeholder="1001"
+                          className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Senha do Ramal</label>
+                        <input
+                          type="password"
+                          value={form?.voipSipPassword ?? ""}
+                          onChange={e => setForm(f => ({ ...f, voipSipPassword: e.target.value || null }))}
+                          placeholder="••••••••"
+                          className="w-full border rounded-lg px-3 py-2 text-sm"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Domínio SIP</label>
+                      <input
+                        value={form?.voipSipDomain ?? ""}
+                        onChange={e => setForm(f => ({ ...f, voipSipDomain: e.target.value || null }))}
+                        placeholder="avoce.capium.com.br"
+                        className="w-full border rounded-lg px-3 py-2 text-sm font-mono"
+                      />
+                      <p className="text-xs text-gray-400 mt-0.5">Pré-preenche automaticamente o modal SIP na página Telefone.</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+                  <p className="text-xs text-amber-800">
+                    <strong>Pré-requisitos:</strong> Asterisk instalado no servidor com suporte WebRTC (PJSIP + WSS), trunk SIP contratado (ex: Directcall.com.br) e portas 5060/8089 abertas no firewall.
+                  </p>
+                </div>
+              </div>
+            )}
+
             {formTab === "dados" && <div className="grid grid-cols-2 gap-3">
               <div className="col-span-2">
                 <label className="block text-xs font-medium text-gray-700 mb-1">Razão Social *</label>
@@ -527,6 +648,27 @@ export default function Empresas() {
               <div className="col-span-2 mt-2">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3 border-t pt-3">Configuração NFS-e</p>
                 <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">Provedor NFS-e</label>
+                    <select
+                      value={form.nfseProvider ?? "el_vdc"}
+                      onChange={e => setForm(f => ({ ...f, nfseProvider: (e.target.value || null) as "el_vdc" | "issnet_df" | null }))}
+                      className="w-full border rounded-lg px-3 py-2 text-sm"
+                    >
+                      <option value="el_vdc">E&L Sistemas — Vitória da Conquista/BA</option>
+                      <option value="issnet_df">ISSNet / Nota Control — Brasília/DF</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-700 mb-1">CNAE <span className="text-gray-400">(somente números)</span></label>
+                    <input
+                      value={form.codigoCnae ?? ""}
+                      onChange={e => setForm(f => ({ ...f, codigoCnae: e.target.value.replace(/\D/g, "").slice(0, 7) || null }))}
+                      placeholder="ex: 6911701"
+                      maxLength={7}
+                      className="w-full border rounded-lg px-3 py-2 text-sm"
+                    />
+                  </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-700 mb-1">Item LC 116 <span className="text-gray-400">(com pontos, ex: 17.14)</span></label>
                     <input value={form.itemListaServico ?? ""} onChange={e => setForm(f => ({ ...f, itemListaServico: e.target.value }))}

@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   DndContext,
   DragEndEvent,
@@ -17,19 +18,22 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { trpc } from "../lib/trpc";
+import VoipDialer, { VoipDialerHandle } from "../components/VoipDialer";
+import { useVoip } from "../contexts/VoipContext";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Stage = {
+export type Stage = {
   id: string; chave: string; nome: string; cor: string;
   ehGanho: boolean; requerAcaoHumana: boolean;
   deals: Deal[];
 };
-type Deal = {
+export type Deal = {
   id: string; titulo: string; valor: string | null; urgencia: boolean;
   status: string; stageId: string; criadoEm: string;
-  valorEstimado: string | null;
+  valorEstimado: string | null; iaAtiva: boolean | null; iaPausadaPor: string | null;
   contato: { id: string; nome: string; whatsapp: string | null; cidade: string | null } | null;
+  tags?: { id: string; nome: string; cor: string }[];
 };
 type Pipeline = {
   id: string; nome: string; tipo: string; cor: string;
@@ -38,9 +42,9 @@ type Pipeline = {
 // ── Card draggável ─────────────────────────────────────────────────────────────
 
 function DealCard({
-  deal, onOpen, overlay = false,
+  deal, onOpen, onWhatsApp, onCriarReuniao, overlay = false,
 }: {
-  deal: Deal; onOpen: (d: Deal) => void; overlay?: boolean;
+  deal: Deal; onOpen: (d: Deal) => void; onWhatsApp?: (d: Deal) => void; onCriarReuniao?: (d: Deal) => void; overlay?: boolean;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: deal.id, data: { type: "deal", deal } });
@@ -66,11 +70,17 @@ function DealCard({
       {deal.urgencia && (
         <span className="text-xs text-red-600 font-semibold mb-1 block">🔴 Urgente</span>
       )}
-      <p className="text-sm font-medium text-gray-800 leading-tight mb-1">{deal.titulo}</p>
+      <p className="text-sm font-medium text-gray-800 leading-tight mb-1">
+        {(() => {
+          const words = (deal.contato?.nome ?? deal.titulo).trim().split(/\s+/).filter(Boolean);
+          const label = words.slice(0, 2).join(" ");
+          const last4 = deal.contato?.whatsapp?.slice(-4);
+          return last4 ? `${label} - ${last4}` : label;
+        })()}
+      </p>
       {deal.contato && (
         <p className="text-xs text-gray-500 mb-1">
-          👤 {deal.contato.nome}
-          {deal.contato.cidade ? ` · ${deal.contato.cidade}` : ""}
+          {deal.contato.cidade ? `📍 ${deal.contato.cidade}` : ""}
         </p>
       )}
       {deal.valorEstimado && (
@@ -83,9 +93,48 @@ function DealCard({
           {Number(deal.valor).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}
         </p>
       )}
-      <p className="text-xs text-gray-400 mt-1">
-        {new Date(deal.criadoEm).toLocaleDateString("pt-BR")}
-      </p>
+      {deal.tags && deal.tags.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1.5">
+          {deal.tags.slice(0, 3).map(tag => (
+            <span key={tag.id} className="inline-flex items-center text-[10px] font-medium px-1.5 py-0.5 rounded-full text-white" style={{ backgroundColor: tag.cor }}>
+              {tag.nome}
+            </span>
+          ))}
+          {deal.tags.length > 3 && (
+            <span className="inline-flex items-center text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600">
+              +{deal.tags.length - 3}
+            </span>
+          )}
+        </div>
+      )}
+      <div className="flex items-center justify-between mt-1">
+        <p className="text-xs text-gray-400">{new Date(deal.criadoEm).toLocaleDateString("pt-BR")}</p>
+        <div className="flex items-center gap-1">
+          {deal.iaAtiva === false && (
+            <span className="text-xs bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded-full font-medium">SDR</span>
+          )}
+          {deal.contato?.whatsapp && onWhatsApp && (
+            <button
+              data-no-open
+              onClick={(e) => { e.stopPropagation(); onWhatsApp(deal); }}
+              className="text-indigo-500 hover:text-indigo-700 hover:bg-indigo-50 p-1 rounded-full transition-colors"
+              title="Atender pelo WhatsApp IA"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
+            </button>
+          )}
+          {onCriarReuniao && (
+            <button
+              data-no-open
+              onClick={(e) => { e.stopPropagation(); onCriarReuniao(deal); }}
+              className="text-purple-500 hover:text-purple-700 hover:bg-purple-50 p-1 rounded-full transition-colors"
+              title="Iniciar videochamada"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -93,11 +142,13 @@ function DealCard({
 // ── Coluna do kanban ──────────────────────────────────────────────────────────
 
 function KanbanColumn({
-  stage, onOpenDeal, onAddDeal,
+  stage, onOpenDeal, onAddDeal, onWhatsApp, onCriarReuniao,
 }: {
   stage: Stage;
   onOpenDeal: (d: Deal) => void;
   onAddDeal: (stageId: string) => void;
+  onWhatsApp: (d: Deal) => void;
+  onCriarReuniao: (d: Deal) => void;
 }) {
   const { setNodeRef } = useSortable({ id: stage.id, data: { type: "stage" } });
   return (
@@ -131,7 +182,7 @@ function KanbanColumn({
           strategy={verticalListSortingStrategy}
         >
           {stage.deals.map((deal) => (
-            <DealCard key={deal.id} deal={deal} onOpen={onOpenDeal} />
+            <DealCard key={deal.id} deal={deal} onOpen={onOpenDeal} onWhatsApp={onWhatsApp} onCriarReuniao={onCriarReuniao} />
           ))}
         </SortableContext>
       </div>
@@ -151,7 +202,7 @@ function KanbanColumn({
 
 // ── Modal de deal ─────────────────────────────────────────────────────────────
 
-function DealModal({
+export function DealModal({
   deal,
   stages,
   pipelineId,
@@ -164,7 +215,16 @@ function DealModal({
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const navigate = useNavigate();
+  const { ligar } = useVoip();
   const isNew = !deal?.id;
+  const dialerRef = useRef<VoipDialerHandle>(null);
+  const dialerDivRef = useRef<HTMLDivElement>(null);
+
+  function discaNumero(num: string) {
+    ligar(num);
+  }
+
   const [titulo, setTitulo] = useState(deal?.titulo ?? "");
   const [descricao, setDescricao] = useState((deal as any)?.descricao ?? "");
   const [valor, setValor] = useState(deal?.valor ?? "");
@@ -182,6 +242,17 @@ function DealModal({
 
   const utils = trpc.useUtils();
 
+  const { data: allTags } = trpc.crm.listTags.useQuery();
+  const [dealTagIds, setDealTagIds] = useState<string[]>((deal as any)?.tags?.map((t: any) => t.id) ?? []);
+  const setDealTagsMut = trpc.crm.setDealTags.useMutation({
+    onSuccess: () => utils.crm.kanban.invalidate(),
+  });
+  function toggleDealTag(tagId: string) {
+    const next = dealTagIds.includes(tagId) ? dealTagIds.filter(id => id !== tagId) : [...dealTagIds, tagId];
+    setDealTagIds(next);
+    if (deal?.id) setDealTagsMut.mutate({ dealId: deal.id, tagIds: next });
+  }
+
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const createMut = trpc.crm.createDeal.useMutation({
@@ -197,8 +268,146 @@ function DealModal({
     onSuccess: () => { utils.crm.getDeal.invalidate(); setNotaText(""); },
   });
 
+  const [reuniaoResult, setReuniaoResult] = useState<{ jitsiUrl: string; linkConvidado: string; titulo: string } | null>(null);
+  const criarReuniaoMut = trpc.reunioes.criarInstantanea.useMutation({
+    onSuccess: (data) => {
+      setReuniaoResult(data);
+      utils.reunioes.listar.invalidate({ dealId: deal?.id });
+    },
+  });
+  const { data: reunioesDoDeal } = trpc.reunioes.listar.useQuery(
+    { dealId: deal?.id ?? "" },
+    { enabled: !!deal?.id }
+  );
+
+  // Agendar reunião manualmente (SDR humana)
+  const [agendarForm, setAgendarForm] = useState({ show: false, usuarioId: "", agendadaPara: "" });
+  const [agendarResult, setAgendarResult] = useState<{ jitsiUrl: string; linkConvidado: string; titulo: string } | null>(null);
+  const { data: usuariosList } = trpc.reunioes.listarUsuarios.useQuery(
+    undefined,
+    { enabled: !isNew }
+  );
+  const criarAgendadaMut = trpc.reunioes.criarAgendada.useMutation({
+    onSuccess: (data) => {
+      setAgendarResult(data);
+      setAgendarForm({ show: false, usuarioId: "", agendadaPara: "" });
+      utils.reunioes.listar.invalidate({ dealId: deal?.id });
+      utils.crm.kanban.invalidate();
+    },
+  });
+
   const { data: dealDetail } = trpc.crm.getDeal.useQuery(
     { id: deal?.id ?? "" },
+    { enabled: !!deal?.id }
+  );
+
+  const [coletaDocsOk, setColetaDocsOk] = useState(false);
+  const dispararColetaMut = trpc.ia.dispararFluxoColetaDocs.useMutation({
+    onSuccess: () => { setColetaDocsOk(true); utils.crm.getDeal.invalidate({ id: deal?.id ?? "" }); },
+  });
+
+  const [marcarReuniaoOk, setMarcarReuniaoOk] = useState(false);
+  const dispararReuniaoMut = trpc.ia.dispararFluxoMarcarReuniao.useMutation({
+    onSuccess: () => { setMarcarReuniaoOk(true); utils.crm.getDeal.invalidate({ id: deal?.id ?? "" }); },
+  });
+
+  // Mover para funil
+  const [moverPipelineId, setMoverPipelineId] = useState("");
+  const [moverStageId, setMoverStageId] = useState("");
+  const todosOsPipelines = trpc.crm.listPipelines.useQuery(undefined, { enabled: !isNew });
+  const stagesMoverPipeline = trpc.crm.listStages.useQuery(
+    { pipelineId: moverPipelineId },
+    { enabled: !!moverPipelineId }
+  );
+  const moverDealMut = trpc.crm.moveDeal.useMutation({
+    onSuccess: () => { utils.crm.kanban.invalidate(); onSaved(); },
+  });
+
+  const { data: anexosDeal, refetch: refetchAnexos } = trpc.ia.listarAnexosDeal.useQuery(
+    { dealId: deal?.id ?? "" },
+    { enabled: !!deal?.id }
+  );
+  const [selectedAnexos, setSelectedAnexos] = useState<Set<string>>(new Set());
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [uploadingFile, setUploadingFile] = useState(false);
+  const [deletingAnexoId, setDeletingAnexoId] = useState<string | null>(null);
+
+  function toggleAnexo(id: string) {
+    setSelectedAnexos(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s; });
+  }
+  function toggleAllAnexos() {
+    if (!anexosDeal) return;
+    if (selectedAnexos.size === anexosDeal.length) { setSelectedAnexos(new Set()); }
+    else { setSelectedAnexos(new Set(anexosDeal.map((a: any) => a.id))); }
+  }
+
+  async function downloadSelecionados() {
+    if (!anexosDeal || selectedAnexos.size === 0) return;
+    const token = localStorage.getItem("avoce_token") ?? "";
+    if (selectedAnexos.size === 1) {
+      const id = [...selectedAnexos][0];
+      const a = document.createElement("a");
+      a.href = `/api/deal-anexos/${id}/download`;
+      const headers = new Headers({ Authorization: `Bearer ${token}` });
+      const res = await fetch(a.href, { headers });
+      if (!res.ok) return;
+      const blob = await res.blob();
+      const nome = anexosDeal.find((x: any) => x.id === id)?.nomeArquivo ?? "documento";
+      const url = URL.createObjectURL(blob);
+      a.href = url; a.download = nome; a.click(); URL.revokeObjectURL(url);
+    } else {
+      setDownloadingZip(true);
+      try {
+        const res = await fetch("/api/deal-anexos/download-zip", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ ids: [...selectedAnexos] }),
+        });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a"); a.href = url; a.download = "documentos.zip"; a.click(); URL.revokeObjectURL(url);
+      } finally { setDownloadingZip(false); }
+    }
+  }
+
+  async function uploadAnexo(file: File) {
+    if (!deal?.id) return;
+    const token = localStorage.getItem("avoce_token") ?? "";
+    setUploadingFile(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`/api/deal-anexos/${deal.id}/upload`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+      if (res.ok) refetchAnexos();
+    } finally {
+      setUploadingFile(false);
+    }
+  }
+
+  async function deletarAnexo(id: string) {
+    const token = localStorage.getItem("avoce_token") ?? "";
+    setDeletingAnexoId(id);
+    try {
+      const res = await fetch(`/api/deal-anexos/${id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setSelectedAnexos(prev => { const s = new Set(prev); s.delete(id); return s; });
+        refetchAnexos();
+      }
+    } finally {
+      setDeletingAnexoId(null);
+    }
+  }
+
+  const { data: ligacoes } = trpc.ligacoes.listar.useQuery(
+    { dealId: deal?.id ?? "" },
     { enabled: !!deal?.id }
   );
 
@@ -265,6 +474,45 @@ function DealModal({
                   <option key={s.id} value={s.id}>{s.nome}</option>
                 ))}
               </select>
+            </div>
+          )}
+
+          {/* Mover para outro funil */}
+          {!isNew && (
+            <div className="border-t pt-4">
+              <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Mover para outro funil</p>
+              <div className="flex gap-2 items-center">
+                <select
+                  value={moverPipelineId}
+                  onChange={(e) => { setMoverPipelineId(e.target.value); setMoverStageId(""); }}
+                  className="flex-1 border border-gray-300 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="">Selecionar funil...</option>
+                  {(todosOsPipelines.data as any[] | undefined)
+                    ?.filter((p: any) => p.id !== pipelineId)
+                    .map((p: any) => <option key={p.id} value={p.id}>{p.nome}</option>)}
+                </select>
+                {moverPipelineId && (
+                  <select
+                    value={moverStageId}
+                    onChange={(e) => setMoverStageId(e.target.value)}
+                    className="flex-1 border border-gray-300 rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  >
+                    <option value="">Etapa...</option>
+                    {(stagesMoverPipeline.data as any[] | undefined)?.map((s: any) => (
+                      <option key={s.id} value={s.id}>{s.nome}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  disabled={!moverStageId || moverDealMut.isPending}
+                  onClick={() => deal?.id && moverStageId && moverDealMut.mutate({ dealId: deal.id, stageId: moverStageId })}
+                  className="px-3 py-1.5 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-40"
+                >
+                  Mover
+                </button>
+              </div>
             </div>
           )}
 
@@ -351,6 +599,31 @@ function DealModal({
             </div>
           </div>
 
+          {!isNew && (
+            <div>
+              <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">Tags</label>
+              <div className="flex flex-wrap gap-1.5">
+                {allTags?.map(tag => {
+                  const active = dealTagIds.includes(tag.id);
+                  return (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      onClick={() => toggleDealTag(tag.id)}
+                      className={`inline-flex items-center text-xs font-medium px-2 py-1 rounded-full border-2 transition-all ${active ? "text-white border-transparent" : "text-gray-600 bg-white border-gray-200 hover:border-gray-400"}`}
+                      style={active ? { backgroundColor: tag.cor, borderColor: tag.cor } : {}}
+                    >
+                      {tag.nome}
+                    </button>
+                  );
+                })}
+                {(!allTags || allTags.length === 0) && (
+                  <p className="text-xs text-gray-400">Nenhuma tag criada. Crie tags no funil.</p>
+                )}
+              </div>
+            </div>
+          )}
+
           {isNew && (
             <div className="border-t pt-4">
               <p className="text-xs font-semibold text-gray-500 uppercase mb-3">Contato</p>
@@ -395,10 +668,6 @@ function DealModal({
             const d = dealDetail as any;
             const wa = d.contato?.whatsapp;
             const tel = d.contato?.telefone;
-            const waLink = (num: string) => {
-              const n = num.replace(/\D/g, "");
-              return `https://wa.me/${n.startsWith("55") ? n : "55" + n}`;
-            };
             return (
               <>
                 {(wa || tel || d.contato?.empresa || d.organizacao) && (
@@ -407,8 +676,19 @@ function DealModal({
                     <div className="text-xs text-gray-600 space-y-1.5">
                       {d.contato?.empresa && <p>🏢 {d.contato.empresa}</p>}
                       {d.organizacao && d.organizacao !== d.contato?.empresa && <p>🏢 {d.organizacao}</p>}
-                      {wa && <p>📱 {wa}{" "}<a href={waLink(wa)} target="_blank" rel="noopener noreferrer" className="text-green-600 hover:text-green-700 font-medium underline">Abrir WhatsApp ↗</a></p>}
-                      {tel && <p>📞 {tel}{" "}<a href={waLink(tel)} target="_blank" rel="noopener noreferrer" className="text-green-600 hover:text-green-700 font-medium underline">Abrir WhatsApp ↗</a></p>}
+                      {wa && (
+                        <p>📱{" "}
+                          <button onClick={() => discaNumero(wa)} className="underline text-green-700 hover:text-green-900 font-medium">{wa}</button>
+                          {" "}
+                          <button
+                            onClick={() => { onClose(); navigate(`/whatsapp?dealId=${deal?.id}`); }}
+                            className="text-indigo-600 hover:text-indigo-700 font-medium underline"
+                          >
+                            Atender pelo WhatsApp IA ↗
+                          </button>
+                        </p>
+                      )}
+                      {tel && <p>📞{" "}<button onClick={() => discaNumero(tel)} className="underline text-green-700 hover:text-green-900 font-medium">{tel}</button></p>}
                     </div>
                   </div>
                 )}
@@ -474,6 +754,318 @@ function DealModal({
                   })}
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Ligações VoIP */}
+          {!isNew && (
+            <div ref={dialerDivRef} className="border-t pt-4">
+              <p className="text-xs font-semibold text-gray-500 uppercase mb-3">
+                Ligações ({ligacoes?.length ?? 0})
+              </p>
+              <VoipDialer
+                ref={dialerRef}
+                dealId={deal!.id}
+                contatoWhatsapp={(dealDetail as any)?.contato?.whatsapp}
+                contatoTelefone={(dealDetail as any)?.contato?.telefone}
+              />
+              {ligacoes && ligacoes.length > 0 && (
+                <div className="mt-3 space-y-2 max-h-48 overflow-y-auto">
+                  {ligacoes.map((l: any) => (
+                    <div key={l.id} className="bg-gray-50 border border-gray-200 rounded-lg p-2.5">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-xs font-medium text-gray-700">
+                          📞{" "}<button onClick={() => discaNumero(l.numeroDestino)} className="underline text-green-700 hover:text-green-900">{l.numeroDestino}</button>
+                        </span>
+                        <span className={`text-xs px-1.5 py-0.5 rounded-full ${
+                          l.status === "ENCERRADA"     ? "bg-green-100 text-green-700" :
+                          l.status === "EM_ANDAMENTO"  ? "bg-blue-100 text-blue-700" :
+                          l.status === "DISCANDO"      ? "bg-yellow-100 text-yellow-700" :
+                          "bg-red-100 text-red-700"
+                        }`}>
+                          {l.status === "ENCERRADA"    ? "encerrada" :
+                           l.status === "EM_ANDAMENTO" ? "em ligação" :
+                           l.status === "DISCANDO"     ? "discando" :
+                           l.status.toLowerCase()}
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-400">
+                        {new Date(l.iniciadaEm).toLocaleString("pt-BR")}
+                        {l.duracao ? ` • ${Math.floor(l.duracao / 60)}min ${l.duracao % 60}s` : ""}
+                      </p>
+                      {l.resumo && (
+                        <p className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{l.resumo}</p>
+                      )}
+                      {!l.resumo && l.transcricao && (
+                        <details className="mt-1">
+                          <summary className="text-xs text-indigo-600 cursor-pointer">Ver transcrição</summary>
+                          <p className="text-xs text-gray-600 mt-1 whitespace-pre-wrap">{l.transcricao}</p>
+                        </details>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Videochamada */}
+          {!isNew && (
+            <div className="border-t pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-gray-500 uppercase">
+                  Videochamada ({reunioesDoDeal?.length ?? 0})
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => criarReuniaoMut.mutate({ dealId: deal!.id })}
+                    disabled={criarReuniaoMut.isPending}
+                    className="text-xs bg-indigo-600 text-white px-3 py-1.5 rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                  >
+                    {criarReuniaoMut.isPending ? "Criando..." : "📹 Agora"}
+                  </button>
+                  <button
+                    onClick={() => setAgendarForm(f => ({ ...f, show: !f.show }))}
+                    className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-lg hover:bg-emerald-700 transition-colors"
+                  >
+                    📅 Agendar
+                  </button>
+                </div>
+              </div>
+
+              {/* Formulário inline: agendar reunião pela SDR humana */}
+              {agendarForm.show && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 mb-3 space-y-2">
+                  <p className="text-xs font-semibold text-emerald-700">Agendar reunião — confirmação e lembretes enviados por WhatsApp automaticamente</p>
+                  <div className="flex flex-col gap-2">
+                    <select
+                      value={agendarForm.usuarioId}
+                      onChange={e => setAgendarForm(f => ({ ...f, usuarioId: e.target.value }))}
+                      className="w-full border border-emerald-300 rounded-lg px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-emerald-300 bg-white"
+                    >
+                      <option value="">Participante (advogado) *</option>
+                      {(usuariosList ?? []).map((u: any) => (
+                        <option key={u.id} value={u.id}>{u.nome}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="datetime-local"
+                      value={agendarForm.agendadaPara}
+                      onChange={e => setAgendarForm(f => ({ ...f, agendadaPara: e.target.value }))}
+                      className="w-full border border-emerald-300 rounded-lg px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-emerald-300 bg-white"
+                    />
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setAgendarForm({ show: false, usuarioId: "", agendadaPara: "" })}
+                        className="flex-1 border border-gray-300 rounded-lg py-1.5 text-xs text-gray-600 hover:bg-gray-50"
+                      >
+                        Cancelar
+                      </button>
+                      <button
+                        onClick={() => criarAgendadaMut.mutate({
+                          dealId:       deal!.id,
+                          usuarioId:    agendarForm.usuarioId,
+                          agendadaPara: agendarForm.agendadaPara,
+                        })}
+                        disabled={!agendarForm.usuarioId || !agendarForm.agendadaPara || criarAgendadaMut.isPending}
+                        className="flex-1 bg-emerald-600 text-white rounded-lg py-1.5 text-xs font-medium hover:bg-emerald-700 disabled:opacity-50"
+                      >
+                        {criarAgendadaMut.isPending ? "Agendando..." : "Confirmar"}
+                      </button>
+                    </div>
+                    {criarAgendadaMut.isError && (
+                      <p className="text-xs text-red-600">{(criarAgendadaMut.error as any)?.message ?? "Erro ao agendar"}</p>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {(reuniaoResult || agendarResult) && (() => {
+                const r = agendarResult ?? reuniaoResult!;
+                const isAgendada = !!agendarResult;
+                return (
+                  <div className={`border rounded-lg p-3 mb-3 space-y-2 ${isAgendada ? "bg-emerald-50 border-emerald-200" : "bg-indigo-50 border-indigo-200"}`}>
+                    <p className={`text-xs font-semibold ${isAgendada ? "text-emerald-700" : "text-indigo-700"}`}>
+                      {isAgendada ? "Reunião agendada — confirmação e lembretes enviados por WhatsApp" : "Reunião criada — link enviado por WhatsApp"}
+                    </p>
+                    <div className="flex items-center gap-2">
+                      <a
+                        href={r.jitsiUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className={`text-xs text-white px-3 py-1.5 rounded-lg inline-block ${isAgendada ? "bg-emerald-600 hover:bg-emerald-700" : "bg-indigo-600 hover:bg-indigo-700"}`}
+                      >
+                        Entrar na sala (advogado)
+                      </a>
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(r.linkConvidado); }}
+                        className={`text-xs border px-3 py-1.5 rounded-lg ${isAgendada ? "border-emerald-300 text-emerald-700 hover:bg-emerald-100" : "border-indigo-300 text-indigo-700 hover:bg-indigo-100"}`}
+                      >
+                        Copiar link cliente
+                      </button>
+                    </div>
+                    <p className={`text-xs break-all ${isAgendada ? "text-emerald-500" : "text-indigo-500"}`}>{r.linkConvidado}</p>
+                  </div>
+                );
+              })()}
+
+              {reunioesDoDeal && reunioesDoDeal.length > 0 && (
+                <div className="space-y-2 max-h-40 overflow-y-auto">
+                  {reunioesDoDeal.map((r: any) => (
+                    <div key={r.id} className="bg-gray-50 border border-gray-200 rounded-lg p-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-gray-700 truncate">{r.titulo}</span>
+                        <span className={`text-xs px-1.5 py-0.5 rounded-full flex-shrink-0 ${
+                          r.status === "em_andamento" ? "bg-green-100 text-green-700" :
+                          r.status === "encerrada"    ? "bg-gray-100 text-gray-600" :
+                          r.status === "cancelada"    ? "bg-red-100 text-red-600" :
+                          "bg-yellow-100 text-yellow-700"
+                        }`}>
+                          {r.status === "em_andamento" ? "ao vivo" :
+                           r.status === "encerrada"    ? "encerrada" :
+                           r.status === "cancelada"    ? "cancelada" : "aguardando"}
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-400 mt-1">
+                        {new Date(r.criadaEm).toLocaleString("pt-BR")}
+                        {r.agendadaPara && ` • Agendada: ${new Date(r.agendadaPara).toLocaleString("pt-BR")}`}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Marcar reunião via Ana */}
+          {!isNew && (
+            <div className="border-t pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-gray-500 uppercase">Agendar Reunião (Ana)</p>
+                <button
+                  onClick={() => dispararReuniaoMut.mutate({ dealId: deal!.id })}
+                  disabled={dispararReuniaoMut.isPending || marcarReuniaoOk}
+                  className="text-xs bg-violet-600 text-white px-3 py-1.5 rounded-lg hover:bg-violet-700 disabled:opacity-50 transition-colors"
+                >
+                  {dispararReuniaoMut.isPending ? "Enviando..." : marcarReuniaoOk ? "Agendamento iniciado!" : "📅 Marcar reunião"}
+                </button>
+              </div>
+              {marcarReuniaoOk && (
+                <p className="text-xs text-violet-700 bg-violet-50 border border-violet-200 rounded-lg p-2">
+                  Ana entrará em contato pelo WhatsApp para agendar a consulta com a Dra. Daniela.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Coleta de Documentos pós-reunião */}
+          {!isNew && (
+            <div className="border-t pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-gray-500 uppercase">Coleta de Docs (pós-reunião)</p>
+                <button
+                  onClick={() => dispararColetaMut.mutate({ dealId: deal!.id })}
+                  disabled={dispararColetaMut.isPending || coletaDocsOk}
+                  className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                >
+                  {dispararColetaMut.isPending ? "Iniciando..." : coletaDocsOk ? "Fluxo iniciado!" : "Iniciar coleta"}
+                </button>
+              </div>
+              {coletaDocsOk && (
+                <p className="text-xs text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg p-2">
+                  Ana iniciará a coleta de dados pelo WhatsApp. Acompanhe a conversa para verificar o progresso.
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Pasta de documentos do deal */}
+          {!isNew && (
+            <div className="border-t pt-4">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-gray-500 uppercase">
+                  Documentos ({anexosDeal?.length ?? 0})
+                </p>
+                <div className="flex items-center gap-2">
+                  {anexosDeal && anexosDeal.length > 0 && (
+                    <>
+                      <label className="flex items-center gap-1 cursor-pointer text-xs text-gray-500">
+                        <input
+                          type="checkbox"
+                          checked={selectedAnexos.size === anexosDeal.length}
+                          onChange={toggleAllAnexos}
+                          className="rounded"
+                        />
+                        todos
+                      </label>
+                      {selectedAnexos.size > 0 && (
+                        <button
+                          onClick={downloadSelecionados}
+                          disabled={downloadingZip}
+                          className="text-xs bg-gray-700 text-white px-2.5 py-1 rounded-lg hover:bg-gray-900 disabled:opacity-50 transition-colors"
+                        >
+                          {downloadingZip ? "Preparando..." : selectedAnexos.size === 1 ? "Baixar" : `Baixar ZIP (${selectedAnexos.size})`}
+                        </button>
+                      )}
+                    </>
+                  )}
+                  <label className={`text-xs px-2.5 py-1 rounded-lg border border-gray-300 cursor-pointer transition-colors ${uploadingFile ? "opacity-50 cursor-not-allowed" : "hover:bg-gray-50"}`}>
+                    {uploadingFile ? "Enviando..." : "+ Anexar"}
+                    <input
+                      type="file"
+                      className="hidden"
+                      disabled={uploadingFile}
+                      onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadAnexo(f); e.target.value = ""; }}
+                    />
+                  </label>
+                </div>
+              </div>
+              {anexosDeal && anexosDeal.length > 0 && (
+                <div className="space-y-2 max-h-56 overflow-y-auto">
+                  {anexosDeal.map((a: any) => (
+                    <div
+                      key={a.id}
+                      onClick={() => toggleAnexo(a.id)}
+                      className={`cursor-pointer border rounded-lg p-2.5 transition-colors ${selectedAnexos.has(a.id) ? "bg-blue-50 border-blue-300" : "bg-gray-50 border-gray-200 hover:border-gray-300"}`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedAnexos.has(a.id)}
+                          onChange={() => toggleAnexo(a.id)}
+                          onClick={e => e.stopPropagation()}
+                          className="rounded flex-shrink-0"
+                        />
+                        <span className="text-xs font-medium text-gray-700 truncate flex-1">{a.nomeArquivo}</span>
+                        {a.tipoDocumento && a.tipoDocumento !== "OUTRO" && (
+                          <span className={`text-xs px-1.5 py-0.5 rounded-full flex-shrink-0 ${
+                            a.tipoDocumento === "TRANSCRICAO" ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700"
+                          }`}>
+                            {a.tipoDocumento === "TRANSCRICAO" ? "Transcrição" : a.tipoDocumento}
+                          </span>
+                        )}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); deletarAnexo(a.id); }}
+                          disabled={deletingAnexoId === a.id}
+                          className="text-red-400 hover:text-red-600 text-xs flex-shrink-0 disabled:opacity-50 px-1"
+                          title="Excluir documento"
+                        >
+                          {deletingAnexoId === a.id ? "..." : "✕"}
+                        </button>
+                      </div>
+                      {a.ocrTexto && (
+                        <p className="text-xs text-gray-400 mt-1 line-clamp-2 pl-5">
+                          {a.ocrTexto.replace(/^\[Documento recebido — dados extraídos\]\n/, "").slice(0, 120)}...
+                        </p>
+                      )}
+                      <p className="text-xs text-gray-400 mt-1 pl-5">{new Date(a.criadoEm).toLocaleString("pt-BR")}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(!anexosDeal || anexosDeal.length === 0) && (
+                <p className="text-xs text-gray-400">Nenhum documento enviado ainda.</p>
+              )}
             </div>
           )}
 
@@ -568,15 +1160,300 @@ function DealModal({
   );
 }
 
+// ── Gerenciador de pipeline/etapas ────────────────────────────────────────────
+
+const STAGE_COLORS = [
+  "#6366f1","#3b82f6","#06b6d4","#10b981","#f59e0b",
+  "#f97316","#ef4444","#8b5cf6","#6b7280","#ec4899",
+];
+
+type StageRow = {
+  id: string; chave: string; nome: string; cor: string; ordem: number;
+  ehEntrada: boolean; ehGanho: boolean; ehEncerramento: boolean; requerAcaoHumana: boolean;
+};
+
+function PipelineManagerModal({ pipelineId, pipelineName: initialName, onClose }: {
+  pipelineId: string;
+  pipelineName: string;
+  onClose: () => void;
+}) {
+  const utils = trpc.useUtils();
+  const [pipelineName, setPipelineName] = useState(initialName);
+  const [nameEdited, setNameEdited] = useState(false);
+  const [rows, setRows] = useState<StageRow[]>([]);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+  const [colorPickerId, setColorPickerId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+  const [newChave, setNewChave] = useState("");
+  const [newCor, setNewCor] = useState(STAGE_COLORS[0]);
+  const [dirty, setDirty] = useState(false);
+
+  const { data: stagesData, isLoading } = trpc.crm.listStages.useQuery({ pipelineId });
+
+  useEffect(() => {
+    if (stagesData) setRows(stagesData as unknown as StageRow[]);
+  }, [stagesData]);
+
+  const updatePipelineMut = trpc.crm.updatePipeline.useMutation({
+    onSuccess: () => utils.crm.listPipelines.invalidate(),
+  });
+  const updateStageMut = trpc.crm.updateStage.useMutation({
+    onSuccess: () => utils.crm.listStages.invalidate({ pipelineId }),
+  });
+  const createStageMut = trpc.crm.createStage.useMutation({
+    onSuccess: () => {
+      setNewName(""); setNewChave(""); setNewCor(STAGE_COLORS[0]);
+      utils.crm.listStages.invalidate({ pipelineId });
+      utils.crm.kanban.invalidate();
+    },
+  });
+  const deleteStageMut = trpc.crm.deleteStage.useMutation({
+    onSuccess: () => {
+      setConfirmDeleteId(null);
+      utils.crm.listStages.invalidate({ pipelineId });
+      utils.crm.kanban.invalidate();
+    },
+  });
+  const reorderMut = trpc.crm.reorderStages.useMutation({
+    onSuccess: () => utils.crm.listStages.invalidate({ pipelineId }),
+  });
+
+  function move(idx: number, dir: -1 | 1) {
+    const next = [...rows];
+    const target = idx + dir;
+    if (target < 0 || target >= next.length) return;
+    [next[idx], next[target]] = [next[target], next[idx]];
+    setRows(next);
+    setDirty(true);
+    reorderMut.mutate({ pipelineId, stageIds: next.map((r) => r.id) });
+  }
+
+  function saveFlag(id: string, field: keyof StageRow, val: boolean) {
+    setRows((prev) => prev.map((r) => r.id === id ? { ...r, [field]: val } : r));
+    updateStageMut.mutate({ id, [field]: val });
+  }
+
+  function saveName(id: string) {
+    if (!editingName.trim()) return;
+    setRows((prev) => prev.map((r) => r.id === id ? { ...r, nome: editingName.trim() } : r));
+    updateStageMut.mutate({ id, nome: editingName.trim() });
+    setEditingId(null);
+  }
+
+  function saveColor(id: string, cor: string) {
+    setRows((prev) => prev.map((r) => r.id === id ? { ...r, cor } : r));
+    updateStageMut.mutate({ id, cor });
+    setColorPickerId(null);
+  }
+
+  function addStage() {
+    const chave = newChave.trim() || newName.trim().toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
+    if (!newName.trim() || !chave) return;
+    createStageMut.mutate({ pipelineId, nome: newName.trim(), chave, cor: newCor });
+  }
+
+  const FLAG_LABELS: { field: keyof StageRow; label: string; color: string }[] = [
+    { field: "ehEntrada",       label: "entrada",  color: "bg-green-100 text-green-700 border-green-200" },
+    { field: "ehGanho",         label: "ganho",    color: "bg-blue-100 text-blue-700 border-blue-200" },
+    { field: "ehEncerramento",  label: "encerra",  color: "bg-gray-100 text-gray-600 border-gray-200" },
+    { field: "requerAcaoHumana",label: "humano",   color: "bg-yellow-100 text-yellow-700 border-yellow-200" },
+  ];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+          <h2 className="text-base font-semibold text-gray-800">Configurar funil</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+        </div>
+
+        <div className="overflow-y-auto flex-1 px-6 py-4 space-y-6">
+          {/* Nome do pipeline */}
+          <div>
+            <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-1.5">Nome do funil</label>
+            <div className="flex gap-2">
+              <input
+                value={pipelineName}
+                onChange={(e) => { setPipelineName(e.target.value); setNameEdited(true); }}
+                className="flex-1 border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+              />
+              <button
+                onClick={() => { updatePipelineMut.mutate({ id: pipelineId, nome: pipelineName }); setNameEdited(false); }}
+                disabled={!nameEdited || updatePipelineMut.isPending}
+                className="px-3 py-2 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Salvar
+              </button>
+            </div>
+          </div>
+
+          {/* Etapas */}
+          <div>
+            <label className="text-xs font-medium text-gray-500 uppercase tracking-wider block mb-3">Etapas</label>
+
+            {isLoading ? (
+              <p className="text-sm text-gray-400">Carregando...</p>
+            ) : (
+              <div className="space-y-1.5">
+                {rows.map((row, idx) => (
+                  <div key={row.id} className="flex items-center gap-2 bg-gray-50 rounded-lg px-3 py-2 group">
+                    {/* Reorder */}
+                    <div className="flex flex-col gap-0.5">
+                      <button onClick={() => move(idx, -1)} disabled={idx === 0} className="text-gray-300 hover:text-gray-500 disabled:opacity-20 leading-none text-xs">▲</button>
+                      <button onClick={() => move(idx, 1)} disabled={idx === rows.length - 1} className="text-gray-300 hover:text-gray-500 disabled:opacity-20 leading-none text-xs">▼</button>
+                    </div>
+
+                    {/* Color swatch */}
+                    <div className="relative flex-shrink-0">
+                      <button
+                        className="w-5 h-5 rounded-full border-2 border-white shadow"
+                        style={{ backgroundColor: row.cor }}
+                        onClick={() => setColorPickerId(colorPickerId === row.id ? null : row.id)}
+                      />
+                      {colorPickerId === row.id && (
+                        <div className="absolute left-0 top-7 z-10 bg-white border border-gray-200 rounded-lg shadow-lg p-2 flex flex-wrap gap-1.5 w-40">
+                          {STAGE_COLORS.map((c) => (
+                            <button
+                              key={c}
+                              className={`w-6 h-6 rounded-full border-2 transition-transform hover:scale-110 ${row.cor === c ? "border-gray-700 scale-110" : "border-white"}`}
+                              style={{ backgroundColor: c }}
+                              onClick={() => saveColor(row.id, c)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Name */}
+                    <div className="flex-1 min-w-0">
+                      {editingId === row.id ? (
+                        <input
+                          autoFocus
+                          value={editingName}
+                          onChange={(e) => setEditingName(e.target.value)}
+                          onBlur={() => saveName(row.id)}
+                          onKeyDown={(e) => { if (e.key === "Enter") saveName(row.id); if (e.key === "Escape") setEditingId(null); }}
+                          className="w-full text-sm border-b border-indigo-400 bg-transparent focus:outline-none"
+                        />
+                      ) : (
+                        <button
+                          className="text-sm text-gray-800 text-left w-full truncate hover:text-indigo-600"
+                          onClick={() => { setEditingId(row.id); setEditingName(row.nome); }}
+                        >
+                          {row.nome}
+                        </button>
+                      )}
+                      <span className="text-xs text-gray-400 font-mono">{row.chave}</span>
+                    </div>
+
+                    {/* Flags */}
+                    <div className="flex gap-1 flex-shrink-0">
+                      {FLAG_LABELS.map(({ field, label, color }) => (
+                        <button
+                          key={field}
+                          onClick={() => saveFlag(row.id, field, !row[field])}
+                          className={`text-xs px-1.5 py-0.5 rounded border transition-opacity ${row[field] ? color : "bg-white text-gray-300 border-gray-200 opacity-60"}`}
+                          title={field}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Delete */}
+                    {confirmDeleteId === row.id ? (
+                      <div className="flex items-center gap-1 ml-1">
+                        <button
+                          onClick={() => deleteStageMut.mutate({ id: row.id })}
+                          disabled={deleteStageMut.isPending}
+                          className="text-xs bg-red-500 text-white px-2 py-0.5 rounded hover:bg-red-600 disabled:opacity-50"
+                        >
+                          Excluir
+                        </button>
+                        <button onClick={() => setConfirmDeleteId(null)} className="text-xs text-gray-400 hover:text-gray-600">✕</button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setConfirmDeleteId(row.id)}
+                        className="text-gray-200 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity ml-1 text-sm"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Add stage */}
+            <div className="mt-4 border border-dashed border-gray-200 rounded-xl p-3 bg-gray-50">
+              <p className="text-xs font-medium text-gray-500 mb-2">Nova etapa</p>
+              <div className="flex gap-2 flex-wrap">
+                <input
+                  placeholder="Nome da etapa"
+                  value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && addStage()}
+                  className="flex-1 min-w-32 border border-gray-200 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                />
+                <input
+                  placeholder="chave_unica (opcional)"
+                  value={newChave}
+                  onChange={(e) => setNewChave(e.target.value)}
+                  className="flex-1 min-w-28 border border-gray-200 rounded-lg px-3 py-1.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"
+                />
+                {/* color picker */}
+                <div className="flex gap-1 items-center">
+                  {STAGE_COLORS.slice(0, 5).map((c) => (
+                    <button
+                      key={c}
+                      className={`w-5 h-5 rounded-full border-2 transition-transform hover:scale-110 ${newCor === c ? "border-gray-600 scale-110" : "border-white shadow"}`}
+                      style={{ backgroundColor: c }}
+                      onClick={() => setNewCor(c)}
+                    />
+                  ))}
+                </div>
+                <button
+                  onClick={addStage}
+                  disabled={!newName.trim() || createStageMut.isPending}
+                  className="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded-lg hover:bg-indigo-700 disabled:opacity-40"
+                >
+                  {createStageMut.isPending ? "..." : "+ Adicionar"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Página principal ──────────────────────────────────────────────────────────
 
 export default function CrmPage() {
+  const navigate = useNavigate();
   const [activePipelineId, setActivePipelineId] = useState<string | null>(null);
   const [activeDeal, setActiveDeal] = useState<Deal | null>(null);
   const [newDealStageId, setNewDealStageId] = useState<string | null>(null);
   const [draggingDeal, setDraggingDeal] = useState<Deal | null>(null);
   const [confirmDeletePipeline, setConfirmDeletePipeline] = useState<string | null>(null);
+  const [managingPipelineId, setManagingPipelineId] = useState<string | null>(null);
+  const [showCreatePipeline, setShowCreatePipeline] = useState(false);
+  const [newPipelineName, setNewPipelineName] = useState("");
+  const [newPipelineTipo, setNewPipelineTipo] = useState<"comercial" | "processual">("comercial");
   const [busca, setBusca] = useState("");
+  const [filterTagIds, setFilterTagIds] = useState<string[]>([]);
+  const [showTagManager, setShowTagManager] = useState(false);
+  const [newTagName, setNewTagName] = useState("");
+  const [newTagCor, setNewTagCor] = useState("#6366f1");
+  const [editingTag, setEditingTag] = useState<{ id: string; nome: string; cor: string } | null>(null);
 
   // Otimismo local de drag-and-drop
   const [localStages, setLocalStages] = useState<Stage[] | null>(null);
@@ -597,6 +1474,20 @@ export default function CrmPage() {
     },
   });
 
+  const createPipelineMut = trpc.crm.createPipeline.useMutation({
+    onSuccess: (data) => {
+      setShowCreatePipeline(false);
+      setNewPipelineName("");
+      setActivePipelineId(data.id);
+      utils.crm.listPipelines.invalidate();
+    },
+  });
+
+  const { data: allTags, refetch: refetchTags } = trpc.crm.listTags.useQuery();
+  const createTagMut = trpc.crm.createTag.useMutation({ onSuccess: () => { refetchTags(); setNewTagName(""); } });
+  const updateTagMut = trpc.crm.updateTag.useMutation({ onSuccess: () => { refetchTags(); setEditingTag(null); } });
+  const deleteTagMut = trpc.crm.deleteTag.useMutation({ onSuccess: () => { refetchTags(); } });
+
   // Selecionar pipeline inicial automaticamente
   useEffect(() => {
     if (pipelines && pipelines.length > 0 && !activePipelineId) {
@@ -612,7 +1503,7 @@ export default function CrmPage() {
 
   const { data: kanbanData, isLoading: loadingKanban } =
     trpc.crm.kanban.useQuery(
-      { pipelineId: activePipelineId ?? "", busca: buscaDebounced || undefined },
+      { pipelineId: activePipelineId ?? "", busca: buscaDebounced || undefined, tagIds: filterTagIds.length > 0 ? filterTagIds : undefined },
       { enabled: !!activePipelineId, staleTime: 30_000 }
     );
 
@@ -630,6 +1521,32 @@ export default function CrmPage() {
       if (activePipelineId) utils.crm.kanban.invalidate({ pipelineId: activePipelineId });
     },
   });
+
+  const togglePausaMut = trpc.ia.toggleIaPausa.useMutation({
+    onSuccess: () => {
+      if (activePipelineId) utils.crm.kanban.invalidate({ pipelineId: activePipelineId });
+    },
+  });
+
+  function handleWhatsApp(deal: Deal) {
+    if (!deal.contato?.whatsapp) return;
+    if (deal.iaAtiva !== false) {
+      togglePausaMut.mutate({ dealId: deal.id, pausar: true });
+    }
+    navigate(`/whatsapp?dealId=${deal.id}`);
+  }
+
+  const [reuniaoToast, setReuniaoToast] = useState<{ jitsiUrl: string; linkConvidado: string; titulo: string } | null>(null);
+  const criarReuniaoRapidaMut = trpc.reunioes.criarInstantanea.useMutation({
+    onSuccess: (data) => {
+      setReuniaoToast(data);
+      setTimeout(() => setReuniaoToast(null), 15_000);
+    },
+  });
+
+  function handleCriarReuniao(deal: Deal) {
+    criarReuniaoRapidaMut.mutate({ dealId: deal.id });
+  }
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
@@ -710,14 +1627,30 @@ export default function CrmPage() {
     );
   }
 
+  const managingPipeline = managingPipelineId
+    ? (pipelines as Pipeline[]).find((p) => p.id === managingPipelineId)
+    : null;
+
   return (
     <div className="flex flex-col h-full">
+      {/* Modal de gerenciamento de funil */}
+      {managingPipeline && (
+        <PipelineManagerModal
+          pipelineId={managingPipeline.id}
+          pipelineName={managingPipeline.nome}
+          onClose={() => {
+            setManagingPipelineId(null);
+            utils.crm.kanban.invalidate();
+          }}
+        />
+      )}
+
       {/* Tabs de pipelines */}
-      <div className="bg-white border-b border-gray-200 px-4 flex items-center gap-1 flex-shrink-0">
+      <div className="bg-white border-b border-gray-200 px-4 flex items-center gap-1 flex-shrink-0 overflow-x-auto">
         {(pipelines as Pipeline[]).map((p) => (
-          <div key={p.id} className="flex items-center">
+          <div key={p.id} className="flex items-center flex-shrink-0">
             <button
-              onClick={() => { setActivePipelineId(p.id); setLocalStages(null); setConfirmDeletePipeline(null); }}
+              onClick={() => { setActivePipelineId(p.id); setLocalStages(null); setConfirmDeletePipeline(null); setShowCreatePipeline(false); }}
               className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                 activePipelineId === p.id
                   ? "border-brand-600 text-brand-700"
@@ -752,17 +1685,69 @@ export default function CrmPage() {
                   </button>
                 </div>
               ) : (
-                <button
-                  onClick={() => setConfirmDeletePipeline(p.id)}
-                  className="ml-1 text-gray-300 hover:text-red-400 text-xs px-1 py-0.5 rounded transition-colors"
-                  title="Excluir funil"
-                >
-                  🗑
-                </button>
+                <div className="flex items-center gap-0.5 ml-1">
+                  <button
+                    onClick={() => { setManagingPipelineId(p.id); setConfirmDeletePipeline(null); }}
+                    className="text-gray-300 hover:text-indigo-500 text-sm px-1 py-0.5 rounded transition-colors"
+                    title="Configurar etapas"
+                  >
+                    ✏
+                  </button>
+                  <button
+                    onClick={() => setConfirmDeletePipeline(p.id)}
+                    className="text-gray-300 hover:text-red-400 text-xs px-1 py-0.5 rounded transition-colors"
+                    title="Excluir funil"
+                  >
+                    🗑
+                  </button>
+                </div>
               )
             )}
           </div>
         ))}
+
+        {/* Novo funil */}
+        <div className="ml-2 flex-shrink-0">
+          {showCreatePipeline ? (
+            <div className="flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-lg px-2 py-1.5 my-1">
+              <input
+                autoFocus
+                placeholder="Nome do funil"
+                value={newPipelineName}
+                onChange={(e) => setNewPipelineName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && newPipelineName.trim()) createPipelineMut.mutate({ nome: newPipelineName.trim(), tipo: newPipelineTipo });
+                  if (e.key === "Escape") { setShowCreatePipeline(false); setNewPipelineName(""); }
+                }}
+                className="text-sm border border-indigo-300 rounded px-2 py-0.5 w-36 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+              />
+              <select
+                value={newPipelineTipo}
+                onChange={(e) => setNewPipelineTipo(e.target.value as "comercial" | "processual")}
+                className="text-xs border border-indigo-300 rounded px-1 py-0.5 focus:outline-none"
+              >
+                <option value="comercial">Comercial</option>
+                <option value="processual">Processual</option>
+              </select>
+              <button
+                onClick={() => newPipelineName.trim() && createPipelineMut.mutate({ nome: newPipelineName.trim(), tipo: newPipelineTipo })}
+                disabled={!newPipelineName.trim() || createPipelineMut.isPending}
+                className="text-xs bg-indigo-600 text-white px-2 py-0.5 rounded hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {createPipelineMut.isPending ? "..." : "Criar"}
+              </button>
+              <button onClick={() => { setShowCreatePipeline(false); setNewPipelineName(""); }} className="text-gray-400 hover:text-gray-600 text-xs px-1">✕</button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setShowCreatePipeline(true)}
+              className="text-gray-400 hover:text-indigo-600 text-sm px-2 py-1 rounded transition-colors"
+              title="Novo funil"
+            >
+              + funil
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Busca */}
@@ -780,6 +1765,81 @@ export default function CrmPage() {
           >
             ✕ limpar
           </button>
+        )}
+
+        {/* Tag filters */}
+        {allTags && allTags.length > 0 && (
+          <div className="flex items-center gap-1.5 flex-wrap mt-2">
+            <span className="text-xs text-gray-400 font-medium">Tags:</span>
+            {allTags.map((tag: any) => {
+              const active = filterTagIds.includes(tag.id);
+              return (
+                <button
+                  key={tag.id}
+                  onClick={() => setFilterTagIds(prev => active ? prev.filter(id => id !== tag.id) : [...prev, tag.id])}
+                  className={`inline-flex items-center text-xs font-medium px-2 py-0.5 rounded-full border transition-all ${active ? "text-white border-transparent" : "bg-white border-gray-200 text-gray-600 hover:border-gray-400"}`}
+                  style={active ? { backgroundColor: tag.cor, borderColor: tag.cor } : {}}
+                >
+                  {tag.nome}
+                </button>
+              );
+            })}
+            {filterTagIds.length > 0 && (
+              <button onClick={() => setFilterTagIds([])} className="text-xs text-gray-400 hover:text-gray-600 underline">limpar</button>
+            )}
+            <button onClick={() => setShowTagManager(v => !v)} className="text-gray-300 hover:text-indigo-500 text-sm ml-1" title="Gerenciar tags">🏷</button>
+          </div>
+        )}
+        {allTags && allTags.length === 0 && (
+          <div className="mt-2">
+            <button onClick={() => setShowTagManager(v => !v)} className="text-xs text-gray-400 hover:text-indigo-500 flex items-center gap-1">🏷 Criar tags</button>
+          </div>
+        )}
+
+        {/* Tag manager panel */}
+        {showTagManager && (
+          <div className="mt-2 p-3 bg-white border border-gray-200 rounded-xl shadow-sm">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-xs font-semibold text-gray-700">Gerenciar Tags</span>
+              <button onClick={() => setShowTagManager(false)} className="text-gray-400 hover:text-gray-600 text-sm">✕</button>
+            </div>
+            <div className="space-y-1.5 mb-3">
+              {allTags?.map((tag: any) => (
+                <div key={tag.id} className="flex items-center gap-2">
+                  {editingTag?.id === tag.id ? (
+                    <>
+                      <input value={editingTag.nome} onChange={e => setEditingTag(t => t ? { ...t, nome: e.target.value } : t)}
+                        className="flex-1 border border-gray-200 rounded px-2 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400" />
+                      <input type="color" value={editingTag.cor} onChange={e => setEditingTag(t => t ? { ...t, cor: e.target.value } : t)}
+                        className="w-6 h-6 rounded cursor-pointer border-0" />
+                      <button onClick={() => updateTagMut.mutate({ id: editingTag.id, nome: editingTag.nome, cor: editingTag.cor })}
+                        className="text-xs text-indigo-600 hover:text-indigo-800 font-medium">OK</button>
+                      <button onClick={() => setEditingTag(null)} className="text-xs text-gray-400 hover:text-gray-600">✕</button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: tag.cor }} />
+                      <span className="flex-1 text-xs text-gray-700">{tag.nome}</span>
+                      <button onClick={() => setEditingTag(tag)} className="text-xs text-gray-400 hover:text-indigo-500">✏</button>
+                      <button onClick={() => deleteTagMut.mutate({ id: tag.id })} className="text-xs text-gray-400 hover:text-red-500">🗑</button>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center gap-2">
+              <input value={newTagName} onChange={e => setNewTagName(e.target.value)} placeholder="Nova tag..."
+                className="flex-1 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                onKeyDown={e => { if (e.key === "Enter" && newTagName.trim()) createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor }); }} />
+              <input type="color" value={newTagCor} onChange={e => setNewTagCor(e.target.value)}
+                className="w-7 h-7 rounded cursor-pointer border border-gray-200" />
+              <button
+                onClick={() => newTagName.trim() && createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor })}
+                className="text-xs bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700 disabled:opacity-40"
+                disabled={!newTagName.trim()}
+              >+ Criar</button>
+            </div>
+          </div>
         )}
       </div>
 
@@ -805,6 +1865,8 @@ export default function CrmPage() {
                     stage={stage}
                     onOpenDeal={setActiveDeal}
                     onAddDeal={(sid) => setNewDealStageId(sid)}
+                    onWhatsApp={handleWhatsApp}
+                    onCriarReuniao={handleCriarReuniao}
                   />
                 ))}
               </SortableContext>
@@ -839,6 +1901,40 @@ export default function CrmPage() {
           onClose={() => setNewDealStageId(null)}
           onSaved={() => setNewDealStageId(null)}
         />
+      )}
+
+      {/* Toast reunião criada */}
+      {(reuniaoToast || criarReuniaoRapidaMut.isPending) && (
+        <div className="fixed bottom-6 right-6 z-50 bg-white border border-purple-200 rounded-2xl shadow-2xl p-4 w-80 space-y-3">
+          {criarReuniaoRapidaMut.isPending ? (
+            <p className="text-sm font-semibold text-purple-700">Criando videochamada...</p>
+          ) : reuniaoToast && (
+            <>
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-semibold text-purple-700">📹 Reunião criada!</p>
+                <button onClick={() => setReuniaoToast(null)} className="text-gray-400 hover:text-gray-600 text-lg leading-none">×</button>
+              </div>
+              <p className="text-xs text-gray-500 truncate">{reuniaoToast.titulo}</p>
+              <p className="text-xs text-green-600">Link enviado por WhatsApp</p>
+              <div className="flex gap-2">
+                <a
+                  href={reuniaoToast.jitsiUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex-1 text-center text-xs bg-purple-600 text-white px-3 py-2 rounded-lg hover:bg-purple-700"
+                >
+                  Entrar na sala
+                </a>
+                <button
+                  onClick={() => { navigator.clipboard.writeText(reuniaoToast!.linkConvidado); }}
+                  className="flex-1 text-xs border border-purple-300 text-purple-700 px-3 py-2 rounded-lg hover:bg-purple-50"
+                >
+                  Copiar link
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       )}
     </div>
   );

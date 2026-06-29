@@ -33,6 +33,17 @@ export interface VinculoEmprego {
   fgts_ok?: string;
   /** CTPS assinada? "assinada" | "nao_assinada" | "parcial" */
   situacao_ctps?: string;
+  // ── Campos específicos para motorista carreteiro ──────────────────────────────
+  /** Descrição livre da jornada diária, horários e frequência de folgas */
+  jornada_descricao?: string;
+  /** Base de cálculo de comissão de frete: "bruto" | "liquido" | descrição livre */
+  base_calculo_comissao?: string;
+  /** Se o holerite mostrava valor diferente do real: "sim" | "nao" | descrição */
+  holerite_ficticio?: string;
+  /** Pagamento de diárias: "sim" | "nao" | descrição */
+  diarias?: string;
+  /** Acidente de trabalho ou doença ocupacional: "sim" | "nao" | descrição */
+  acidente_trabalho?: string;
 }
 
 // ── Document extraction ───────────────────────────────────────────────────────
@@ -150,6 +161,7 @@ export type AgentResult = {
   systemInstructions: string;
   allDone: boolean;
   phase: AssistentePhase;
+  forceDescarte?: boolean;
 };
 
 // ── Advogado sub-agents ───────────────────────────────────────────────────────

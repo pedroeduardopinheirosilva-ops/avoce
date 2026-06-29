@@ -16,7 +16,9 @@ export async function getModoColeta(projetoId: string): Promise<string> {
   const cfg = await prisma.iaProjetoConfig
     .findFirst({ where: { projetoId, chave: "modo_coleta" } })
     .catch(() => null);
-  const valor = cfg?.valor ?? "sequencial";
+  // valid: "sequencial" | "conversacional" (outros valores fazem fallback silencioso para "sequencial")
+  const raw = cfg?.valor ?? "sequencial";
+  const valor = raw === "conversacional" ? "conversacional" : "sequencial";
   _modoColetaCache.set(projetoId, { valor, expiresAt: Date.now() + 60_000 });
   return valor;
 }
@@ -45,26 +47,10 @@ export async function applyConversacionalMode(opts: {
     outgoingCount: number;
   };
 }): Promise<{ agentResult: MiniAgentResult; nextQDeterministico: string | null }> {
-  if (opts.modoColeta !== "conversacional" || opts.personaChave !== "assistente") {
-    return { agentResult: opts.agentResult, nextQDeterministico: opts.currentNextQ };
-  }
-  try {
-    const { getConversationalSystemInstructions } = await import("./conversational-router.js");
-    const convResult = await getConversationalSystemInstructions(
-      opts.convParams.projetoId, opts.convParams.merged, opts.convParams.vinculos,
-      opts.convParams.vinculosOk, opts.convParams.vinculosTodosPrescritos,
-      opts.convParams.empresasBloqueadas, opts.convParams.outgoingCount,
-    );
-    return {
-      agentResult: {
-        ...opts.agentResult,
-        systemInstructions: opts.agentResult.systemInstructions + "\n\n" + convResult.systemSuffix,
-        allDone: convResult.isDone,
-      },
-      nextQDeterministico: null,
-    };
-  } catch (err: any) {
-    console.warn("[ConversationalRouter] Erro — fallback para sequencial:", err?.message ?? err);
-    return { agentResult: opts.agentResult, nextQDeterministico: opts.currentNextQ };
-  }
+  // Modo conversacional desativado — sempre sequencial/determinístico.
+  return { agentResult: opts.agentResult, nextQDeterministico: opts.currentNextQ };
+}
+
+export function invalidateModoColetaCache(projetoId: string) {
+  _modoColetaCache.delete(projetoId);
 }

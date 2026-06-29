@@ -69,14 +69,14 @@ describe("buildSystemPrompt", () => {
   });
 
   it("includes CPF confirmation when cpf in merged is valid", () => {
-    const ctx = minimalCtx({ merged: { cpf: "529.982.247-25" } });
+    const ctx = minimalCtx({ personaChave: "advogado", merged: { cpf: "529.982.247-25" } });
     const result = buildSystemPrompt(ctx);
     expect(result).toContain("CPF CONFIRMADO");
     expect(result).toContain("529.982.247-25");
   });
 
   it("does NOT include CPF confirmation for invalid CPF", () => {
-    const ctx = minimalCtx({ merged: { cpf: "111.111.111-11" } });
+    const ctx = minimalCtx({ personaChave: "advogado", merged: { cpf: "111.111.111-11" } });
     const result = buildSystemPrompt(ctx);
     expect(result).not.toContain("CPF CONFIRMADO");
   });
@@ -84,7 +84,9 @@ describe("buildSystemPrompt", () => {
   it("includes prescrição warning when vinculosTodosPrescritos", () => {
     const ctx = minimalCtx({ vinculosTodosPrescritos: true });
     const result = buildSystemPrompt(ctx);
-    expect(result).toContain("PRAZO PRESCRICIONAL VENCIDO");
+    // Cabeçalho atual inclui "TRABALHISTA" e a exceção de acidente com incapacidade permanente
+    expect(result).toContain("PRAZO PRESCRICIONAL TRABALHISTA VENCIDO");
+    expect(result).toContain("ACIDENTE DO TRABALHO COM INCAPACIDADE PERMANENTE");
   });
 
   it("injects frustrationInjection when provided", () => {
@@ -93,11 +95,13 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("FRUSTRATION_TEXT");
   });
 
-  it("includes nextQDeterministico for non-llm_generated step", () => {
+  it("includes nextQDeterministico for non-llm_generated step (assistente → texto literal)", () => {
     const ctx = minimalCtx({ nextQDeterministico: "Qual é o seu CPF?" });
     const result = buildSystemPrompt(ctx);
     expect(result).toContain("Qual é o seu CPF?");
-    expect(result).toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+    // Marcador atual: "PRÓXIMA MENSAGEM (envie exatamente este texto...)" — substituiu
+    // o antigo "PRÓXIMA PERGUNTA OBRIGATÓRIA".
+    expect(result).toContain("PRÓXIMA MENSAGEM (envie exatamente este texto");
   });
 
   it("handles llm_generated step with valueInjection", () => {
@@ -107,15 +111,26 @@ describe("buildSystemPrompt", () => {
       valueInjection: "VALOR_CALC_TEXTO",
     });
     const result = buildSystemPrompt(ctx);
-    expect(result).toContain("TAREFA OBRIGATÓRIA");
+    // Marcador atual: "Instruções para este turno" — substituiu "TAREFA OBRIGATÓRIA".
+    expect(result).toContain("Instruções para este turno");
+    expect(result).toContain("Apresente o valor estimado.");
     expect(result).toContain("VALOR_CALC_TEXTO");
   });
 
-  it("includes pending questions and skips them when vinculosTodosPrescritos", () => {
-    const withQ = buildSystemPrompt(minimalCtx({ perguntasDeterministicas: ["- Qual empresa?"] }));
+  it("includes pending questions (persona não-assistente) and skips them when vinculosTodosPrescritos", () => {
+    // A seção "INFORMAÇÕES AINDA NÃO COLETADAS" passou a ser injetada apenas para personas
+    // que NÃO sejam a assistente (a Ana segue exclusivamente a pergunta determinística).
+    const withQ = buildSystemPrompt(minimalCtx({
+      personaChave: "advogado",
+      perguntasDeterministicas: ["- Qual empresa?"],
+    }));
     expect(withQ).toContain("INFORMAÇÕES AINDA NÃO COLETADAS");
 
+    const assistente = buildSystemPrompt(minimalCtx({ perguntasDeterministicas: ["- Qual empresa?"] }));
+    expect(assistente).not.toContain("INFORMAÇÕES AINDA NÃO COLETADAS");
+
     const prescribed = buildSystemPrompt(minimalCtx({
+      personaChave: "advogado",
       perguntasDeterministicas: ["- Qual empresa?"],
       vinculosTodosPrescritos: true,
     }));
@@ -139,7 +154,10 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("10000");
   });
 
-  it("step com campoColetar ausente no merged → instrução OBRIGATÓRIA", () => {
+  // Comportamento atual: a injeção de texto literal ("PRÓXIMA MENSAGEM ...") é exclusiva da
+  // assistente. Para o advogado, quando o campo NÃO foi coletado, o builder instrui o LLM a
+  // responder apenas a dúvida — a próxima pergunta é enviada pelo stage-engine em bolha separada.
+  it("step com campoColetar ausente no merged → NÃO marca 'já foi coletado' (advogado)", () => {
     const ctx = minimalCtx({
       personaChave: "advogado",
       personaNome: "Dra. Daniela Pires",
@@ -150,10 +168,11 @@ describe("buildSystemPrompt", () => {
       merged: {},
     });
     const result = buildSystemPrompt(ctx);
-    expect(result).toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+    expect(result).not.toContain("já foi coletado");
+    expect(result).toContain("Responda APENAS a dúvida acima");
   });
 
-  it("step de documento (solicitar_cnh) com cpf no merged → mantém instrução OBRIGATÓRIA", () => {
+  it("step de documento (solicitar_cnh) com cpf no merged → NÃO marca 'já foi coletado'", () => {
     const ctx = minimalCtx({
       personaChave: "advogado",
       personaNome: "Dra. Daniela Pires",
@@ -164,6 +183,8 @@ describe("buildSystemPrompt", () => {
       merged: { cpf: "12345678901" },
     });
     const result = buildSystemPrompt(ctx);
-    expect(result).toContain("PRÓXIMA PERGUNTA OBRIGATÓRIA");
+    // Step de documento nunca é tratado como "campo já coletado", mesmo com cpf presente
+    expect(result).not.toContain("já foi coletado");
+    expect(result).toContain("Responda APENAS a dúvida acima");
   });
 });

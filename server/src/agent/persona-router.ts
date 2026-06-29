@@ -5,6 +5,7 @@
 
 import { prisma } from "../db.js";
 import type { VinculoEmprego } from "./qualification.js";
+import { getTempoMinimoGate, getMesesMinimoProjeto, renderNomePlaceholder } from "./gate-evaluator.js";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -20,69 +21,43 @@ export interface FlowPasso {
   tipoEspecial: string | null;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Default flow steps (auto-seeded when project has no DB rows)
-// ──────────────────────────────────────────────────────────────────────────────
 
-const DEFAULT_FLOW_PASSOS: Omit<FlowPasso, "ativo">[] = [
-  { chave: "empresa",        campoColetar: "empresa",        ordemPadrao: 1,  pergunta: "Em qual empresa você trabalhou (ou trabalha)?",                                            skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "funcao",         campoColetar: "funcao",         ordemPadrao: 2,  pergunta: "Qual era sua função lá?",                                                                  skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "vinculo",        campoColetar: "vinculo",        ordemPadrao: 3,  pergunta: "Você tinha carteira assinada (CLT) ou era autônomo?",                                       skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "saida",          campoColetar: "saida",          ordemPadrao: 4,  pergunta: "Como foi o desligamento — foi demitido, pediu demissão ou ainda está lá?",                  skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "tempo",          campoColetar: "tempo",          ordemPadrao: 5,  pergunta: "Quanto tempo você trabalhou lá? (meses ou anos)",                                           skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "horas_extras",   campoColetar: "horas_extras",   ordemPadrao: 6,  pergunta: "Trabalhava além da jornada normal? Recebia por essas horas?",                               skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "pagamento_fora", campoColetar: "pagamento_fora", ordemPadrao: 7,  pergunta: "Recebia algum valor fora do holerite, como Pix, Pamcard ou dinheiro?",                     skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "injustica",      campoColetar: "injustica",      ordemPadrao: 8,  pergunta: "Teve alguma pressão, desconto indevido ou jornada sem registro?",                           skipSe: null,                                                                   tipoEspecial: null },
-  { chave: "frota",          campoColetar: "frota",          ordemPadrao: 9,  pergunta: "Quantos caminhões a empresa tinha na frota?",                                              skipSe: { campo: "vinculo", contem_qualquer: ["clt", "carteira assinada", "carteira"] }, tipoEspecial: null },
-  { chave: "mais_empregos",  campoColetar: null,             ordemPadrao: 10, pergunta: "Antes de trabalhar lá, você trabalhou em outro lugar nos últimos 2 anos?",                  skipSe: null,                                                                   tipoEspecial: "mais_empregos" },
-];
-
-// In-memory flow cache
+// In-memory flow cache — keyed by "${projetoId}:${fase}"
 const _flowPassosCache: Record<string, { passos: FlowPasso[]; ts: number }> = {};
 const FLOW_CACHE_TTL = 2 * 60 * 1000;
 
 export function invalidateFlowCache(projetoId: string) {
-  delete _flowPassosCache[projetoId];
+  for (const key of Object.keys(_flowPassosCache)) {
+    if (key.startsWith(`${projetoId}:`)) delete _flowPassosCache[key];
+  }
 }
 
-async function getFlowPassos(projetoId: string): Promise<FlowPasso[]> {
-  const cached = _flowPassosCache[projetoId];
+async function getFlowPassos(
+  projetoId: string,
+  fase: string = "vinculos_loop",
+): Promise<FlowPasso[]> {
+  const cacheKey = `${projetoId}:${fase}`;
+  const cached = _flowPassosCache[cacheKey];
   if (cached && Date.now() - cached.ts < FLOW_CACHE_TTL) return cached.passos;
 
-  let rows = await prisma.iaVinculoFlowPasso.findMany({
-    where: { projetoId, ativo: true },
-    orderBy: { ordemPadrao: "asc" },
+  const flowStepRows = await prisma.iaFlowStep.findMany({
+    where: { projetoId, personaChave: "assistente", fase, ativo: true },
+    orderBy: { ordem: "asc" },
   });
 
-  if (rows.length === 0) {
-    const seedData = DEFAULT_FLOW_PASSOS.map(p => ({
-      projetoId,
-      ativo: true,
-      chave: p.chave,
-      pergunta: p.pergunta,
-      campoColetar: p.campoColetar,
-      ordemPadrao: p.ordemPadrao,
-      skipSe: p.skipSe as any,
-      tipoEspecial: p.tipoEspecial,
-    }));
-    await prisma.iaVinculoFlowPasso.createMany({ data: seedData, skipDuplicates: true });
-    rows = await prisma.iaVinculoFlowPasso.findMany({
-      where: { projetoId, ativo: true },
-      orderBy: { ordemPadrao: "asc" },
-    });
-  }
-
-  const passos: FlowPasso[] = rows.map(r => ({
+  const passos: FlowPasso[] = flowStepRows.map(r => ({
     chave: r.chave,
     pergunta: r.pergunta,
-    campoColetar: r.campoColetar,
-    ordemPadrao: r.ordemPadrao,
+    campoColetar: r.campoColetar ?? null,
+    ordemPadrao: r.ordem,
     ativo: r.ativo,
     skipSe: r.skipSe as Record<string, any> | null,
-    tipoEspecial: r.tipoEspecial,
+    tipoEspecial: r.stepType === "mais_empregos" ? "mais_empregos"
+      : r.stepType === "open_question" ? "open_question"
+      : null,
   }));
 
-  _flowPassosCache[projetoId] = { passos, ts: Date.now() };
+  _flowPassosCache[cacheKey] = { passos, ts: Date.now() };
   return passos;
 }
 
@@ -92,18 +67,23 @@ function shouldSkipPasso(
   merged?: Record<string, unknown>,
 ): boolean {
   if (!passo.skipSe) return false;
-  const { campo, contem_qualquer } = passo.skipSe as { campo?: string; contem_qualquer?: string[] };
+  const skipSe = passo.skipSe as {
+    campo?: string;
+    contem_qualquer?: string[];
+    ordem_maior_que?: number;
+  };
+
+  // Skip if vinculo.ordem > N (used to restrict questions to recent employer only)
+  if (skipSe.ordem_maior_que !== undefined && vinculo.ordem > skipSe.ordem_maior_que) return true;
+
+  const { campo, contem_qualquer } = skipSe;
   if (!campo || !Array.isArray(contem_qualquer) || contem_qualquer.length === 0) return false;
   const norm = (s: string) => s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
   const anyMatch = (val: string) => contem_qualquer.some(v => val.includes(norm(v)));
 
-  // Primary check: the field on the vínculo object itself
   const valorCampo = norm(String((vinculo as any)[campo] ?? ""));
   if (anyMatch(valorCampo)) return true;
 
-  // Fallback: check flat merged field when vinculo field is empty.
-  // Handles the case where CLT/autônomo was answered before empresa was mentioned,
-  // so vinculo.vinculo is null even though merged.vinculo_recente has the value.
   if (merged && campo === "vinculo") {
     const flatVal = norm(String(merged.vinculo_recente ?? ""));
     if (flatVal && anyMatch(flatVal)) return true;
@@ -112,18 +92,42 @@ function shouldSkipPasso(
   return false;
 }
 
-function parseTempToMeses(tempo: string): number {
+export function parseTempToMeses(tempo: string): number {
   if (!tempo) return 999;
-  const t = tempo.toLowerCase();
+  // Normalizar números por extenso
+  let t = tempo.toLowerCase()
+    .replace(/\bum\b|\buma\b/gi, "1").replace(/\bdois\b|\bduas\b/gi, "2")
+    .replace(/\btrês\b|\btres\b/gi, "3").replace(/\bquatro\b/gi, "4")
+    .replace(/\bcinco\b/gi, "5").replace(/\bseis\b/gi, "6")
+    .replace(/\bsete\b/gi, "7").replace(/\boito\b/gi, "8")
+    .replace(/\bnove\b/gi, "9").replace(/\bdez\b/gi, "10")
+    .replace(/\bonze\b/gi, "11").replace(/\bdoze\b/gi, "12");
+  // "menos de X meses" → X-1 (fica abaixo do limite)
+  t = t.replace(/menos\s+de\s+(\d+)/gi, (_, n) => String(parseInt(n) - 1));
   let meses = 0;
-  const anosMatch = t.match(/(\d+)\s*ano/);
-  const mesesMatch = t.match(/(\d+)\s*m[eê]s/);
-  if (anosMatch)  meses += parseInt(anosMatch[1]) * 12;
-  if (mesesMatch) meses += parseInt(mesesMatch[1]);
-  if (!anosMatch && !mesesMatch) {
+  // Aceita decimais com vírgula ou ponto ("1,5 meses", "2.5 anos") — sem isso a regex
+  // capturava só o dígito após a vírgula ("1,5 meses" → 5 meses) e o pivot não disparava.
+  const num = (s: string) => parseFloat(s.replace(",", "."));
+  const anosMatch  = t.match(/(\d+(?:[.,]\d+)?)\s*ano/);
+  const mesesMatch = t.match(/(\d+(?:[.,]\d+)?)\s*m[eê]s/);
+  const semMatch   = t.match(/(\d+)\s*semana/);
+  const diasMatch  = t.match(/(\d+)\s*dia/);
+  if (anosMatch)  meses += Math.floor(num(anosMatch[1]) * 12);
+  if (mesesMatch) meses += Math.floor(num(mesesMatch[1]));
+  if (semMatch && !anosMatch && !mesesMatch) meses += Math.round(parseInt(semMatch[1]) / 4.3);
+  if (diasMatch && !anosMatch && !mesesMatch && !semMatch) meses += parseInt(diasMatch[1]) / 30;
+  if (!anosMatch && !mesesMatch && !semMatch && !diasMatch) {
+    // Intervalo de anos: "de 2020 até janeiro de 2026", "2021 a 2025"
+    const yr = t.match(/\b((?:19|20)\d{2})\b[^.]{0,60}?\b((?:19|20)\d{2})\b/);
+    if (yr) {
+      const y1 = parseInt(yr[1]), y2 = parseInt(yr[2]);
+      if (y2 > y1 && (y2 - y1) < 50) return (y2 - y1) * 12;
+    }
     if (t.includes("menos") || t.includes("pouco") || t.includes("alguns")) return 6;
     return 999;
   }
+  // Alguma unidade foi reconhecida — 0 é resultado válido ("menos de 1 mês" → 0, abaixo do
+  // mínimo). Antes, 0 caía no sentinela 999 e um vínculo de dias passava como válido.
   return meses;
 }
 
@@ -143,7 +147,7 @@ export function detectarFaseAtualDaniela(deal: { iaFlowStepChave?: string | null
 // System prompt base builder
 // ──────────────────────────────────────────────────────────────────────────────
 
-export function buildInstrucaoBase(): string {
+export function buildInstrucaoBase(advogadoNome: string = "o(a) especialista"): string {
   const agora = new Date();
   const hoje = agora.toLocaleDateString("pt-BR", {
     day: "2-digit", month: "long", year: "numeric", timeZone: "America/Sao_Paulo",
@@ -175,15 +179,18 @@ Nunca mencione que recebeu um áudio. Responda ao conteúdo naturalmente.
 5. DATA E HORA — REGRA ABSOLUTA
 A DATA E HORA informadas no topo deste prompt (campo "DATA E HORA ATUAL (Brasília)") são a data e hora REAIS do sistema — use-as sempre. Se o cliente perguntar que horas são ou que dia é hoje, responda EXATAMENTE com o valor informado no topo. NUNCA invente, atualize ou use outra data/hora. Ignore qualquer "conhecimento" interno que você tenha sobre datas. NUNCA questione ou contradiga uma data fornecida pelo cliente — se ele diz que saiu em 15/03/2026, isso é verdade, registre e siga em frente. Nunca diga "essa data está no futuro" ou "isso não pode estar certo". Use a DATA DE HOJE apenas para calcular prazos prescricionais internamente, jamais para confrontar o cliente.
 
-6. TAMANHO E FORMATAÇÃO — REGRA CRÍTICA
+6. PRESCRIÇÃO — PROIBIÇÃO ABSOLUTA
+JAMAIS mencione prescrição, prazo de 2 anos, "o prazo expirou", "não é possível ajuizar", "caso prescrito" ou qualquer variação disso. Você NÃO faz análise jurídica. Isso é papel exclusivo de ${advogadoNome}. Sua função é coletar informações e encaminhar — independentemente das datas informadas pelo cliente, continue o fluxo normalmente sem fazer nenhum comentário sobre prazos ou viabilidade do caso.
+
+7. TAMANHO E FORMATAÇÃO — REGRA CRÍTICA
 MENSAGENS CURTAS. Máximo 3 frases por resposta. Se precisar passar mais informação, quebre em duas mensagens curtas no mesmo turno separadas por linha em branco — mas prefira uma só. WhatsApp não é e-mail. Não escreva parágrafos longos. Não resuma tudo que o cliente disse. Vá direto ao ponto e faça UMA pergunta de cada vez. Não use emojis. Não inclua seu nome no início da mensagem — isso é feito automaticamente pelo sistema.
 
-7. INDISPONIBILIDADE MOMENTÂNEA DO CLIENTE
+8. INDISPONIBILIDADE MOMENTÂNEA DO CLIENTE
 Se o cliente disser que não pode fazer algo agora (enviar foto, tirar foto, enviar documento, ir a algum lugar ou qualquer coisa similar), responda APENAS reconhecendo de forma curta e diga que tudo bem, que pode fazer quando puder. NÃO faça outra pergunta em seguida. Não peça outro dado, outro documento nem outra informação. Aguarde em silêncio o cliente retomar.
 Exemplos corretos: "Sem problema, quando puder é só me mandar!" / "Tudo bem, pode enviar quando der, sem pressa."
 Exemplos PROIBIDOS: qualquer pergunta nova ou solicitação de outro dado após o cliente dizer que não pode fazer algo agora.
 
-8. DOCUMENTOS RECEBIDOS — LEITURA AUTOMÁTICA
+9. DOCUMENTOS RECEBIDOS — LEITURA AUTOMÁTICA
 Quando a mensagem começa com "[Documento recebido — dados extraídos]", significa que o sistema JÁ leu e extraiu o texto do documento automaticamente (OCR). O texto completo extraído está logo abaixo dessa linha. VOCÊ DEVE:
   a) Ler o texto extraído e identificar os dados relevantes (nome, CPF, RG, CNH, endereço, data, valor, empresa, etc.)
   b) Apresentar UMA confirmação rápida e humana dos dados encontrados, como: "Peguei sua CNH — número 12345678, categoria B, válida até 15/08/2028. Confere?"
@@ -199,6 +206,20 @@ A CNH Digital exportada pelo aplicativo "Carteira Digital de Trânsito" (CDT) ou
 // Deterministic question selectors
 // ──────────────────────────────────────────────────────────────────────────────
 
+// Template substitution: replaces {{empresa}} with the company name
+function sub(pergunta: string, empresa: string | null | undefined): string {
+  if (empresa) return pergunta.replace(/\{\{empresa\}\}/g, empresa);
+  // Sem empresa conhecida: "Antes da {{empresa}}" → "Antes disso" (evita "Antes da essa empresa").
+  return pergunta
+    .replace(/\b(da|de|do|na|no)\s+\{\{empresa\}\}/gi, "disso")
+    .replace(/\{\{empresa\}\}/g, "essa empresa");
+}
+
+export interface VinculoQuestionResult {
+  pergunta: string;
+  passoChave: string | null;
+}
+
 export async function getNextVinculoQuestion(
   projetoId: string,
   merged: Record<string, unknown>,
@@ -206,25 +227,24 @@ export async function getNextVinculoQuestion(
   vinculosOk: boolean,
   vinculosTodosPrescritos: boolean,
   empresasBloqueadas: string[],
-): Promise<string | null> {
+): Promise<VinculoQuestionResult | null> {
   if (vinculosOk || vinculosTodosPrescritos) return null;
-  if (merged._mais_empregos_negado === true) return null;
+  // D2 FIX: _mais_empregos_negado NÃO interrompe a coleta de campos do v0.
+  // O check foi movido para APÓS o loop de passosNormais — só bloqueia a pergunta
+  // mais_empregos quando todos os campos do vínculo atual já foram coletados.
+  // Antes, saía imediatamente quando empresa != null, mesmo com vinculo/saida ausentes.
 
-  const passos = await getFlowPassos(projetoId);
+  // Determine which flow to use based on whether we're collecting an anterior employer
+  const isAnterior = merged._mais_empregos_confirmado === true || vinculos.some(v => v.ordem > 1);
+  const fase = isAnterior ? "vinculos_anterior" : "vinculos_recente";
 
+  const passos = await getFlowPassos(projetoId, fase);
   const passosNormais = passos.filter(p => p.tipoEspecial !== "mais_empregos" && p.campoColetar);
   const passoMaisEmpregos = passos.find(p => p.tipoEspecial === "mais_empregos");
 
-  // Fields that are optional for previous employers (ordem > 1).
-  // The lead often ignores these when impatient — don't insist.
-  const CAMPOS_OPCIONAIS_ANTERIOR: Array<keyof VinculoEmprego> = [
-    "horas_extras", "pagamento_fora", "injustica", "frota",
-  ];
-
-  if (vinculos.length === 0) {
-    const primeiro = passosNormais[0];
-    return primeiro?.pergunta ?? "Em qual empresa você trabalhou?";
-  }
+  // Campos that have been asked 2+ times without answer are skipped to avoid loops.
+  // Tracked via merged._q_skipped (array of step chaves).
+  const qSkipped: string[] = Array.isArray(merged._q_skipped) ? merged._q_skipped as string[] : [];
 
   const isEmpresaBloqueada = (empresa: string | null | undefined): boolean => {
     if (!empresa || empresasBloqueadas.length === 0) return false;
@@ -234,72 +254,224 @@ export async function getNextVinculoQuestion(
     );
   };
 
-  const primeiroIncompleto = vinculos.find(v => {
-    if (isEmpresaBloqueada(v.empresa)) return false;
-    return passosNormais.some(p => {
-      const campo = p.campoColetar as keyof VinculoEmprego;
-      if (v.ordem > 1 && CAMPOS_OPCIONAIS_ANTERIOR.includes(campo)) return false;
-      const val = v[campo];
-      return (val === undefined || val === null || val === "") && !shouldSkipPasso(p, v, merged);
-    });
-  });
-  const alvoVinculo = primeiroIncompleto ?? vinculos[vinculos.length - 1];
+  const ret = (pergunta: string, chave: string | null): VinculoQuestionResult =>
+    ({ pergunta, passoChave: chave });
 
-  if (isEmpresaBloqueada(alvoVinculo.empresa)) {
-    console.log(`[VinculoFlow] Empresa bloqueada: "${alvoVinculo.empresa}" — pulando para mais_empregos`);
-    return passoMaisEmpregos?.pergunta?.replace("lá", `na ${alvoVinculo.empresa}`)
-      ?? `A ${alvoVinculo.empresa} infelizmente não é uma empresa que atendemos no momento. Antes disso, você trabalhou em outro lugar nos últimos 2 anos?`;
+  // Find the target vinculos entry for this phase
+  let alvoVinculo: VinculoEmprego | null = null;
+  if (!isAnterior) {
+    alvoVinculo = vinculos.find(v => v.ordem === 1) ?? null;
+  } else {
+    const anteriorVinculos = vinculos.filter(v => v.ordem > 1);
+    if (anteriorVinculos.length === 0) {
+      // mais_empregos confirmado mas sem entrada ainda — pergunta ABERTA primeiro (uma vez),
+      // depois a pergunta específica de empresa como resíduo.
+      const pOpenAnt = passos.find(p => p.tipoEspecial === "open_question");
+      if (pOpenAnt && !qSkipped.includes(pOpenAnt.chave) && merged[`_${pOpenAnt.chave}_enviada`] !== true) {
+        merged[`_${pOpenAnt.chave}_enviada`] = true;
+        return ret(pOpenAnt.pergunta, pOpenAnt.chave);
+      }
+      const p0 = passosNormais[0];
+      return p0 ? ret(p0.pergunta, p0.chave) : null;
+    }
+    // Find first incomplete anterior vinculos
+    alvoVinculo = anteriorVinculos.find(v =>
+      !isEmpresaBloqueada(v.empresa) &&
+      passosNormais.some(p => {
+        if (qSkipped.includes(p.chave)) return false;
+        const campo = p.campoColetar as keyof VinculoEmprego;
+        const val = v[campo];
+        return (val === undefined || val === null || val === "") && !shouldSkipPasso(p, v, merged);
+      })
+    ) ?? null;
   }
 
-  const SAIDA_INFERIDA = ['saiu', 'já saiu', 'saiu da empresa', 'deixou a empresa', 'não trabalha mais'];
+  // Empresa bloqueada — check abrangente ANTES de qualquer retorno do loop
+  // Cobre: alvoVinculo.empresa, vinculos[0] do array passado, merged.empresa_recente/principal
+  // (merged.empresa_recente só é sincronizado de vinculos após _vinculos_ok, por isso o fallback duplo)
+  if (!isAnterior) {
+    const empresaParaBloquear: string | null =
+      (alvoVinculo?.empresa ?? null)
+      ?? (vinculos.find(v => v.ordem === 1)?.empresa ?? null)
+      ?? (Array.isArray(merged.vinculos) ? ((merged.vinculos as any[])[0]?.empresa ?? null) : null)
+      ?? (merged.empresa_recente as string | null)
+      ?? (merged.empresa_principal as string | null);
+    if (empresaParaBloquear && isEmpresaBloqueada(empresaParaBloquear)) {
+      // Se lead já negou ter mais empregos → retorna null para que assistente-agents
+      // entre no bloco allDone e dispare o gate empresa_bloqueada com forceDescarte.
+      // tem_emprego_anterior só conta como negação se a pergunta foi feita de fato
+      // (extração pode alucinar false a partir de relatos — caso Nelson 11/06).
+      const maisEmpregosNegado = merged._mais_empregos_negado === true
+        || (merged._mais_empregos_perguntado === true &&
+            (merged.tem_emprego_anterior === false || merged.tem_emprego_anterior === "false"
+             || merged.tem_emprego_anterior === "nao" || merged.tem_emprego_anterior === "não"));
+      if (maisEmpregosNegado) {
+        console.log(`[VinculoFlow] Empresa bloqueada "${empresaParaBloquear}" + mais_empregos negado → null (deixa assistente-agents disparar gate)`);
+        return null;
+      }
+      console.log(`[VinculoFlow] Empresa bloqueada: "${empresaParaBloquear}" — pulando para mais_empregos`);
+      return passoMaisEmpregos
+        ? ret(sub(passoMaisEmpregos.pergunta, empresaParaBloquear), passoMaisEmpregos.chave)
+        : null;
+    }
+  }
 
+  // Pergunta ABERTA (modo sequencial v2): convite ao relato livre, UMA vez por fase,
+  // antes das perguntas específicas. Os campos que o relato cobrir são extraídos pelo
+  // processVinculos e somente o RESÍDUO é perguntado individualmente depois.
+  // Pulada quando o lead já contou a história espontaneamente (2+ campos narrativos no vínculo).
+  const passoOpen = passos.find(p => p.tipoEspecial === "open_question");
+  if (passoOpen && !qSkipped.includes(passoOpen.chave)) {
+    const flagOpen = `_${passoOpen.chave}_enviada`;
+    const camposNarrativos: Array<keyof VinculoEmprego> = ["funcao", "tempo", "saida", "horas_extras", "pagamento_fora", "injustica"];
+    const contados = alvoVinculo
+      ? camposNarrativos.filter(k => alvoVinculo![k] != null && alvoVinculo![k] !== "").length
+      : 0;
+    if (merged[flagOpen] !== true && contados < 2) {
+      merged[flagOpen] = true; // persistido pelo stage-engine no mesmo turno (flags "_" novas)
+      return ret(sub(passoOpen.pergunta, alvoVinculo?.empresa ?? null), passoOpen.chave);
+    }
+  }
+
+  // No target entry yet → ask first question (respecting skipped steps)
+  if (!alvoVinculo) {
+    if (!isAnterior) {
+      // Autônomo declarado sem nenhuma empresa citada: não há vínculo para detalhar — pergunta
+      // direto sobre emprego anterior CLT. A negação seta _mais_empregos_negado e o gate
+      // vinculo_invalido descarta (antes: coletava campos de um vínculo inexistente para sempre).
+      const semEmpresaCitada = !vinculos.some(v => !!v.empresa);
+      const naoCltDeclarado = merged.e_clt === false ||
+        (merged.vinculo_recente != null && !/clt|carteira/i.test(String(merged.vinculo_recente)) &&
+         /autônomo|autonomo|\bpj\b|cooperado|agregado|conta própria|conta propria|freteiro/i.test(String(merged.vinculo_recente)));
+      if (semEmpresaCitada && naoCltDeclarado && passoMaisEmpregos && !qSkipped.includes(passoMaisEmpregos.chave)) {
+        if (merged._mais_empregos_negado === true) return null;
+        console.log(`[VinculoFlow] Autônomo sem empresa citada → pivot mais_empregos direto`);
+        return ret(
+          "Entendi! E antes disso, você trabalhou com carteira assinada em alguma empresa nos últimos 2 anos?",
+          passoMaisEmpregos.chave,
+        );
+      }
+      const p0 = passosNormais.find(p => !qSkipped.includes(p.chave));
+      return p0 ? ret(p0.pergunta, p0.chave) : null;
+    }
+    // All anterior vinculos complete — ask mais_empregos for another potential employer
+    // Se lead já negou ter mais empregos → retorna null para que assistente-agents
+    // entre no bloco nenhumVinculoValido e dispare o gate correto.
+    const maisEmpregosNegadoAnt = merged._mais_empregos_negado === true
+      || (merged._mais_empregos_perguntado === true &&
+          (merged.tem_emprego_anterior === false || merged.tem_emprego_anterior === "false"
+           || merged.tem_emprego_anterior === "nao" || merged.tem_emprego_anterior === "não"));
+    if (maisEmpregosNegadoAnt) {
+      console.log(`[VinculoFlow] Todos anteriores completos + mais_empregos negado → null (assistente-agents trata)`);
+      return null;
+    }
+    const ultimoAnterior = vinculos.filter(v => v.ordem > 1).at(-1);
+    return passoMaisEmpregos
+      ? ret(sub(passoMaisEmpregos.pergunta, ultimoAnterior?.empresa), passoMaisEmpregos.chave)
+      : null;
+  }
+
+  // Vínculo inválido (muito curto OU não-CLT): pular coleta detalhada e ir direto para mais_empregos.
+  // Aplica tanto para emprego recente quanto anterior.
+  // mesesMin e mensagem de pivot lidos do gate tempo_minimo do projeto (fallback: 2 meses).
+  const gateTempoMinimo = await getTempoMinimoGate(projetoId);
+  const mesesMinBase = gateTempoMinimo?.mesesMin ?? 2;
+  // CLT/carteira tem prioridade: vínculo misto ("metade CLT, depois PJ") qualifica.
+  // RECONHECIMENTO DE VÍNCULO: "informal"/"sem registro"/"PJ forçado" (pejotização) NÃO são não-CLT
+  // — motorista subordinado sem carteira qualifica. Só é não-CLT a autonomia real (dono do
+  // caminhão: autônomo/agregado/TAC, cooperado, avulso, app).
+  const isNaoClt = (vinculo: string | null | undefined) =>
+    vinculo != null && !/clt|carteira/i.test(String(vinculo))
+    && /autônomo|autonomo|avulso|cooperado|agregado|\btac\b/i.test(String(vinculo));
+
+  if (alvoVinculo.empresa) {
+    const tempoMesAlvo = alvoVinculo.tempo ? parseTempToMeses(String(alvoVinculo.tempo)) : null;
+    const vinculoCurto  = tempoMesAlvo !== null && tempoMesAlvo < mesesMinBase;
+    const vinculoNaoClt = isNaoClt(alvoVinculo.vinculo);
+
+    if ((vinculoCurto || vinculoNaoClt) && passoMaisEmpregos && !qSkipped.includes(passoMaisEmpregos.chave)) {
+      const nomeCliente = typeof merged.nome === "string" ? merged.nome.split(" ")[0].trim() : "";
+      const pivotMsg = gateTempoMinimo?.mensagemLead
+        ? renderNomePlaceholder(gateTempoMinimo.mensagemLead, nomeCliente)
+        : sub(passoMaisEmpregos.pergunta, alvoVinculo.empresa);
+      return ret(pivotMsg, passoMaisEmpregos.chave);
+    }
+    // Sem passoMaisEmpregos disponível → encerra coleta deste vínculo
+    if ((vinculoCurto || vinculoNaoClt)) return null;
+  }
+
+  const SAIDA_INFERIDA = ["saiu", "já saiu", "saiu da empresa", "deixou a empresa", "não trabalha mais"];
+
+  // Iterate flow steps — ask first missing campo (skip already-attempted ones)
   for (const passo of passosNormais) {
+    if (qSkipped.includes(passo.chave)) continue;
     const campo = passo.campoColetar as keyof VinculoEmprego;
-    if (alvoVinculo.ordem > 1 && CAMPOS_OPCIONAIS_ANTERIOR.includes(campo)) continue;
     const val = alvoVinculo[campo];
     const faltando = val === undefined || val === null || val === ""
-      || (campo === 'saida' && SAIDA_INFERIDA.includes(String(val).toLowerCase().trim()));
+      || (campo === "saida" && SAIDA_INFERIDA.includes(String(val).toLowerCase().trim()));
     if (!faltando) continue;
-
     if (shouldSkipPasso(passo, alvoVinculo, merged)) continue;
-
-    if (campo === "saida" && alvoVinculo.ordem > 1) {
-      const empresa = alvoVinculo.empresa ?? "essa empresa";
-      return `Como foi o desligamento da ${empresa} — foi demitido ou pediu demissão? E quando foi isso?`;
+    // Caso Nelson 11/06: se o lead JÁ contou a história (função/tempo/saída presentes) e só falta
+    // o nome da empresa, o passo de abertura ("Agora me conta do seu emprego...") soa robótico e
+    // repetido. Usa o passo direto de empresa (ex: nome_empresa_rec — "Qual era o nome da empresa?").
+    if (campo === "empresa" && (alvoVinculo.funcao || alvoVinculo.tempo || alvoVinculo.saida)) {
+      const passoDireto = [...passosNormais].reverse().find(p =>
+        p.campoColetar === "empresa" && p.chave !== passo.chave && !qSkipped.includes(p.chave));
+      if (passoDireto) return ret(sub(passoDireto.pergunta, alvoVinculo.empresa), passoDireto.chave);
     }
-
-    if (campo === "tempo" && alvoVinculo.ordem > 1) {
-      const empresa = alvoVinculo.empresa ?? "essa empresa anterior";
-      return `Quanto tempo você trabalhou na ${empresa}?`;
-    }
-
-    return passo.pergunta;
+    return ret(sub(passo.pergunta, alvoVinculo.empresa), passo.chave);
   }
 
-  const ultimoVinculo = vinculos[vinculos.length - 1];
-  const nomeEmpresa = ultimoVinculo?.empresa ?? "empresa anterior";
-
-  // Gate: need data_saida before asking about previous employers.
-  // Without a departure date, prescricao check defaults to "within 2 years" and
-  // asks about anterior incorrectly. Only skip the gate if client is still employed.
-  if (!merged._mais_empregos_confirmado) {
-    const aindaEmpregado = /ainda (est[áa]|trabalh|empregad)/i.test(String(ultimoVinculo?.saida ?? ""));
-    if (!aindaEmpregado && !ultimoVinculo?.data_saida) {
-      const empresa = nomeEmpresa;
-      return `Quando você saiu da ${empresa}? Me passa o mês e o ano aproximado.`;
-    }
+  // FIX: empresa é campo obrigatório — não pode ficar null por _q_skipped.
+  // Se todos os passos de empresa foram pulados mas empresa ainda é null, perguntar mesmo assim.
+  if (!alvoVinculo.empresa) {
+    const empPasso = [...passosNormais].reverse().find(p => p.campoColetar === "empresa");
+    if (empPasso) return ret(sub(empPasso.pergunta, null), empPasso.chave);
   }
 
-  if (merged._mais_empregos_confirmado === true) {
-    return `Em qual empresa você trabalhou antes da ${nomeEmpresa}?`;
+  // All passosNormais done for this vinculos
+
+  // data_saida gate: ask for a precise departure date when needed for prescription check.
+  const saida = String(alvoVinculo.saida ?? "");
+  const aindaEmpregado = /ainda (est[áa]|trabalh|empregad)/i.test(saida);
+  const temReferenciaTemporal = /\b(h[aá]\s*\d|dia[s]?\s+atr[aá]|m[eê]s(es)?\s+atr[aá]|ano\s+atr[aá]|\d+\s*(dia|m[eê]s|ano)|mês passado|ano passado|semana passada|faz\s+\d)/i.test(saida);
+  if (!aindaEmpregado && !alvoVinculo.data_saida && !temReferenciaTemporal) {
+    const gateChave = isAnterior ? "data_saida_gate_ant" : "data_saida_gate";
+    const gateStep = passos.find(p => p.chave === gateChave);
+    if (gateStep && !qSkipped.includes(gateChave)) return ret(sub(gateStep.pergunta, alvoVinculo.empresa), gateChave);
   }
 
-  const perguntaMaisEmpregos = passoMaisEmpregos?.pergunta
-    ?.replace("lá", `na ${nomeEmpresa}`)
-    ?? `Antes de trabalhar na ${nomeEmpresa}, você trabalhou em outro lugar nos últimos 2 anos?`;
+  // A pergunta "trabalhou em outro lugar nos últimos 2 anos?" é CONDICIONAL: só faz sentido
+  // para investigar OUTRO vínculo dentro da janela de prescrição. Se o vínculo atual já
+  // preenche essa janela (tenure ≥ 2 anos), não há "outro nos últimos 2 anos" a investigar —
+  // pula direto para o fechamento.
+  // parseTempToMeses normaliza meses E anos ("36 meses", "3 anos", "desde 2020"). Antes a
+  // detecção usava só um regex de "anos", então tenure em meses ("36 meses") escapava e o bot
+  // perguntava à toa mesmo com 3 anos de casa (caso Transmagna 20/06). 999 = tempo não
+  // reconhecido → NÃO pula (mantém a pergunta) para não fechar com tenure desconhecido.
+  const tempoMesesNum =
+    (typeof alvoVinculo.tempo_meses_estimado === "number" ? alvoVinculo.tempo_meses_estimado : null)
+    ?? (typeof merged.tempo_meses_estimado === "number" ? merged.tempo_meses_estimado : null);
+  const tempoTexto = String(alvoVinculo.tempo ?? (isAnterior ? "" : merged.tempo_recente ?? "")).trim();
+  const mesesTenure = tempoMesesNum ?? (tempoTexto ? parseTempToMeses(tempoTexto) : 0);
+  const empregoLongo = mesesTenure >= 24 && mesesTenure < 900;
+  // empregoLongo só retorna null se empresa já foi coletada.
+  if (empregoLongo && alvoVinculo.empresa) return null;
 
-  return perguntaMaisEmpregos;
+  // D2 FIX: só bloqueia mais_empregos quando lead já negou E todos os passosNormais estão feitos.
+  // Chegando aqui, todos os campos do alvoVinculo foram coletados ou explicitamente pulados.
+  if (merged._mais_empregos_negado === true) return null;
+
+  // Ask mais_empregos — only if not already skipped after 2 unanswered attempts
+  if (passoMaisEmpregos && !qSkipped.includes(passoMaisEmpregos.chave)) {
+    return ret(sub(passoMaisEmpregos.pergunta, alvoVinculo.empresa), passoMaisEmpregos.chave);
+  }
+  return null;
 }
+
+// Bubbled up from getNextVinculoQuestion for attempt-tracking in stage-engine
+let _lastVinculoStepChave: string | null = null;
+export function getLastVinculoStepChave(): string | null { return _lastVinculoStepChave; }
 
 export async function getNextDeterministicQuestion(
   projetoId: string,
@@ -310,6 +482,10 @@ export async function getNextDeterministicQuestion(
   empresasBloqueadas: string[],
   outgoingCount: number,
 ): Promise<string | null> {
+  // Reset on every call — module-level state persists across deals in the same PM2 worker.
+  // A stale value from a different deal's request would incorrectly trigger _last_dq tracking.
+  _lastVinculoStepChave = null;
+
   if (!merged._saudacao_enviada) {
     const { getGreetingStep } = await import("./flow-controller.js");
     const greeting = await getGreetingStep(projetoId);
@@ -319,12 +495,7 @@ export async function getNextDeterministicQuestion(
   const { getNextPreVinculosQuestion, getNextPosVinculosQuestion } = await import("./flow-controller.js");
 
   const preQ = await getNextPreVinculosQuestion(projetoId, merged);
-  if (preQ === undefined) {
-    const nomeConhecido = typeof merged.nome === "string" && merged.nome.trim().length > 1;
-    if (!nomeConhecido) return "Qual é o seu nome?";
-    if (!merged.cidade) return "De qual cidade você é?";
-    if (!merged.plataforma_anuncio) return "Você viu nosso anúncio onde? Instagram, Facebook, TikTok ou indicação?";
-  } else if (preQ) {
+  if (preQ) {
     return preQ;
   }
 
@@ -332,36 +503,28 @@ export async function getNextDeterministicQuestion(
     const nextVinculo = await getNextVinculoQuestion(
       projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas,
     );
-    if (nextVinculo) return nextVinculo;
+    // Return the question text; bubble up passoChave via module-level for stage-engine tracking
+    if (nextVinculo) {
+      _lastVinculoStepChave = nextVinculo.passoChave;
+      return nextVinculo.pergunta;
+    }
+    _lastVinculoStepChave = null;
   }
 
-  // Mandatory calc fields — ask after basic vinculo collected, before pos-vinculos.
-  // These are required for calc-trabalhista to produce a correct value estimate.
-  if (!vinculosTodosPrescritos && vinculos.length > 0) {
-    const mainV = vinculos.find((v: VinculoEmprego) => v.ordem === 1) ?? vinculos[0];
-    if (!mainV.tempo && !mainV.tempo_meses_estimado && !merged.tempo_meses_estimado)
-      return "Quanto tempo você trabalhou nessa empresa? (pode ser em meses ou anos)";
-    if (!mainV.salario_holerite && !merged.salario_holerite)
-      return "Qual era o valor do seu salário na carteira de trabalho? (o valor do holerite mesmo)";
-    const pagouExtra = mainV.pagamento_fora ?? merged.pagamento_fora;
-    const pagouExtraPositivo = pagouExtra && !/^(não|nao|nenhum|0|zero|nunca)/i.test(String(pagouExtra).trim());
-    if (pagouExtraPositivo && !mainV.salario_por_fora && !merged.salario_por_fora)
-      return "E quanto você recebia por fora por mês em média? (Pix, dinheiro, comissão)";
-    if (!mainV.jornada_inicio && !merged.jornada_inicio)
-      return "Qual era seu horário de trabalho? Que horas você começava e que horas terminava normalmente?";
-  }
-
-  if (!vinculosTodosPrescritos) {
+  // FIX: pos_vinculos só executa se empresa do vínculo principal já foi coletada.
+  // Se empresa ainda é null, não há pós-vinculos válido — o fluxo deve permanecer em coleta.
+  const _mainVinculoPos = vinculos.find((v: VinculoEmprego) => v.ordem === 1);
+  const _empresaPosOk = !!_mainVinculoPos?.empresa;
+  if (!vinculosTodosPrescritos && !vinculosOk && _empresaPosOk) {
     if (!merged._pos_vinculos_fase) {
-      const mainVinculo = vinculos.find((v: VinculoEmprego) => v.ordem === 1);
-      if (mainVinculo?.tempo) {
-        const meses = parseTempToMeses(String(mainVinculo.tempo));
+      if (_mainVinculoPos?.tempo) {
+        const meses = parseTempToMeses(String(_mainVinculoPos.tempo));
         merged._pos_vinculos_fase = meses <= 18 ? "pos_vinculos_curto" : "pos_vinculos";
       }
     }
     const posFase = (merged._pos_vinculos_fase as string) || "pos_vinculos";
 
-    const mainV = vinculos.find((v: VinculoEmprego) => v.ordem === 1);
+    const mainV = _mainVinculoPos;
     if (mainV) {
       if (merged.horas_extras === undefined || merged.horas_extras === null)
         merged.horas_extras = mainV.horas_extras ?? null;
@@ -406,15 +569,19 @@ export async function getNextDeterministicQuestion(
     }
 
     const posQ = await getNextPosVinculosQuestion(projetoId, merged, posFase);
-    if (posQ === undefined) {
-      if (!merged.interesse) {
-        return "Você gostaria de entender o que seria possível recuperar no seu caso?";
-      }
-      // melhor_hora_contato and acao_em_andamento removed — Dra. Daniela handles those
-    } else if (posQ) {
-      return posQ;
-    }
+    if (posQ) return posQ;
   }
 
   return null;
+}
+
+/**
+ * Retorna a pergunta do passo mais_empregos do fluxo vinculos_anterior.
+ * Usada como fallback quando nenhum vínculo válido existe mas o lead pode ter outros empregos.
+ */
+export async function getMaisEmpregosAnteriorQuestion(projetoId: string, ultimaEmpresa: string | null): Promise<string | null> {
+  const passos = await getFlowPassos(projetoId, "vinculos_anterior");
+  const passo = passos.find(p => p.tipoEspecial === "mais_empregos");
+  if (!passo) return null;
+  return sub(passo.pergunta, ultimaEmpresa);
 }

@@ -35,20 +35,32 @@ export async function persistMergedUpdates(
 }
 
 export async function createInitialDeal(projetoId: string, contatoId: string, nome: string) {
+  // 1. Pipeline explícito via IaProjetoConfig (chave pipeline_entrada_id) — fonte mais confiável
+  const pipelineConfig = await prisma.iaProjetoConfig.findFirst({
+    where: { projetoId, chave: "pipeline_entrada_id" },
+  });
+  const pipelineEntradaId = pipelineConfig?.valor || undefined;
+
   const faseEntrada = await prisma.iaFaseFunil.findFirst({
     where: { projetoId, ehEntrada: true, pipelineTipo: "comercial" },
     orderBy: { ordem: "asc" },
   });
 
+  // Resolve pipelineId: config explícita > IaFaseFunil
+  const resolvedPipelineId = pipelineEntradaId ?? faseEntrada?.pipelineId;
+
   let stageId: string | undefined;
   let pipelineId: string | undefined;
 
-  if (faseEntrada?.pipelineId) {
+  if (resolvedPipelineId) {
     const stage = await prisma.crmStage.findFirst({
-      where: { pipelineId: faseEntrada.pipelineId, chave: faseEntrada.chave },
+      where: { pipelineId: resolvedPipelineId, ehEntrada: true },
+    }) ?? await prisma.crmStage.findFirst({
+      where: { pipelineId: resolvedPipelineId },
+      orderBy: { ordem: "asc" },
     });
     stageId = stage?.id;
-    pipelineId = faseEntrada.pipelineId;
+    pipelineId = resolvedPipelineId;
   }
 
   if (!stageId) {
@@ -64,6 +76,8 @@ export async function createInitialDeal(projetoId: string, contatoId: string, no
 
   if (!stageId || !pipelineId) throw new Error("Nenhum pipeline comercial configurado");
 
+  const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId }, select: { empresaId: true } });
+
   return prisma.crmDeal.create({
     data: {
       titulo: `${nome} — WhatsApp`,
@@ -71,6 +85,7 @@ export async function createInitialDeal(projetoId: string, contatoId: string, no
       stageId,
       contatoId,
       projetoId,
+      empresaId: projeto?.empresaId ?? undefined,
       iaAtiva: true,
       iaStageChave: faseEntrada?.chave ?? "lead_carreteiro",
       iaPersonaChave: faseEntrada?.personaChave ?? "assistente",

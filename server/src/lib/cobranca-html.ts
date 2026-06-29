@@ -63,10 +63,11 @@ export interface CartaCobrancaParams {
   boletoPdfEndpoint?:    string;  // URL para abrir o boleto PDF separadamente
   // NFS-e (se já emitida)
   nfse?: {
-    numero:      string;
-    emitidoEm?:  Date | null;
-    codigoVerif?: string | null;
-    linkNfse?:   string | null;
+    numero:           string;
+    emitidoEm?:       Date | null;
+    codigoVerif?:     string | null;
+    linkNfse?:        string | null;
+    qrcodeBase64?:    string;   // QR code da URL de autenticidade no portal da Prefeitura
   };
 }
 
@@ -337,28 +338,39 @@ export function gerarCartaCobrancaHtml(p: CartaCobrancaParams): string {
     <div style="background:#004a5c;color:#fff;padding:8px 12px;font-weight:bold;font-size:10pt;display:flex;align-items:center;gap:8px;">
       <span>🧾</span> Nota Fiscal de Serviços Eletrônica (NFS-e)
     </div>
-    <div style="padding:12px 14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">
-      <div>
-        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Número</div>
-        <div style="font-size:11pt;font-weight:bold;color:#004a5c;">${p.nfse.numero}</div>
-      </div>
-      ${p.nfse.emitidoEm ? `
-      <div>
-        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Data de Emissão</div>
-        <div style="font-size:10.5pt;">${new Date(p.nfse.emitidoEm).toLocaleDateString("pt-BR")}</div>
+    <div style="padding:12px 14px;display:flex;gap:14px;align-items:flex-start;">
+      ${p.nfse.qrcodeBase64 ? `
+      <div style="flex-shrink:0;text-align:center;">
+        <img src="${p.nfse.qrcodeBase64}" alt="QR Code NFS-e"
+             style="width:110px;height:110px;border:1px solid #dde4e8;border-radius:4px;display:block;">
+        <div style="font-size:7.5pt;color:#888;margin-top:4px;width:110px;line-height:1.3;">
+          Escaneie para verificar<br>no portal da Prefeitura
+        </div>
       </div>` : ""}
-      ${p.nfse.codigoVerif ? `
-      <div>
-        <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Código de Verificação</div>
-        <div style="font-size:10pt;font-family:monospace;letter-spacing:1px;">${p.nfse.codigoVerif}</div>
-      </div>` : ""}
-      ${p.nfse.linkNfse ? `
-      <div style="display:flex;align-items:flex-end;">
+      <div style="flex:1;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px 12px;margin-bottom:10px;">
+          <div>
+            <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Número</div>
+            <div style="font-size:11pt;font-weight:bold;color:#004a5c;">${p.nfse.numero}</div>
+          </div>
+          ${p.nfse.emitidoEm ? `
+          <div>
+            <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Data de Emissão</div>
+            <div style="font-size:10.5pt;">${new Date(p.nfse.emitidoEm).toLocaleDateString("pt-BR")}</div>
+          </div>` : ""}
+          ${p.nfse.codigoVerif ? `
+          <div>
+            <div style="font-size:8.5pt;color:#888;text-transform:uppercase;margin-bottom:2px;">Código de Verificação</div>
+            <div style="font-size:10pt;font-family:monospace;letter-spacing:1px;">${p.nfse.codigoVerif}</div>
+          </div>` : ""}
+        </div>
+        ${p.nfse.linkNfse ? `
         <a href="${p.nfse.linkNfse}" target="_blank"
-           style="display:inline-block;background:#004a5c;color:#fff;text-decoration:none;padding:6px 14px;border-radius:5px;font-size:9pt;font-weight:bold;">
+           style="display:inline-block;background:#004a5c;color:#fff;text-decoration:none;
+                  padding:7px 16px;border-radius:5px;font-size:9pt;font-weight:bold;">
           🔗 Acessar NFS-e no portal da Prefeitura
-        </a>
-      </div>` : ""}
+        </a>` : ""}
+      </div>
     </div>
   </div>` : ""}
 

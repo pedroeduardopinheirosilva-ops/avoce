@@ -5,6 +5,12 @@ interface NotaItem {
   id: string;
   numero?: string | null;
   status: string;
+  emitente?: { nfseProvider?: string | null } | null;
+}
+
+function getMunicipioLabel(nfseProvider?: string | null): string {
+  if (nfseProvider === "issnet_df") return "Brasília/DF";
+  return "Vitória da Conquista/BA";
 }
 
 function fmt(centavos: number) {
@@ -61,10 +67,10 @@ export default function Notas() {
   if (isLoading) return <div className="p-8 text-gray-500">Carregando...</div>;
 
   return (
-    <div className="p-8">
-      <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">NFS-e Emitidas</h1>
-        <div className="flex items-center gap-2">
+    <div className="p-4 md:p-8">
+      <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-6">
+        <h1 className="text-2xl font-bold text-gray-900 flex-1">NFS-e Emitidas</h1>
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={() => {
               if (!confirm("Verificar todas as notas emitidas no sistema da prefeitura e marcar as canceladas?\n\nIsso pode demorar alguns minutos dependendo da quantidade de notas.")) return;
@@ -94,7 +100,7 @@ export default function Notas() {
       )}
 
       {/* Filtros */}
-      <div className="flex gap-3 mb-4">
+      <div className="flex gap-3 mb-4 flex-wrap">
         <select value={filtroStatus} onChange={e => { setFiltroStatus(e.target.value); setPage(1); }}
           className="border border-gray-300 rounded-lg px-3 py-2 text-sm">
           <option value="">Todos os status</option>
@@ -201,7 +207,7 @@ export default function Notas() {
               </div>
 
               <div className="bg-gray-50 rounded-lg px-4 py-3 mb-4 text-sm text-gray-700">
-                <p>Você está prestes a cancelar a <strong>NFS-e nº {cancelModal.numero}</strong> na prefeitura de Vitória da Conquista.</p>
+                <p>Você está prestes a cancelar a <strong>NFS-e nº {cancelModal.numero}</strong> na prefeitura de {getMunicipioLabel(cancelModal.emitente?.nfseProvider)}.</p>
               </div>
 
               {cancelErro && (
