@@ -112,8 +112,8 @@ function ImportJsonModal({ onClose }: { onClose: () => void }) {
                   <p className="font-medium">✓ Importação concluída</p>
                   <p>{result.totalNoJson} leads no JSON</p>
                   <p>{result.contatosCriados} contatos criados</p>
-                  <p>{result.dealsCriados} deals criados no funil</p>
-                  <p>{result.dealsPulados} deals pulados (já existiam)</p>
+                  <p>{result.dealsCriados} leads criados no funil</p>
+                  <p>{result.dealsPulados} leads pulados (já existiam)</p>
                   {result.erros ? <p className="text-red-600">{result.erros} erros</p> : null}
                 </div>
               ) : (

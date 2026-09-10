@@ -7,10 +7,12 @@ import cron                 from "node-cron";
 import { prisma }           from "./db.js";
 import { processarTimeoutsAgente, recuperarMensagensPerdidas, processarHandoffsAtrasados } from "./agent/cron-agent.js";
 import { recordCronRun } from "./agent/cron-tracker.js";
+import { emSilencio }       from "./agent/quiet-hours.js";
 import { emitirNfse, type EmpresaConfig } from "./lib/nfse.js";
 import { certPathForEmpresa } from "./upload.js";
 import { consultarPix }     from "./lib/sicoob-pix.js";
 import { gerarCobrancaParaContrato } from "./lib/gerar-cobranca.js";
+import { enviarEmailCobranca }       from "./lib/email-cobranca.js";
 import { fieldDecrypt }             from "./lib/field-crypto.js";
 
 function competenciaAtual(): string {
@@ -277,6 +279,38 @@ export async function gerarCobrancasDoDia(): Promise<void> {
   console.log("[CRON-Cob] Geração de cobranças concluída");
 }
 
+// ── Reprocessamento de e-mails de cobrança (auto-cura) ───────────────────────
+// Roda a cada 30 min. Reenvia automaticamente cobranças recentes cujo e-mail
+// ficou PENDENTE ou FALHOU (ex.: SMTP fora do ar, Chromium indisponível no
+// momento do faturamento). Assim, uma falha transitória no dia da emissão é
+// corrigida sozinha nas horas seguintes, sem intervenção manual.
+export async function reprocessarEmailsCobranca(): Promise<void> {
+  const MAX_TENTATIVAS = 6;
+  const JANELA_DIAS    = 15;
+  const limite = new Date(Date.now() - JANELA_DIAS * 24 * 60 * 60 * 1000);
+
+  const pendentes = await prisma.cobranca.findMany({
+    where: {
+      emailStatus:     { in: ["PENDENTE", "FALHA"] },
+      emailTentativas: { lt: MAX_TENTATIVAS },
+      criadoEm:        { gte: limite },
+    },
+    select: { id: true },
+    orderBy: { criadoEm: "asc" },
+    take: 100,
+  });
+
+  if (!pendentes.length) return;
+  console.log(`[Email-Retry] Reprocessando ${pendentes.length} cobrança(s) com e-mail pendente/falha`);
+
+  for (const c of pendentes) {
+    await enviarEmailCobranca(c.id).catch((e) =>
+      console.error(`[Email-Retry] Erro ao reenviar cobrança ${c.id}:`, e));
+    await new Promise((r) => setTimeout(r, 1500)); // não sobrecarregar o SMTP
+  }
+  console.log("[Email-Retry] Reprocessamento concluído");
+}
+
 // ── Polling de status PIX pendentes (fallback para webhook) ──────────────────
 // Roda a cada 15 minutos e atualiza cobranças com PIX PENDENTE não expirados.
 
@@ -397,15 +431,30 @@ async function enviarLembretesReuniao(): Promise<void> {
     }
     const lembretes = lembretesCache.get(deal.projetoId)!;
 
-    // Check each lembrete's time window
-    for (const lembrete of lembretes) {
-      const flagKey = `_lembrete_${lembrete.horas}h_enviado`;
-      if (stepData[flagKey]) continue;
+    // Janela de silêncio: nada de lembrete de madrugada (caso Edgar 9312 — reunião 09:30 e
+    // lembrete disparado às 03:00). Sai sem marcar flag: o lembrete é retomado no primeiro
+    // tick após o fim do silêncio, tratado como "vencido" logo abaixo.
+    if (await emSilencio(deal.projetoId, agora)) continue;
 
-      const targetMs = lembrete.horas * 60 * 60 * 1000;
-      const windowMin = new Date(agora.getTime() + targetMs - JANELA_MIN * 60 * 1000);
-      const windowMax = new Date(agora.getTime() + targetMs + JANELA_MIN * 60 * 1000);
-      if (agendada < windowMin || agendada > windowMax) continue;
+    // Lembretes VENCIDOS (o horário-alvo já chegou ou passou) e ainda não enviados.
+    // Antes a condição era uma janela de ±30min em torno do alvo; se o cron não pegasse
+    // essa janela — silêncio, app reiniciando, reunião remarcada — o lembrete se perdia.
+    const vencidos = lembretes
+      .filter(l => !stepData[`_lembrete_${l.horas}h_enviado`])
+      .filter(l => agendada.getTime() - agora.getTime() <= l.horas * 60 * 60 * 1000 + JANELA_MIN * 60 * 1000)
+      .sort((a, b) => a.horas - b.horas);
+    if (!vencidos.length) continue;
+
+    // Só o mais próximo da reunião é enviado. Os outros vencidos são marcados como
+    // suprimidos, senão ao sair do silêncio às 07:00 o lead levaria 3 lembretes seguidos.
+    const [lembrete, ...suprimidos] = vencidos;
+    const flagKey = `_lembrete_${lembrete.horas}h_enviado`;
+    const flagsSuprimidas = Object.fromEntries(suprimidos.map(l => [`_lembrete_${l.horas}h_enviado`, true]));
+    if (suprimidos.length) {
+      console.log(`[Reuniao-Lembrete] Deal ${deal.id} — suprimidos ${suprimidos.map(l => `${l.horas}h`).join(", ")} (acumulados fora do horário de envio)`);
+    }
+
+    {
 
       const { getEvolutionConfig } = await import("./agent/message-handler.js");
       const evo = await getEvolutionConfig(deal.projetoId);
@@ -416,10 +465,17 @@ async function enviarLembretesReuniao(): Promise<void> {
       const horario = horarioFmt.split(" ")[1]?.slice(0, 5) ?? horarioFmt;
       const nome = deal.contato?.nome ?? "cliente";
       const link = r.tokenConvidado ? `${appBaseUrl}/sala/${r.tokenConvidado}` : "";
+      // Nome de quem assina o lembrete vem do banco (IaPersona), nunca fixo no código.
+      const { getPersonaNomeExibicao } = await import("./agent/transition-engine.js");
+      const nomeSecretaria = await getPersonaNomeExibicao(deal.projetoId, "secretaria").catch(() => "");
+      const nomeAssistente = await getPersonaNomeExibicao(deal.projetoId, "assistente").catch(() => "");
+      const remetenteLembrete = nomeSecretaria || nomeAssistente || "Secretaria";
       const msg = lembrete.texto
         .replace(/\{nome\}/g, nome)
         .replace(/\{horario\}/g, horario)
-        .replace(/\{link\}/g, link);
+        .replace(/\{link\}/g, link)
+        .replace(/\{nome_secretaria\}/g, remetenteLembrete)
+        .replace(/\{nome_assistente\}/g, nomeAssistente || remetenteLembrete);
 
       await sendText(evo, whatsapp, msg).catch(() => {});
       await prisma.crmMensagemWhatsapp.create({
@@ -428,7 +484,7 @@ async function enviarLembretesReuniao(): Promise<void> {
           contatoId: undefined as any,
           direcao: "out",
           personaChave: "secretaria",
-          remetente: "Ana",
+          remetente: remetenteLembrete,
           tipo: "text",
           conteudo: msg,
         },
@@ -436,10 +492,74 @@ async function enviarLembretesReuniao(): Promise<void> {
 
       await prisma.crmDeal.update({
         where: { id: deal.id },
-        data: { iaFlowStepData: { ...stepData, [flagKey]: true } as any },
+        data: { iaFlowStepData: { ...stepData, ...flagsSuprimidas, [flagKey]: true } as any },
       }).catch(() => {});
       console.log(`[Reuniao-Lembrete] Deal ${deal.id} lembrete ${lembrete.horas}h enviado`);
     }
+  }
+
+  await alertarReunioesSemConfirmacao();
+}
+
+/**
+ * Reunião perto da hora e o lead nunca deu sinal depois dos lembretes → avisa o SDR humano
+ * enquanto ainda dá tempo de ligar. O no-show respondia por 34,7% das reuniões marcadas
+ * (auditoria da planilha, 26/08/2026) e só 6% avisavam antes — o resto sumia no horário.
+ *
+ * O sinal usado é "respondeu alguma coisa depois do lembrete", não um "sim" explícito:
+ * boa parte comparece sem nunca mandar confirmação, e exigir o "sim" geraria alarme falso.
+ */
+const HORAS_ALERTA_SEM_CONFIRMACAO = 3;
+
+async function alertarReunioesSemConfirmacao(): Promise<void> {
+  const agora = new Date();
+  const limite = new Date(agora.getTime() + HORAS_ALERTA_SEM_CONFIRMACAO * 60 * 60 * 1000);
+
+  const reunioes = await prisma.sessaoReuniao.findMany({
+    where: { status: "agendada", agendadaPara: { gt: agora, lte: limite }, dealId: { not: null } },
+    select: {
+      id: true, agendadaPara: true, dealId: true,
+      deal: { select: { id: true, projetoId: true, iaFlowStepData: true, contato: { select: { nome: true, whatsapp: true } } } },
+    },
+  });
+
+  for (const r of reunioes) {
+    const deal = r.deal;
+    if (!deal?.projetoId) continue;
+
+    const stepData = (deal.iaFlowStepData ?? {}) as Record<string, unknown>;
+    if (stepData._alerta_sem_confirmacao_enviado) continue;   // um alerta por reunião
+    if (stepData._reuniao_confirmada === true) continue;      // já confirmou
+
+    const { respondeuAposLembrete } = await import("./agent/confirmacao-reuniao.js");
+    if (await respondeuAposLembrete(deal.id).catch(() => true)) continue;  // deu sinal de vida
+
+    const horario = (r.agendadaPara as Date).toLocaleString("pt-BR", {
+      timeZone: "America/Sao_Paulo", dateStyle: "short", timeStyle: "short",
+    });
+    const nome = deal.contato?.nome ?? "cliente";
+    const fone = deal.contato?.whatsapp ?? "";
+
+    let briefing = "";
+    try {
+      const { buildLeadBriefing } = await import("./agent/lead-briefing.js");
+      briefing = await buildLeadBriefing(deal.id, {
+        titulo: `⚠️ SEM CONFIRMAÇÃO — reunião às ${horario}`,
+        acao: `Ligar AGORA para ${nome} (wa.me/${fone}) e confirmar presença antes do horário.`,
+      }).catch(() => "");
+    } catch { /* briefing é opcional — o alerta vale mesmo sem ele */ }
+
+    const { dispararNotificacoes } = await import("./agent/message-handler.js");
+    await dispararNotificacoes(deal.projetoId, "reuniao_sem_confirmacao", {
+      nome, telefone: fone, horario, dealId: deal.id,
+      briefing: briefing || `⚠️ ${nome} tem reunião às ${horario} e não confirmou presença.\nwa.me/${fone}`,
+    }).catch(() => {});
+
+    await prisma.crmDeal.update({
+      where: { id: deal.id },
+      data: { iaFlowStepData: { ...stepData, _alerta_sem_confirmacao_enviado: true } as any },
+    }).catch(() => {});
+    console.log(`[Reuniao-SemConfirmacao] Deal ${deal.id} (${nome}) — reunião ${horario} sem confirmação; SDR avisado`);
   }
 }
 
@@ -529,6 +649,71 @@ async function detectarNoShows(): Promise<void> {
   }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Lembretes de audiência
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lembra o cliente da audiência que se aproxima: semanal enquanto falta mais de
+ * uma semana, diário na última semana.
+ *
+ * Só entra lead cuja designação já foi avisada — mandar "sua audiência está
+ * chegando" para quem nunca recebeu a data seria estranho. `audienciaLembreteEm`
+ * trava um envio por dia, para que um restart do processo não repita a mensagem.
+ */
+async function enviarLembretesAudiencia(): Promise<void> {
+  const { diasAte, ehDiaDeLembrete, ehTipoValido, formatarValor, montarMensagemLembrete } =
+    await import("./services/audiencia.js");
+  const { enviarTextoParaDeal, remetenteDoDeal } = await import("./services/whatsapp-deal.js");
+
+  const agora = new Date();
+  const deals = await prisma.crmDeal.findMany({
+    where: {
+      audienciaEm: { gt: agora },
+      audienciaAvisadaEm: { not: null },
+      status: "aberto",
+    },
+    include: { contato: true },
+  });
+
+  for (const deal of deals) {
+    try {
+      if (!deal.audienciaEm || !ehTipoValido(deal.audienciaTipo)) continue;
+      if (!deal.contato?.whatsapp) continue;
+
+      const dias = diasAte(deal.audienciaEm, agora);
+      if (!ehDiaDeLembrete(dias)) continue;
+
+      // Já mandou hoje? (compara o dia local, não as 24h)
+      const ultimo = deal.audienciaLembreteEm;
+      if (ultimo && diasAte(agora, ultimo) === 0) continue;
+
+      const texto = montarMensagemLembrete({
+        nome:       (deal.contato.nome ?? deal.titulo).trim().split(/\s+/)[0],
+        em:         deal.audienciaEm,
+        tipo:       deal.audienciaTipo,
+        modalidade: deal.audienciaModalidade === "virtual" ? "virtual" : "presencial",
+        local:      deal.audienciaLocal,
+        empresa:    null,
+        valorCausa: formatarValor(deal.valorCausaAjuizada),
+      });
+
+      const remetente = await remetenteDoDeal(deal.responsavelId);
+      await enviarTextoParaDeal(deal.id, texto, remetente);
+      await prisma.crmDeal.update({
+        where: { id: deal.id },
+        data: { audienciaLembreteEm: new Date() },
+      });
+      console.log(`[Audiencia] Lembrete enviado — deal ${deal.id}, faltam ${dias} dia(s)`);
+
+      // O número do escritório já foi bloqueado antes por rajada de envio.
+      await new Promise((r) => setTimeout(r, 4000));
+    } catch (err) {
+      console.error(`[Audiencia] Falha no lembrete do deal ${deal.id}:`, err);
+    }
+  }
+}
+
 export function iniciarCron(): void {
   // Todo dia às 07:00 — emitir NFS-e automáticas + gerar cobranças
   cron.schedule("0 7 * * *", async () => {
@@ -541,6 +726,15 @@ export function iniciarCron(): void {
       await gerarCobrancasDoDia();
     } catch (err) {
       console.error("[CRON-Cob] Erro crítico:", err);
+    }
+  });
+
+  // A cada 30 min — reprocessa e-mails de cobrança pendentes/falhos (auto-cura)
+  cron.schedule("*/30 * * * *", async () => {
+    try {
+      await reprocessarEmailsCobranca();
+    } catch (err) {
+      console.error("[Email-Retry] Erro crítico:", err);
     }
   });
 
@@ -620,6 +814,15 @@ export function iniciarCron(): void {
     }
   });
 
+  // Lembretes de audiência: diário às 09:30 (depois do follow-up, no horário comercial)
+  cron.schedule("30 9 * * *", async () => {
+    try {
+      await enviarLembretesAudiencia();
+    } catch (err) {
+      console.error("[Audiencia] Erro no cron de lembretes:", err);
+    }
+  });
+
   // Follow-up PAKT: diário às 9h
   cron.schedule("0 9 * * *", async () => {
     try {
@@ -646,6 +849,18 @@ export function iniciarCron(): void {
       console.log(`[CRON-Cleanup] Logs removidos: ${deletedLogs.count} interações IA, ${deletedMsgs.count} mensagens WA`);
     } catch (e) {
       console.error("[CRON-Cleanup] Erro:", e);
+    }
+  });
+
+  // ── Fotos de perfil do WhatsApp — renova contatos ativos (diário às 04:30) ──
+  cron.schedule("30 4 * * *", async () => {
+    try {
+      const { renovarFotosPerfilAtivas } = await import("./services/foto-perfil.js");
+      const r = await renovarFotosPerfilAtivas();
+      console.log(`[FotoPerfil] Renovação: ${r.consultados} consultados, ${r.comFoto} com foto`);
+      recordCronRun("renovarFotosPerfilAtivas");
+    } catch (e) {
+      console.error("[FotoPerfil] Erro no cron:", e);
     }
   });
 

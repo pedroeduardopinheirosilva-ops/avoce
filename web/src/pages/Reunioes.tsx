@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { Video, Plus, Copy, ExternalLink, Clock, CheckCircle, XCircle, Calendar, FileText, CalendarDays, Trash2, ChevronLeft, ChevronRight } from "lucide-react";
 import { trpc } from "../lib/trpc";
+import { useTranscricaoCapture } from "../lib/useTranscricaoCapture";
 
 const DIAS_SEMANA_NOMES = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
 
@@ -26,6 +27,8 @@ type Sessao = {
   duracao: number | null;
   criadaEm: string;
   notas: string | null;
+  transcricao: string | null;
+  resumoIa: string | null;
   tokenConvidado: string;
   deal: { titulo: string } | null;
   contato: { nome: string; whatsapp: string | null } | null;
@@ -130,65 +133,26 @@ export default function ReunioesPage() {
 
   const appBase = window.location.origin;
 
-  // Auto-recording for transcription — starts when Jitsi iframe is shown
-  const recorderRef  = useRef<MediaRecorder | null>(null);
-  const streamRef    = useRef<MediaStream | null>(null);
-  const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const chunksRef    = useRef<Blob[]>([]);
+  // Transcrição — captura o microfone do operador com o nome do usuário logado
+  const me = trpc.auth.me.useQuery();
+  useTranscricaoCapture({
+    sessaoId: selectedId ?? undefined,
+    enabled:  showJitsi && !!selectedId,
+    nome:     me.data?.nome,
+  });
 
-  async function sendAudioChunk(sessaoId: string, blob: Blob) {
-    if (blob.size < 1000) return;
-    const token = localStorage.getItem("avoce_token") ?? "";
-    const fd = new FormData();
-    fd.append("audio", blob, "chunk.webm");
-    fetch(`/api/reuniao/${sessaoId}/transcricao-chunk`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: fd,
-    }).catch(() => {});
-  }
+  // Transcrição ao vivo — chunks rotulados por interlocutor
+  const emAndamento = sessao.data?.status === "em_andamento";
+  const transcricaoQ = trpc.reunioes.getTranscricao.useQuery(
+    { id: selectedId ?? "" },
+    { enabled: !!selectedId, refetchInterval: emAndamento ? 4_000 : false },
+  );
 
-  useEffect(() => {
-    if (!showJitsi || !selectedId) {
-      // Stop recording when Jitsi is hidden or no meeting selected
-      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
-      streamRef.current?.getTracks().forEach(t => t.stop());
-      recorderRef.current = null; streamRef.current = null; chunksRef.current = [];
-      return;
-    }
-
-    navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(stream => {
-      streamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      const recorder = new MediaRecorder(stream, { mimeType });
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        sendAudioChunk(selectedId, blob);
-        chunksRef.current = [];
-      };
-
-      recorder.start();
-
-      // Every 30s: stop → sends chunk via onstop → restart
-      intervalRef.current = setInterval(() => {
-        if (recorderRef.current?.state === "recording") {
-          recorderRef.current.stop();
-          setTimeout(() => { recorderRef.current?.start(); }, 200);
-        }
-      }, 30_000);
-    }).catch(() => { /* microphone permission denied — silently skip */ });
-
-    return () => {
-      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
-      streamRef.current?.getTracks().forEach(t => t.stop());
-    };
-  }, [showJitsi, selectedId]);
+  // Copiloto IA — sugestões em tempo real enquanto a reunião acontece
+  const copilotoQ = trpc.reunioes.copiloto.useQuery(
+    { id: selectedId ?? "" },
+    { enabled: !!selectedId && emAndamento, refetchInterval: 45_000 },
+  );
 
   function handleEntrar() {
     if (!jitsiQ.data) return;
@@ -210,6 +174,19 @@ export default function ReunioesPage() {
   const emitentesQ  = trpc.empresa.listar.useQuery(undefined, { enabled: tab === "agenda" });
   const usuariosQ   = trpc.auth.listUsuarios.useQuery(undefined, { enabled: tab === "agenda" });
   const projetosQ   = trpc.ia.listProjetos.useQuery(undefined, { enabled: tab === "agenda" });
+
+  // O que ainda falta para liberar os botões de criar slot — sem isso o botão fica
+  // desabilitado sem dizer por quê (Escritório e Projeto SDR começam em "Todos",
+  // que não serve para criar).
+  const emitentesVazio = tab === "agenda" && !emitentesQ.isLoading && !(emitentesQ.data as any[])?.length;
+  const faltaBase = [
+    !agendaEmitenteId && "Escritório",
+    !agendaProjetoId  && "Projeto SDR",
+  ].filter(Boolean) as string[];
+  const faltaRecorrente = [
+    ...faltaBase,
+    !recorrente.diasSemana.length && "ao menos um dia da semana",
+  ].filter(Boolean) as string[];
 
   function gerarRecorrente() {
     if (!agendaEmitenteId || !recorrente.diasSemana.length || !recorrente.horarios.length) return;
@@ -379,6 +356,17 @@ export default function ReunioesPage() {
                     className="w-full bg-purple-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-purple-700 disabled:opacity-50">
                     {criarRecorrenteMut.isPending ? "Gerando..." : `Gerar ${recorrente.semanas} semanas`}
                   </button>
+                  {faltaRecorrente.length > 0 && (
+                    <p className="text-xs text-amber-600">
+                      Para habilitar, selecione: {faltaRecorrente.join(", ")}.
+                    </p>
+                  )}
+                  {emitentesVazio && (
+                    <p className="text-xs text-red-600">
+                      Seu usuário não tem nenhuma empresa emissora liberada — peça a um administrador
+                      para marcar o escritório em Usuários → Permissões.
+                    </p>
+                  )}
                   {criarRecorrenteMut.isSuccess && (
                     <p className="text-xs text-green-600">✓ {criarRecorrenteMut.data?.count} slots criados</p>
                   )}
@@ -425,6 +413,11 @@ export default function ReunioesPage() {
                     className="w-full bg-gray-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium hover:bg-gray-800 disabled:opacity-50">
                     {criarSlotMut.isPending ? "..." : "Adicionar"}
                   </button>
+                  {faltaBase.length > 0 && (
+                    <p className="text-xs text-amber-600">
+                      Para habilitar, selecione: {faltaBase.join(", ")}.
+                    </p>
+                  )}
                 </div>
               )}
             </div>
@@ -452,7 +445,7 @@ export default function ReunioesPage() {
                   {STATUS_ICONS[s.status]} {s.status}
                 </span>
                 {s.contato && <span>{s.contato.nome}</span>}
-                {s.deal && <span>Deal: {s.deal.titulo}</span>}
+                {s.deal && <span>Lead: {s.deal.titulo}</span>}
                 {s.duracao && <span className="flex items-center gap-1"><Clock size={11} /> {formatDuracao(s.duracao)}</span>}
               </div>
             </div>
@@ -582,15 +575,56 @@ export default function ReunioesPage() {
                   </button>
                 </div>
 
-                {/* Transcrição */}
-                {s.notas && s.notas.length > 200 && (
+                {/* Copiloto IA — sugestões em tempo real durante a reunião */}
+                {emAndamento && copilotoQ.data?.sugestoes && (
+                  <div className="bg-amber-50 rounded-xl border border-amber-200 p-5">
+                    <h3 className="font-medium text-amber-800 mb-2 text-sm flex items-center gap-2">
+                      💡 Copiloto IA
+                      <span className="text-[10px] bg-amber-100 text-amber-600 px-2 py-0.5 rounded-full">atualiza a cada 45s</span>
+                    </h3>
+                    <p className="text-xs text-amber-900 whitespace-pre-wrap">{copilotoQ.data.sugestoes}</p>
+                  </div>
+                )}
+
+                {/* Relatório IA — gerado automaticamente ao encerrar */}
+                {s.resumoIa && (
                   <div className="bg-white rounded-xl border p-5">
-                    <h3 className="font-medium text-gray-800 mb-3 text-sm">Transcrição</h3>
-                    <p className="text-xs text-gray-600 whitespace-pre-wrap bg-gray-50 rounded p-3 max-h-60 overflow-auto">
-                      {s.notas}
+                    <h3 className="font-medium text-gray-800 mb-3 text-sm">📋 Relatório da Reunião (IA)</h3>
+                    <p className="text-xs text-gray-700 whitespace-pre-wrap bg-gray-50 rounded p-3 max-h-80 overflow-auto">
+                      {s.resumoIa}
                     </p>
                   </div>
                 )}
+
+                {/* Transcrição — ao vivo (chunks rotulados) ou final (texto montado) */}
+                {(transcricaoQ.data?.length ?? 0) > 0 ? (
+                  <div className="bg-white rounded-xl border p-5">
+                    <h3 className="font-medium text-gray-800 mb-3 text-sm flex items-center gap-2">
+                      Transcrição
+                      {emAndamento && <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full animate-pulse">ao vivo</span>}
+                    </h3>
+                    <div className="space-y-2 bg-gray-50 rounded p-3 max-h-72 overflow-auto">
+                      {transcricaoQ.data!.map(c => (
+                        <div key={c.id} className="text-xs">
+                          <span className="text-gray-400 mr-1.5">
+                            [{String(Math.floor(c.segundos / 60)).padStart(2, "0")}:{String(c.segundos % 60).padStart(2, "0")}]
+                          </span>
+                          <span className={`font-semibold mr-1 ${c.role === "convidado" ? "text-green-700" : "text-indigo-700"}`}>
+                            {c.nome}:
+                          </span>
+                          <span className="text-gray-700">{c.texto}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : s.transcricao ? (
+                  <div className="bg-white rounded-xl border p-5">
+                    <h3 className="font-medium text-gray-800 mb-3 text-sm">Transcrição</h3>
+                    <p className="text-xs text-gray-600 whitespace-pre-wrap bg-gray-50 rounded p-3 max-h-72 overflow-auto">
+                      {s.transcricao}
+                    </p>
+                  </div>
+                ) : null}
               </div>
             </div>
           )}
@@ -714,8 +748,10 @@ export default function ReunioesPage() {
             </div>
           </div>
 
-          {!agendaEmitenteId && (
-            <p className="text-center text-sm text-gray-400 mt-6">Selecione um escritório na barra lateral para visualizar e criar slots.</p>
+          {faltaBase.length > 0 && (
+            <p className="text-center text-sm text-gray-400 mt-6">
+              Selecione {faltaBase.join(" e ")} na barra lateral para visualizar e criar slots.
+            </p>
           )}
         </div>
       )}

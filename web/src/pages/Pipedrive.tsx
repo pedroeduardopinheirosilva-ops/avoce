@@ -69,6 +69,8 @@ export default function Pipedrive() {
     importarMutation.mutate({ overwrite, importarPerdidos, importarHistoricoEtapas, forceFull });
   }
 
+  const backfillMutation = trpc.pipedrive.backfillDatas.useMutation();
+
   const botMutation = trpc.reengajamento.importarBot.useMutation({
     onSuccess: (data) => setBotLog(data.log),
     onError: (e) => setBotLog([`Erro: ${e.message}`]),
@@ -109,7 +111,7 @@ export default function Pipedrive() {
     <div className="p-6 max-w-2xl mx-auto space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Pipedrive — Importação</h1>
-        <p className="text-sm text-gray-500 mt-1">Configure seu token e importe pipelines, contatos e deals do Pipedrive.</p>
+        <p className="text-sm text-gray-500 mt-1">Configure seu token e importe funis, contatos e leads do Pipedrive.</p>
       </div>
 
       {/* Token */}
@@ -229,7 +231,7 @@ export default function Pipedrive() {
               onChange={(e) => setImportarPerdidos(e.target.checked)}
               className="rounded"
             />
-            <span className="text-sm text-gray-700">Importar deals perdidos</span>
+            <span className="text-sm text-gray-700">Importar leads perdidos</span>
           </label>
 
           <label className="flex items-center gap-2 cursor-pointer">
@@ -241,7 +243,7 @@ export default function Pipedrive() {
             />
             <span className="text-sm text-gray-700">
               Importar histórico de etapas{" "}
-              <span className="text-xs text-amber-600">(mais lento — 1 requisição por deal)</span>
+              <span className="text-xs text-amber-600">(mais lento — 1 requisição por lead)</span>
             </span>
           </label>
 
@@ -279,6 +281,50 @@ export default function Pipedrive() {
               ))}
             </div>
           )}
+
+          {/* Backfill das datas de criação */}
+          <div className="border-t border-gray-100 pt-4 space-y-2">
+            <p className="text-sm font-medium text-gray-800">Corrigir datas de criação</p>
+            <p className="text-xs text-gray-500">
+              Regrava a data de criação de cada contato com o <code>add_time</code> real do Pipedrive.
+              Importações antigas gravavam a data do sync, o que empilha milhares de contatos num único
+              dia no Painel Diário. Só mexe nesse campo.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => backfillMutation.mutate({ dryRun: true })}
+                disabled={backfillMutation.isPending}
+                className="px-3 py-2 rounded-lg border border-gray-200 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              >
+                Simular
+              </button>
+              <button
+                onClick={() => backfillMutation.mutate({ dryRun: false })}
+                disabled={backfillMutation.isPending}
+                className="px-3 py-2 rounded-lg bg-gray-900 text-white text-sm font-medium hover:bg-black disabled:opacity-50"
+              >
+                {backfillMutation.isPending ? "Processando..." : "Corrigir datas"}
+              </button>
+            </div>
+            {backfillMutation.data && (
+              <div className="bg-gray-50 rounded-lg p-3 text-xs text-gray-600 space-y-1">
+                <p>
+                  {backfillMutation.data.dryRun ? "Simulação: " : "Concluído: "}
+                  <b>{backfillMutation.data.atualizados}</b> de {backfillMutation.data.dealsLocais} contatos
+                  {backfillMutation.data.dryRun ? " seriam corrigidos" : " corrigidos"}
+                  {" "}({backfillMutation.data.dealsPipedrive} deals lidos do Pipedrive).
+                </p>
+                {backfillMutation.data.exemplos.map((e, i) => (
+                  <p key={i} className="font-mono">
+                    {e.titulo}: {e.de} → {e.para}
+                  </p>
+                ))}
+              </div>
+            )}
+            {backfillMutation.error && (
+              <p className="text-xs text-red-600">{backfillMutation.error.message}</p>
+            )}
+          </div>
         </div>
       )}
       {/* Bot RAP — Importação Supabase */}

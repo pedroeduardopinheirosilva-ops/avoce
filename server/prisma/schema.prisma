@@ -75,6 +75,11 @@ model Usuario {
   criadoEm  DateTime @default(now())
   permissoes Json?   // { modulos?: string[], emitentes?: string[] } | null = full access
   whatsapp  String?  // somente dígitos ex: 5577999999999 — whitelist do Assistente Interno
+  // Ramal SIP do APARELHO desta pessoa (app iOS). Fica separado do ramal do
+  // emitente porque o AOR da recepção tem max_contacts=1 remove_existing=yes:
+  // dois aparelhos no mesmo ramal derrubam um ao outro em silêncio.
+  voipRamal       String?
+  voipRamalSenha  String?
 
   empresa              Empresa?            @relation(fields: [empresaId], references: [id])
   projetoUsuarios      IaProjetoUsuario[]
@@ -169,6 +174,7 @@ model EmpresaEmitente {
   reunioes           SessaoReuniao[]
   agendaSlots        AgendaSlot[]
   lancamentos        Lancamento[]
+  assinaturas        Assinatura[]
 }
 
 model Lancamento {
@@ -231,6 +237,7 @@ model Tomador {
   administradores Administrador[]
   contratos       Contrato[]
   propostas       Proposta[]
+  assinaturas     Assinatura[]
 
   @@unique([empresaId, cpfCnpj])
 }
@@ -342,7 +349,7 @@ model Proposta {
   contratoDescricao         String?
   paktSignedPdfPath         String?
   templatesGerar            String?
-  honorariosExitoPerc       Int?
+  honorariosExitoPerc       Float?
   followUpCount             Int       @default(0)
   followUpUltimoEm          DateTime?
   paktAssinadoEm            DateTime?
@@ -409,6 +416,14 @@ model Cobranca {
   pixPagadorNome       String?
   pixPagoEm            DateTime?
 
+  // ── Rastreamento de envio de e-mail (monitor de saúde) ──
+  emailStatus        String    @default("PENDENTE")  // PENDENTE | ENVIADO | FALHA
+  emailEnviadoEm     DateTime?
+  emailErro          String?
+  emailTentativas    Int       @default(0)
+  emailUltTentativa  DateTime?
+  emailDestinatarios String[]  @default([])
+
   // Baixa manual (depósito / PIX avulso / etc.)
   baixaManualStatus         String?   // "PAGO" | "ESTORNADO"
   baixaManualEm             DateTime?
@@ -423,10 +438,11 @@ model Cobranca {
   baixaManualBanco          String?
   baixaManualObs            String?
 
-  contrato      Contrato         @relation(fields: [contratoId], references: [id])
-  emitente      EmpresaEmitente  @relation(fields: [emitenteId], references: [id])
-  bankStatement BankStatement?
-  baixaLogs     CobrancaBaixaLog[]
+  contrato       Contrato         @relation(fields: [contratoId], references: [id])
+  emitente       EmpresaEmitente  @relation(fields: [emitenteId], references: [id])
+  bankStatement  BankStatement?
+  statementMatch BankStatementMatch?
+  baixaLogs      CobrancaBaixaLog[]
 
   reconciledAt    DateTime?
   reconciledBy    String?
@@ -526,6 +542,15 @@ model CrmDeal {
   status           String    @default("aberto") // aberto | ganho | perdido
   urgencia         Boolean   @default(false)
   fonteLead        String?
+  // Origem rastreada da 1ª mensagem (Meta Click-to-WhatsApp / link wa.me / orgânico).
+  // Vem do contextInfo do webhook da Evolution (externalAdReply + entryPointConversionSource).
+  origemPlataforma    String?   // facebook | instagram | site | whatsapp | telefone
+  origemTipo          String?   // anuncio | link | organico
+  origemAnuncioId     String?   // Meta ad id (externalAdReply.sourceId)
+  origemAnuncioTitulo String?
+  origemAnuncioTexto  String?
+  origemUrl           String?
+  origemEm            DateTime?
   descricao        String?
   camposCustom     Json?
   numeroCnj        String?
@@ -538,6 +563,13 @@ model CrmDeal {
   valorCausaAjuizada Decimal? @db.Decimal(12, 2) // Valor da causa no processo ajuizado
   valorCondenacao  Decimal?  @db.Decimal(12, 2)  // Valor da condenação
   valorAcordo      Decimal?  @db.Decimal(12, 2)  // Valor do acordo homologado
+  // Audiência designada — alimenta as mensagens automáticas ao cliente
+  audienciaEm          DateTime? // data e hora da audiência
+  audienciaTipo        String?   // inicial_protocolo | inicial_posterior | instrucao | una
+  audienciaModalidade  String?   // presencial | virtual
+  audienciaLocal       String?   // endereço da vara ou link da sala virtual
+  audienciaAvisadaEm   DateTime? // quando a mensagem de designação foi enviada ao cliente
+  audienciaLembreteEm  DateTime? // último lembrete enviado (trava 1 por dia)
   // IA fields
   iaAtiva              Boolean   @default(true)
   iaStageChave         String?
@@ -639,6 +671,12 @@ model CrmContato {
   pipedriveId  Int?     @unique
   telefone     String?
   empresa      String?
+  // Foto de perfil do WhatsApp (Evolution /chat/fetchProfilePictureUrl). A URL do
+  // pps.whatsapp.net expira em ~10 dias, por isso o arquivo é baixado para disco
+  // (uploads/fotos-perfil/<id>.jpg) e servido por /api/contato-foto/:id.
+  // fotoPerfilEm marca a última tentativa (mesmo sem foto) para não consultar de novo.
+  fotoPerfilUrl String?
+  fotoPerfilEm  DateTime?
   criadoEm     DateTime @default(now())
   atualizadoEm DateTime @updatedAt
 
@@ -1009,10 +1047,25 @@ model BankStatement {
   updatedAt            DateTime             @updatedAt
   bankAccount          BankAccount          @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
   cobranca             Cobranca?            @relation(fields: [cobrancaId], references: [id])
+  groupMatches         BankStatementMatch[]
   @@unique([bankAccountId, externalId])
   @@index([emitenteId, bankAccountId, entryDate])
   @@index([emitenteId, reconciliationStatus])
   @@map("bank_statements")
+}
+
+// Conciliação N:1 — um lançamento do extrato (ex.: CRÉD.LIQUIDAÇÃO COBRANÇA)
+// liquidando VÁRIAS cobranças de uma vez. O vínculo 1:1 (cobrancaId acima)
+// continua sendo usado para matches simples.
+model BankStatementMatch {
+  id          String        @id @default(cuid())
+  statementId String
+  cobrancaId  String        @unique
+  createdAt   DateTime      @default(now())
+  statement   BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  cobranca    Cobranca      @relation(fields: [cobrancaId], references: [id])
+  @@index([statementId])
+  @@map("bank_statement_matches")
 }
 
 model StatementSyncLog {
@@ -1375,12 +1428,33 @@ model SessaoReuniao {
   duracao         Int?
   transcricao     String?   @db.Text
   notas           String?   @db.Text
+  resumoIa        String?   @db.Text  // relatório IA pós-reunião
+  consentimentoEm DateTime? // consentimento LGPD do convidado p/ gravação+transcrição
+  consentimentoIp String?
   criadaEm        DateTime  @default(now())
   atualizadaEm    DateTime  @updatedAt
 
   deal     CrmDeal?         @relation(fields: [dealId], references: [id], onDelete: SetNull)
   contato  CrmContato?      @relation(fields: [contatoId], references: [id])
   emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
+  chunks   ReuniaoTranscricaoChunk[]
+}
+
+// Transcrição de reunião — 1 chunk por fala, rotulado por quem gravou
+// (cada participante transcreve o próprio microfone; papel conhecido a priori)
+model ReuniaoTranscricaoChunk {
+  id             String   @id @default(cuid())
+  sessaoId       String
+  speakerRole    String   @default("indefinido") // operador | convidado | indefinido
+  speakerNome    String?
+  conteudo       String   @db.Text
+  inicioSegundos Int?     // contador local da página de quem gravou (aproximado)
+  origem         String   @default("whisper")    // webspeech | whisper
+  criadaEm       DateTime @default(now())
+
+  sessao SessaoReuniao @relation(fields: [sessaoId], references: [id], onDelete: Cascade)
+
+  @@index([sessaoId, criadaEm])
 }
 
 // Agenda — Slots de disponibilidade para reuniões
@@ -1443,4 +1517,51 @@ model IaEmpresaBloqueada {
   projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
 
   @@index([projetoId, ativo])
+}
+
+// ─────────────────────────────────────────────
+// Assinaturas — assinatura eletrônica via PAKT
+// ─────────────────────────────────────────────
+
+model Assinatura {
+  id                        String    @id @default(cuid())
+  paktDocumentId            String?   @unique
+  emitenteId                String    // escritório remetente (RAP ou PSA) citado no texto
+  nome                      String
+  status                    String    @default("DRAFT")
+  mensagem                  String?   @db.Text
+  expiresAt                 DateTime?
+  paktResponse              Json?
+
+  arquivoNome               String?
+  arquivoPath               String?
+  arquivoTamanho            Int?
+  arquivoAssinadoPath       String?
+  arquivoAssinadoEm         DateTime?
+
+  criadoPorId               String?
+  criadoPorNome             String?
+
+  signatarios               Json      @default("[]")
+
+  tomadorId                 String?
+  dealId                    String?
+
+  emailEnviado              Boolean   @default(false)
+  emailEnviadoEm            DateTime?
+  whatsappEnviado           Boolean   @default(false)
+  whatsappEnviadoEm         DateTime?
+  whatsappAssinadoEnviado   Boolean   @default(false)
+  whatsappAssinadoEnviadoEm DateTime?
+
+  webhookEventos            Json      @default("[]")
+
+  criadoEm                  DateTime  @default(now())
+  atualizadoEm              DateTime  @updatedAt
+
+  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  tomador  Tomador?        @relation(fields: [tomadorId], references: [id])
+
+  @@index([emitenteId, status])
+  @@index([criadoEm])
 }

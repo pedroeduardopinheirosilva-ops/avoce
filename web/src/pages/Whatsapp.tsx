@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import { trpc } from "../lib/trpc";
 import { useVoip } from "../contexts/VoipContext";
 import { DealModal, type Deal, type Stage } from "./Crm";
+import { Avatar } from "../components/Avatar";
+import { OrigemBadge, type DealOrigem } from "../components/OrigemLead";
 
 type Conversa = {
   id: string;
@@ -12,7 +14,7 @@ type Conversa = {
   iaPersonaChave: string | null;
   ultimoContatoEm: string | null;
   sdrNome: string | null;
-  contato: { id: string; nome: string; whatsapp: string | null } | null;
+  contato: { id: string; nome: string; whatsapp: string | null; fotoPerfilUrl?: string | null; fotoPerfilEm?: string | null } | null;
   mensagens: {
     id: string;
     direcao: string;
@@ -20,7 +22,7 @@ type Conversa = {
     personaChave: string | null;
     enviadaEm: string;
   }[];
-};
+} & DealOrigem;
 
 type Mensagem = {
   id: string;
@@ -49,10 +51,13 @@ const PERSONA_COLORS: Record<string, string> = {
   closer: "bg-orange-100 text-orange-800",
 };
 
-const PERSONA_NAMES: Record<string, string> = {
-  assistente: "Ana",
-  advogado: "Dra. Daniela",
-  closer: "Dra. Daniela (Closer)",
+// Último recurso, só para chave sem persona cadastrada. Os nomes de verdade vêm
+// do banco (ia.listPersonas): este mapa ficou anos desatualizado — mostrava "Ana"
+// onde a persona já se chamava Isabella, e não conhecia coleta_docs nem secretaria.
+const PERSONA_NAMES_FALLBACK: Record<string, string> = {
+  assistente: "Assistente",
+  advogado: "Advogada",
+  closer: "Closer",
 };
 
 const EVENTO_LABELS: Record<string, string> = {
@@ -68,7 +73,11 @@ function formatTime(iso: string) {
   return d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
 }
 
-const PERSONA_PREFIX_RE = /^\*?(?:Ana|Dra\.?\s+Daniela(?:\s+\(Closer\))?)\s*\*?\s*[\n:]\s*/;
+// O agente assina a mensagem com "*Nome*" na primeira linha, e a bolha já mostra
+// o remetente à parte — repetir vira ruído. Antes a lista de nomes era fixa (só
+// Ana e Dra. Daniela), então "Nelson" e "Isabella" apareciam soltos no texto.
+// Casa qualquer nome curto em negrito seguido de quebra de linha ou dois-pontos.
+const PERSONA_PREFIX_RE = /^\*[^*\n]{2,40}\*\s*[\n:]\s*/;
 
 function formatWhatsApp(text: string, stripPrefix = false) {
   const cleaned = stripPrefix ? text.replace(PERSONA_PREFIX_RE, "") : text;
@@ -77,7 +86,46 @@ function formatWhatsApp(text: string, stripPrefix = false) {
     .replace(/\n/g, "<br/>");
 }
 
+/** Data curta + hora — a lista de busca cruza conversas de meses diferentes. */
+function formatDataHora(iso: string) {
+  const d = new Date(iso);
+  const hoje = new Date();
+  const mesmoDia = d.toDateString() === hoje.toDateString();
+  return mesmoDia
+    ? d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })
+    : d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit", year: "2-digit" });
+}
+
+/** Atrasa o valor para não disparar uma busca por tecla digitada. */
+function useDebounced<T>(valor: T, ms = 350): T {
+  const [v, setV] = useState(valor);
+  useEffect(() => {
+    const t = setTimeout(() => setV(valor), ms);
+    return () => clearTimeout(t);
+  }, [valor, ms]);
+  return v;
+}
+
+/** Marca o termo buscado dentro do trecho. */
+function Realce({ texto, termo }: { texto: string; termo: string }) {
+  const t = termo.trim();
+  if (!t) return <>{texto}</>;
+  const i = texto.toLowerCase().indexOf(t.toLowerCase());
+  if (i < 0) return <>{texto}</>;
+  return (
+    <>
+      {texto.slice(0, i)}
+      <mark className="bg-yellow-200 text-gray-900 rounded px-0.5">{texto.slice(i, i + t.length)}</mark>
+      {texto.slice(i + t.length)}
+    </>
+  );
+}
+
 type SidebarTab = "conversas" | "notificacoes";
+
+type ConversaBusca = Conversa & {
+  match: { tipo: "mensagem" | "contato"; trecho: string; direcao: string; enviadaEm: string | null; total: number };
+};
 
 function MessageBubble({ msg, senderLabel, isOut }: {
   msg: Mensagem; senderLabel: string | null; isOut: boolean;
@@ -142,6 +190,7 @@ export default function WhatsappPage() {
   const [notifDestino, setNotifDestino] = useState<string | null>(null);
   const [manualMsg, setManualMsg] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
+  const [buscaGlobal, setBuscaGlobal] = useState("");
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("conversas");
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessingAudio, setIsProcessingAudio] = useState(false);
@@ -160,16 +209,39 @@ export default function WhatsappPage() {
     {},
     { refetchInterval: 10_000 }
   );
+  const buscaDebounced = useDebounced(buscaGlobal);
+  const buscaAtiva = buscaDebounced.trim().length >= 2;
+  const resultados = trpc.ia.buscarConversas.useQuery(
+    { q: buscaDebounced.trim() },
+    { enabled: buscaAtiva && sidebarTab === "conversas", keepPreviousData: true }
+  );
+  // Com termo na busca da conversa, o servidor procura no histórico inteiro do
+  // deal (não só nas 100 últimas, que era tudo que o filtro client-side via).
+  const msgQuery = useDebounced(searchQuery);
   const mensagens = trpc.ia.getMensagens.useQuery(
-    { dealId: dealId ?? "" },
-    { enabled: !!dealId, refetchInterval: 5_000 }
+    { dealId: dealId ?? "", ...(msgQuery.trim().length >= 2 ? { q: msgQuery.trim() } : {}) },
+    { enabled: !!dealId, refetchInterval: msgQuery.trim().length >= 2 ? false : 5_000 }
   );
   const notifLogs = trpc.ia.listNotificacaoLogs.useQuery(
     { projetoId: projetoId ?? "" },
     { enabled: !!projetoId && sidebarTab === "notificacoes", refetchInterval: 15_000 }
   );
 
-  const dealDaLista = (conversas.data as unknown as Conversa[] | undefined)?.find((d) => d.id === dealId);
+  const personas = trpc.ia.listPersonas.useQuery(
+    { projetoId: projetoId ?? "" },
+    { enabled: !!projetoId, staleTime: 5 * 60_000 },
+  );
+  /** Nome de exibição da persona, como cadastrado no projeto. */
+  const nomePersona = (chave: string | null | undefined): string => {
+    if (!chave) return "";
+    const p = (personas.data as Array<{ chave: string; nomeExibicao: string }> | undefined)
+      ?.find(x => x.chave === chave);
+    return p?.nomeExibicao || PERSONA_NAMES_FALLBACK[chave] || chave;
+  };
+
+  const dealDaLista =
+    (conversas.data as unknown as Conversa[] | undefined)?.find((d) => d.id === dealId) ??
+    (resultados.data as unknown as ConversaBusca[] | undefined)?.find((d) => d.id === dealId);
   // Fallback: fetch deal directly when navigated from CRM (deal may have no messages yet)
   const dealById = trpc.crm.getDeal.useQuery(
     { id: dealId ?? "" },
@@ -359,11 +431,99 @@ export default function WhatsappPage() {
               Notificações
             </button>
           </div>
+
+          {sidebarTab === "conversas" && (
+            <div className="relative flex items-center mt-2">
+              <input
+                type="text"
+                value={buscaGlobal}
+                onChange={(e) => setBuscaGlobal(e.target.value)}
+                placeholder="Buscar nome, número ou palavra…"
+                className="w-full pl-8 pr-7 py-1.5 text-sm border rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+              />
+              <span className="absolute left-2 text-gray-400 text-xs">🔍</span>
+              {buscaGlobal && (
+                <button
+                  onClick={() => setBuscaGlobal("")}
+                  className="absolute right-2 text-gray-400 hover:text-gray-600 text-xs"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {/* Conversas */}
-          {sidebarTab === "conversas" && (
+          {/* Resultados da busca global — nome, número (ou parte) e texto das mensagens */}
+          {sidebarTab === "conversas" && buscaAtiva && (
+            <>
+              {resultados.isLoading && <p className="text-center text-gray-400 mt-8 text-sm">Buscando...</p>}
+              {!resultados.isLoading && (resultados.data as unknown as ConversaBusca[] | undefined)?.length === 0 && (
+                <p className="text-center text-gray-400 mt-8 text-sm px-4">
+                  Nada encontrado para "{buscaDebounced.trim()}"
+                </p>
+              )}
+              {!!(resultados.data as unknown as ConversaBusca[] | undefined)?.length && (
+                <p className="px-4 py-2 text-xs text-gray-400 border-b bg-gray-50">
+                  {(resultados.data as unknown as ConversaBusca[]).length} conversa(s)
+                </p>
+              )}
+              {(resultados.data as unknown as ConversaBusca[] | undefined)?.map((deal) => {
+                const ultima = deal.mensagens[0];
+                const m = deal.match;
+                const quando = m.enviadaEm ?? ultima?.enviadaEm ?? deal.ultimoContatoEm;
+                return (
+                  <button
+                    key={deal.id}
+                    onClick={() => {
+                      setDealId(deal.id);
+                      // Achou por texto → já abre a conversa filtrada no mesmo termo.
+                      setSearchQuery(m.tipo === "mensagem" ? buscaDebounced.trim() : "");
+                    }}
+                    className={`w-full text-left px-4 py-3 border-b hover:bg-gray-50 ${
+                      dealId === deal.id ? "bg-indigo-50 border-l-4 border-l-indigo-500" : ""
+                    }`}
+                  >
+                    <div className="flex justify-between items-start gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Avatar contato={deal.contato} nome={deal.contato?.nome ?? deal.titulo} size={32} />
+                        <p className="font-medium text-sm text-gray-800 truncate">
+                          <Realce texto={deal.contato?.nome ?? deal.titulo} termo={buscaDebounced.trim()} />
+                        </p>
+                      </div>
+                      <span className="text-xs text-gray-400 flex-shrink-0">
+                        {quando ? formatDataHora(quando) : ""}
+                      </span>
+                    </div>
+                    {deal.contato?.whatsapp && (
+                      <p className="text-xs text-gray-400 mt-0.5">
+                        <Realce texto={deal.contato.whatsapp} termo={buscaDebounced.replace(/\D/g, "")} />
+                      </p>
+                    )}
+                    {m.tipo === "mensagem" ? (
+                      <>
+                        <p className="text-xs text-gray-600 mt-1 line-clamp-2">
+                          {m.direcao === "out" ? "→ " : ""}
+                          <Realce texto={m.trecho} termo={buscaDebounced.trim()} />
+                        </p>
+                        {m.total > 1 && (
+                          <span className="text-xs text-indigo-500">{m.total} mensagens</span>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-gray-400 mt-1 truncate">
+                        {ultima ? `${ultima.direcao === "out" ? "→ " : ""}${ultima.conteudo ?? ""}` : "sem mensagens"}
+                      </p>
+                    )}
+                  </button>
+                );
+              })}
+            </>
+          )}
+
+          {sidebarTab === "conversas" && !buscaAtiva && (
             <>
               {conversas.isLoading && <p className="text-center text-gray-400 mt-8 text-sm">Carregando...</p>}
               {conversas.data?.length === 0 && <p className="text-center text-gray-400 mt-8 text-sm">Nenhuma conversa</p>}
@@ -371,18 +531,21 @@ export default function WhatsappPage() {
                 const ultima = deal.mensagens[0];
                 return (
                   <div key={deal.id} className={`relative border-b ${dealId === deal.id ? "bg-indigo-50 border-l-4 border-l-indigo-500" : ""}`}>
-                    <button onClick={() => setDealId(deal.id)} className="w-full text-left px-4 py-3 hover:bg-gray-50">
-                      <div className="flex justify-between items-start">
-                        <p className="font-medium text-sm text-gray-800 truncate pr-8">{deal.contato?.nome ?? deal.titulo}</p>
-                        <span className="text-xs text-gray-400 ml-2 flex-shrink-0">{ultima ? formatTime(ultima.enviadaEm) : ""}</span>
+                    <button onClick={() => setDealId(deal.id)} className="w-full text-left px-3 py-3 hover:bg-gray-50 flex items-start gap-3">
+                      <Avatar contato={deal.contato} nome={deal.contato?.nome ?? deal.titulo} size={40} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex justify-between items-start">
+                          <p className="font-medium text-sm text-gray-800 truncate pr-8">{deal.contato?.nome ?? deal.titulo}</p>
+                          <span className="text-xs text-gray-400 ml-2 flex-shrink-0">{ultima ? formatTime(ultima.enviadaEm) : ""}</span>
+                        </div>
+                        <div className="flex items-center gap-1 mt-0.5">
+                          <span className={`text-xs px-1.5 py-0.5 rounded-full ${deal.iaAtiva ? "bg-green-100 text-green-700" : "bg-yellow-100 text-yellow-700"}`}>
+                            {deal.iaAtiva ? "IA" : (deal.sdrNome ? deal.sdrNome.split(" ")[0] : "Humano")}
+                          </span>
+                          {deal.iaStageChave && <span className="text-xs text-gray-400 truncate">{deal.iaStageChave.replace(/_/g, " ")}</span>}
+                        </div>
+                        {ultima && <p className="text-xs text-gray-500 mt-1 truncate">{ultima.direcao === "out" ? "→ " : ""}{ultima.conteudo ?? ""}</p>}
                       </div>
-                      <div className="flex items-center gap-1 mt-0.5">
-                        <span className={`text-xs px-1.5 py-0.5 rounded-full ${deal.iaAtiva ? "bg-green-100 text-green-700" : "bg-yellow-100 text-yellow-700"}`}>
-                          {deal.iaAtiva ? "IA" : (deal.sdrNome ? deal.sdrNome.split(" ")[0] : "Humano")}
-                        </span>
-                        {deal.iaStageChave && <span className="text-xs text-gray-400 truncate">{deal.iaStageChave.replace(/_/g, " ")}</span>}
-                      </div>
-                      {ultima && <p className="text-xs text-gray-500 mt-1 truncate">{ultima.direcao === "out" ? "→ " : ""}{ultima.conteudo ?? ""}</p>}
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); togglePausa.mutate({ dealId: deal.id, pausar: deal.iaAtiva }); }}
@@ -430,8 +593,10 @@ export default function WhatsappPage() {
       {showLeadConv && (
         <div className="flex-1 flex flex-col">
           <div className="bg-white border-b px-6 py-3 flex justify-between items-center">
-            <div>
-              <p className="font-semibold text-gray-800">{dealAtual.contato?.nome ?? dealAtual.titulo}</p>
+            <div className="flex items-center gap-3 min-w-0">
+              <Avatar contato={dealAtual.contato} nome={dealAtual.contato?.nome ?? dealAtual.titulo} size={44} />
+              <div className="min-w-0">
+              <p className="font-semibold text-gray-800 truncate">{dealAtual.contato?.nome ?? dealAtual.titulo}</p>
               <div className="flex items-center gap-2 text-xs text-gray-500">
                 {dealAtual.contato?.whatsapp && (
                   <button
@@ -447,9 +612,11 @@ export default function WhatsappPage() {
                 {dealAtual.iaPersonaChave && (
                   <><span>·</span>
                   <span className={`px-1.5 py-0.5 rounded-full text-xs font-medium ${PERSONA_COLORS[dealAtual.iaPersonaChave] ?? "bg-gray-100 text-gray-600"}`}>
-                    {PERSONA_NAMES[dealAtual.iaPersonaChave] ?? dealAtual.iaPersonaChave}
+                    {nomePersona(dealAtual.iaPersonaChave)}
                   </span></>
                 )}
+                {dealAtual.origemPlataforma && <><span>·</span><OrigemBadge deal={dealAtual} /></>}
+              </div>
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -463,7 +630,7 @@ export default function WhatsappPage() {
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Buscar mensagem..."
+                  placeholder="Buscar nesta conversa..."
                   className="pl-8 pr-3 py-1.5 text-sm border rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-300 w-44"
                 />
                 <span className="absolute left-2 text-gray-400 text-xs">🔍</span>
@@ -473,7 +640,7 @@ export default function WhatsappPage() {
               </div>
               <button
                 onClick={() => setEditDealOpen(true)}
-                title="Editar Deal"
+                title="Editar Lead"
                 className="px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 text-gray-700 hover:bg-gray-200"
               >
                 ✏️ Editar Deal
@@ -492,7 +659,7 @@ export default function WhatsappPage() {
             {mensagens.isLoading && <p className="text-center text-gray-400">Carregando...</p>}
             {searchQuery && (
               <p className="text-xs text-center text-gray-400 py-1">
-                {(mensagens.data as Mensagem[] | undefined)?.filter(m => (m.conteudo ?? "").toLowerCase().includes(searchQuery.toLowerCase())).length ?? 0} resultado(s) para "{searchQuery}"
+                {(mensagens.data as Mensagem[] | undefined)?.filter(m => (m.conteudo ?? "").toLowerCase().includes(searchQuery.toLowerCase())).length ?? 0} resultado(s) no histórico para "{searchQuery}"
               </p>
             )}
             {(mensagens.data as Mensagem[] | undefined)
@@ -501,7 +668,7 @@ export default function WhatsappPage() {
               const isOut = msg.direcao === "out";
               let senderLabel: string | null = null;
               if (isOut) {
-                senderLabel = msg.remetente ?? (msg.personaChave ? (PERSONA_NAMES[msg.personaChave] ?? msg.personaChave) : null);
+                senderLabel = msg.remetente ?? (msg.personaChave ? nomePersona(msg.personaChave) : null);
               } else {
                 senderLabel = dealAtual?.contato?.nome ?? null;
               }

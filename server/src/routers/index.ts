@@ -18,6 +18,9 @@ import { ligacoesRouter }              from "./ligacoes.js";
 import { reunioesRouter }              from "./reunioes.js";
 import { agendaRouter }               from "./agenda.js";
 import { tenantRouter }               from "./tenants.js";
+import { assinaturaRouter }           from "./assinaturas.js";
+import { painelRouter }               from "./painel.js";
+import { audienciaRouter }            from "./audiencia.js";
 
 export type { Context } from "./trpc.js";
 
@@ -41,6 +44,9 @@ export const appRouter = router({
   ligacoes:          ligacoesRouter,
   reunioes:          reunioesRouter,
   agenda:            agendaRouter,
+  assinatura:        assinaturaRouter,
+  painel:            painelRouter,
+  audiencia:         audienciaRouter,
 });
 
 export type AppRouter = typeof appRouter;

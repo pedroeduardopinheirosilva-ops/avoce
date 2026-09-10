@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { Avatar } from "../components/Avatar";
+import AudienciaLead from "../components/AudienciaLead";
 import { OrigemBadge, OrigemDetalhe, type DealOrigem } from "../components/OrigemLead";
 import { useNavigate } from "react-router-dom";
 import {
@@ -469,7 +470,7 @@ export function DealModal({
       >
         <div className="p-5 border-b border-gray-100 flex items-center justify-between">
           <h2 className="text-lg font-bold text-gray-800">
-            {isNew ? "Novo Deal" : "Editar Deal"}
+            {isNew ? "Novo Lead" : "Editar Lead"}
           </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl">×</button>
         </div>
@@ -588,6 +589,9 @@ export function DealModal({
               </div>
             </div>
           )}
+
+          {/* Audiência designada + mensagem ao cliente */}
+          {!isNew && deal?.id && <AudienciaLead dealId={deal.id} />}
 
           {/* Parecer — exibido quando preenchido pela IA */}
           {!isNew && dealDetail && (dealDetail as any).parecer && (
