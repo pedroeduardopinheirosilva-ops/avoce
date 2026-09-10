@@ -126,8 +126,24 @@ export async function moveToDescarte(
 ): Promise<{ moved: boolean; justificativa: string }> {
   const faseFunil = await prisma.iaFaseFunil.findUnique({ where: { projetoId_chave: { projetoId, chave: "descartado" } } });
   if (!faseFunil) return { moved: false, justificativa: "" };
-  const crmStage = await prisma.crmStage.findFirst({ where: { chave: "descartado" } });
-  await prisma.crmDeal.update({ where: { id: dealId }, data: { iaStageChave: "descartado", ...(crmStage ? { stageId: crmStage.id } : {}) } });
+
+  // Procurar a coluna só pela chave pegava o "descartado" de QUALQUER funil — na prática
+  // o da Subvenção ICMS, que é o primeiro. Um lead de Carreteiros descartado ia parar no
+  // funil de outro cliente. A coluna tem que ser a do funil da fase (ou a do próprio deal),
+  // e o pipelineId anda junto com o stageId, senão a IA devolve o card pro funil antigo.
+  const deal = await prisma.crmDeal.findUnique({ where: { id: dealId }, select: { pipelineId: true } });
+  const pipelineId = faseFunil.pipelineId ?? deal?.pipelineId ?? null;
+  const crmStage = pipelineId
+    ? await prisma.crmStage.findFirst({ where: { pipelineId, chave: "descartado" } })
+    : null;
+
+  await prisma.crmDeal.update({
+    where: { id: dealId },
+    data: {
+      iaStageChave: "descartado",
+      ...(crmStage ? { stageId: crmStage.id, pipelineId: crmStage.pipelineId } : {}),
+    },
+  });
   const justificativa = vinculosTodosPrescritos
     ? "Prescrição trabalhista: vínculo mais recente encerrado há mais de 2 anos."
     : "Empresa/caso fora do perfil de atuação do escritório (filtro silencioso ativado).";

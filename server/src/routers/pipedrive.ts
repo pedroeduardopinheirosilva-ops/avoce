@@ -17,6 +17,19 @@ import {
 
 const CONFIG_KEY = "pipedrive_api_token";
 
+/**
+ * Pipedrive devolve datas como "2026-05-07 18:56:49" (UTC, sem marcador de fuso).
+ * `new Date()` interpretaria isso como horário LOCAL — o que joga o dia para trás.
+ */
+function parsePdDate(v?: string | null): Date | undefined {
+  if (!v) return undefined;
+  const iso = /[zZ]|[+-]\d{2}:?\d{2}$/.test(v)
+    ? v.replace(" ", "T")
+    : `${v.replace(" ", "T")}Z`;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? undefined : d;
+}
+
 async function getToken(): Promise<string | null> {
   const cfg = await prisma.configuracao.findUnique({ where: { chave: CONFIG_KEY } });
   return cfg?.valor ?? null;
@@ -77,6 +90,62 @@ export const pipedriveRouter = router({
     };
   }),
 
+  // ── Backfill de datas de criação ──────────────────────────────────────────
+
+  /**
+   * Regrava `CrmDeal.criadoEm` com o `add_time` real do Pipedrive.
+   *
+   * Importações antigas gravavam a data do SYNC, o que empilhava milhares de
+   * deals num único dia e inutilizava qualquer série diária (painel).
+   */
+  backfillDatas: authProc
+    .input(z.object({ dryRun: z.boolean().default(false) }).default({ dryRun: false }))
+    .mutation(async ({ input }) => {
+      const token = await getToken();
+      if (!token) throw new Error("Token não configurado");
+
+      const pdDeals = await fetchDeals(token);
+      const locais = await prisma.crmDeal.findMany({
+        where: { pipedriveId: { not: null } },
+        select: { id: true, pipedriveId: true, criadoEm: true, titulo: true },
+      });
+      const porPd = new Map(locais.map(d => [d.pipedriveId!, d]));
+
+      const updates: { id: string; criadoEm: Date; titulo: string; antes: Date }[] = [];
+      let semAddTime = 0;
+      for (const pd of pdDeals) {
+        const local = porPd.get(pd.id);
+        if (!local) continue;
+        const nova = parsePdDate(pd.add_time);
+        if (!nova) { semAddTime++; continue; }
+        // tolerância de 1 min evita reescrever o que já está certo
+        if (Math.abs(nova.getTime() - local.criadoEm.getTime()) < 60_000) continue;
+        updates.push({ id: local.id, criadoEm: nova, titulo: local.titulo, antes: local.criadoEm });
+      }
+
+      if (!input.dryRun && updates.length) {
+        const BATCH = 50;
+        for (let i = 0; i < updates.length; i += BATCH) {
+          await Promise.all(updates.slice(i, i + BATCH).map(u =>
+            prisma.crmDeal.update({ where: { id: u.id }, data: { criadoEm: u.criadoEm } })
+          ));
+        }
+      }
+
+      return {
+        dryRun: input.dryRun,
+        dealsPipedrive: pdDeals.length,
+        dealsLocais: locais.length,
+        semAddTime,
+        atualizados: updates.length,
+        exemplos: updates.slice(0, 8).map(u => ({
+          titulo: u.titulo,
+          de: u.antes.toISOString().slice(0, 10),
+          para: u.criadoEm.toISOString().slice(0, 10),
+        })),
+      };
+    }),
+
   // ── Import ────────────────────────────────────────────────────────────────
 
   importar: authProc
@@ -86,7 +155,7 @@ export const pipedriveRouter = router({
       importarHistoricoEtapas: z.boolean().default(false),
       forceFull: z.boolean().default(false),
     }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ input, ctx }) => {
       const token = await getToken();
       if (!token) throw new Error("Token não configurado");
 
@@ -113,11 +182,16 @@ export const pipedriveRouter = router({
       // 1. Pipelines
       const pdPipelines = await fetchPipelines(token);
       const pipelineMap = new Map<number, string>(); // pdId → localId
+      // Sem herdar a empresa, o deal importado nasce com empresaId nulo: some das
+      // listagens por empresa e trava todo guard canAccess — ninguém consegue abrir
+      // nem excluir o card, que mesmo assim aparece no kanban.
+      const pipelineEmpresaMap = new Map<number, string | null>(); // pdId → empresaId
 
       for (const pp of pdPipelines) {
         const existing = await prisma.crmPipeline.findUnique({ where: { pipedriveId: pp.id } });
         if (existing) {
           pipelineMap.set(pp.id, existing.id);
+          pipelineEmpresaMap.set(pp.id, existing.empresaId ?? ctx.empresaId ?? null);
           if (input.overwrite) {
             await prisma.crmPipeline.update({ where: { id: existing.id }, data: { nome: pp.name } });
           }
@@ -128,9 +202,11 @@ export const pipedriveRouter = router({
               nome: pp.name,
               pipedriveId: pp.id,
               ordem: (last?.ordem ?? -1) + 1,
+              empresaId: ctx.empresaId ?? undefined,
             },
           });
           pipelineMap.set(pp.id, created.id);
+          pipelineEmpresaMap.set(pp.id, created.empresaId ?? null);
           log.push(`Pipeline criado: ${pp.name}`);
         }
       }
@@ -296,6 +372,10 @@ export const pipedriveRouter = router({
         // v2: person_phone not included in deal response; phones come from person import
         const dealPhone: string | null = null;
 
+        // add_time = data real de criação no Pipedrive. Sem isso, `criadoEm`
+        // vira a data da importação e o painel diário fica todo no dia do sync.
+        const criadoEm = parsePdDate(pd.add_time);
+
         const dealExtra = {
           organizacao:           pd.org_name ?? null,  // v2: org_name is a root string field
           motivoPerda:           pd.lost_reason ?? null,
@@ -313,7 +393,7 @@ export const pipedriveRouter = router({
           if (input.overwrite) {
             overwriteDealUpdates.push({
               id: existingId,
-              data: { titulo: pd.title, valor: pd.value || undefined, status, stageId: stageLocalId, contatoId, ...dealExtra },
+              data: { titulo: pd.title, valor: pd.value || undefined, status, stageId: stageLocalId, contatoId, ...(criadoEm ? { criadoEm } : {}), ...dealExtra },
               contatoId: contatoId ?? undefined,
               phone: dealPhone ?? undefined,
             });
@@ -328,6 +408,8 @@ export const pipedriveRouter = router({
             status,
             pipedriveId: pd.id,
             fonteLead: "Pipedrive",
+            empresaId: pipelineEmpresaMap.get(pd.pipeline_id) ?? ctx.empresaId ?? undefined,
+            ...(criadoEm ? { criadoEm } : {}),
             ...dealExtra,
           });
           newDealStageMap.set(pd.id, stageLocalId);

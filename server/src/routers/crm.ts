@@ -3,6 +3,16 @@ import { router, authProc } from "./trpc.js";
 import { prisma }    from "../db.js";
 import { whereEmpresa, canAccess } from "./tenant-utils.js";
 
+/**
+ * Deal importado (Pipedrive, planilha, bot) costuma nascer com `empresaId` nulo, e
+ * `canAccess` recusa nulo. Como o kanban lista os cards só por `stageId`, o card
+ * aparecia no funil mas não abria nem excluía. O dono real é a empresa do pipeline.
+ */
+const empresaDoDeal = (deal: { empresaId?: string | null; pipeline?: { empresaId: string | null } | null } | null) =>
+  deal?.empresaId ?? deal?.pipeline?.empresaId ?? null;
+
+const PIPELINE_EMPRESA = { pipeline: { select: { empresaId: true } } } as const;
+
 // ─── Seed dados carreteiros ───────────────────────────────────────────────────
 
 const SEED_COMERCIAL = {
@@ -142,7 +152,8 @@ export const crmRouter = router({
               id: true, titulo: true, valor: true, urgencia: true,
               status: true, stageId: true, criadoEm: true,
               valorEstimado: true, iaAtiva: true, iaPausadaPor: true,
-              contato: { select: { id: true, nome: true, whatsapp: true, cidade: true } },
+              origemPlataforma: true, origemTipo: true, origemAnuncioId: true, origemAnuncioTitulo: true, origemAnuncioTexto: true, origemUrl: true, origemEm: true,
+              contato: { select: { id: true, nome: true, whatsapp: true, cidade: true, fotoPerfilUrl: true, fotoPerfilEm: true } },
             },
           });
 
@@ -238,6 +249,10 @@ export const crmRouter = router({
         include: {
           contato: true,
           stage: true,
+          // As etiquetas do deal só existiam no card do kanban; sem elas aqui,
+          // a ficha (app iOS) mostraria o seletor de etiquetas sem saber quais
+          // já estão marcadas.
+          tags: { select: { id: true, nome: true, cor: true } },
           pipeline: {
             include: {
               stages: { select: { id: true, nome: true, cor: true }, orderBy: { ordem: "asc" } },
@@ -249,7 +264,7 @@ export const crmRouter = router({
           },
         },
       });
-      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
+      if (!canAccess(ctx, empresaDoDeal(deal))) throw new Error("Deal não pertence à sua empresa");
       return deal;
     }),
 
@@ -315,8 +330,8 @@ export const crmRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       const { id, proximoPrazo, valor, valorEstimado, valorCausaAjuizada, valorCondenacao, valorAcordo, ...rest } = input;
-      { const d = await prisma.crmDeal.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!d || !canAccess(ctx, d.empresaId)) throw new Error("Deal não pertence à sua empresa"); }
+      { const d = await prisma.crmDeal.findUnique({ where: { id }, select: { empresaId: true, ...PIPELINE_EMPRESA } });
+        if (!d || !canAccess(ctx, empresaDoDeal(d))) throw new Error("Deal não pertence à sua empresa"); }
       return prisma.crmDeal.update({
         where: { id },
         data: {
@@ -335,8 +350,17 @@ export const crmRouter = router({
   moveDeal: authProc
     .input(z.object({ dealId: z.string(), stageId: z.string() }))
     .mutation(async ({ input, ctx }) => {
-      const deal = await prisma.crmDeal.findUniqueOrThrow({ where: { id: input.dealId } });
-      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
+      const deal = await prisma.crmDeal.findUniqueOrThrow({ where: { id: input.dealId }, include: PIPELINE_EMPRESA });
+      if (!canAccess(ctx, empresaDoDeal(deal))) throw new Error("Deal não pertence à sua empresa");
+
+      // Mover de funil tem que mover o funil, não só a coluna: o motor da IA
+      // (moveDealToStage) resolve a coluna por `deal.pipelineId`, então um deal com
+      // pipelineId antigo é puxado de volta pro funil anterior no ciclo seguinte.
+      const destino = await prisma.crmStage.findUnique({
+        where: { id: input.stageId },
+        select: { pipelineId: true },
+      });
+      if (!destino) throw new Error("Etapa de destino não encontrada");
 
       await prisma.crmDealStageLog.create({
         data: {
@@ -348,7 +372,7 @@ export const crmRouter = router({
 
       return prisma.crmDeal.update({
         where: { id: input.dealId },
-        data: { stageId: input.stageId },
+        data: { stageId: input.stageId, pipelineId: destino.pipelineId },
         include: { contato: true, stage: true },
       });
     }),
@@ -356,9 +380,9 @@ export const crmRouter = router({
   deleteDeal: authProc
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
-      const deal = await prisma.crmDeal.findUnique({ where: { id: input.id } });
+      const deal = await prisma.crmDeal.findUnique({ where: { id: input.id }, include: PIPELINE_EMPRESA });
       if (!deal) throw new Error("Deal não encontrado");
-      if (!canAccess(ctx, deal.empresaId)) throw new Error("Deal não pertence à sua empresa");
+      if (!canAccess(ctx, empresaDoDeal(deal))) throw new Error("Deal não pertence à sua empresa");
 
       // Limpar tudo relacionado ao deal
       await prisma.crmMensagemWhatsapp.deleteMany({ where: { dealId: input.id } });
@@ -382,11 +406,45 @@ export const crmRouter = router({
 
   // ── Notas ─────────────────────────────────────────────────────────────��────
 
+  /// Editar os dados do lead (a pessoa). Existia criação e busca de contato,
+  /// mas não edição: corrigir um nome ou um telefone errado só dava pelo banco.
+  updateContato: authProc
+    .input(z.object({
+      id:        z.string(),
+      nome:      z.string().optional(),
+      whatsapp:  z.string().nullable().optional(),
+      telefone:  z.string().nullable().optional(),
+      email:     z.string().nullable().optional(),
+      cpf:       z.string().nullable().optional(),
+      cidade:    z.string().nullable().optional(),
+      profissao: z.string().nullable().optional(),
+      empresa:   z.string().nullable().optional(),
+    }))
+    .mutation(async ({ input, ctx }) => {
+      const { id, ...campos } = input;
+      const atual = await prisma.crmContato.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!atual) throw new Error("Contato não encontrado");
+      // Contato importado pode ter empresaId nulo; nesse caso vale o acesso ao
+      // deal, que o app já checou para chegar até aqui.
+      if (atual.empresaId && !canAccess(ctx, atual.empresaId)) {
+        throw new Error("Contato não pertence à sua empresa");
+      }
+      // Só dígitos: o WhatsApp é chave de envio, e "(77) 99999-9999" não casa
+      // com o remoteJid que volta do Evolution.
+      const whatsapp = campos.whatsapp === undefined
+        ? undefined
+        : campos.whatsapp === null ? null : campos.whatsapp.replace(/\D/g, "");
+      return prisma.crmContato.update({
+        where: { id },
+        data: { ...campos, whatsapp },
+      });
+    }),
+
   addNota: authProc
     .input(z.object({ dealId: z.string(), conteudo: z.string().min(1) }))
     .mutation(async ({ input, ctx }) => {
-      { const d = await prisma.crmDeal.findUnique({ where: { id: input.dealId }, select: { empresaId: true } });
-        if (!d || !canAccess(ctx, d.empresaId)) throw new Error("Deal não pertence à sua empresa"); }
+      { const d = await prisma.crmDeal.findUnique({ where: { id: input.dealId }, select: { empresaId: true, ...PIPELINE_EMPRESA } });
+        if (!d || !canAccess(ctx, empresaDoDeal(d))) throw new Error("Deal não pertence à sua empresa"); }
       return prisma.crmNota.create({ data: input });
     }),
 

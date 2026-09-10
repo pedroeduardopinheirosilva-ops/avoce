@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from "react";
+import { Avatar } from "../components/Avatar";
+import { OrigemBadge, OrigemDetalhe, type DealOrigem } from "../components/OrigemLead";
 import { useNavigate } from "react-router-dom";
 import {
   DndContext,
@@ -32,9 +34,9 @@ export type Deal = {
   id: string; titulo: string; valor: string | null; urgencia: boolean;
   status: string; stageId: string; criadoEm: string;
   valorEstimado: string | null; iaAtiva: boolean | null; iaPausadaPor: string | null;
-  contato: { id: string; nome: string; whatsapp: string | null; cidade: string | null } | null;
+  contato: { id: string; nome: string; whatsapp: string | null; cidade: string | null; fotoPerfilUrl?: string | null; fotoPerfilEm?: string | null } | null;
   tags?: { id: string; nome: string; cor: string }[];
-};
+} & DealOrigem;
 type Pipeline = {
   id: string; nome: string; tipo: string; cor: string;
 };
@@ -70,14 +72,20 @@ function DealCard({
       {deal.urgencia && (
         <span className="text-xs text-red-600 font-semibold mb-1 block">🔴 Urgente</span>
       )}
-      <p className="text-sm font-medium text-gray-800 leading-tight mb-1">
-        {(() => {
-          const words = (deal.contato?.nome ?? deal.titulo).trim().split(/\s+/).filter(Boolean);
-          const label = words.slice(0, 2).join(" ");
-          const last4 = deal.contato?.whatsapp?.slice(-4);
-          return last4 ? `${label} - ${last4}` : label;
-        })()}
-      </p>
+      <div className="flex items-center gap-2 mb-1">
+        <Avatar contato={deal.contato} nome={deal.contato?.nome ?? deal.titulo} size={28} />
+        <p className="text-sm font-medium text-gray-800 leading-tight min-w-0 truncate">
+          {(() => {
+            const words = (deal.contato?.nome ?? deal.titulo).trim().split(/\s+/).filter(Boolean);
+            const label = words.slice(0, 2).join(" ");
+            const last4 = deal.contato?.whatsapp?.slice(-4);
+            return last4 ? `${label} - ${last4}` : label;
+          })()}
+        </p>
+      </div>
+      {deal.origemPlataforma && (
+        <div className="mb-1 flex"><OrigemBadge deal={deal} /></div>
+      )}
       {deal.contato && (
         <p className="text-xs text-gray-500 mb-1">
           {deal.contato.cidade ? `📍 ${deal.contato.cidade}` : ""}
@@ -261,8 +269,13 @@ export function DealModal({
   const updateMut = trpc.crm.updateDeal.useMutation({
     onSuccess: () => { utils.crm.kanban.invalidate(); onSaved(); },
   });
+  const updateContatoMut = trpc.crm.updateContato.useMutation({
+    onSuccess: () => { utils.crm.kanban.invalidate(); },
+  });
+  const [erroExclusao, setErroExclusao] = useState<string | null>(null);
   const deleteMut = trpc.crm.deleteDeal.useMutation({
-    onSuccess: () => { utils.crm.kanban.invalidate(); onSaved(); },
+    onSuccess: () => { setErroExclusao(null); utils.crm.kanban.invalidate(); onSaved(); },
+    onError: (e) => setErroExclusao(e.message),
   });
   const addNotaMut = trpc.crm.addNota.useMutation({
     onSuccess: () => { utils.crm.getDeal.invalidate(); setNotaText(""); },
@@ -435,6 +448,16 @@ export function DealModal({
         valorCondenacao:    valorCondenacao    ? parseFloat(String(valorCondenacao).replace(/\./g, "").replace(",", "."))    : null,
         valorAcordo:        valorAcordo        ? parseFloat(String(valorAcordo).replace(/\./g, "").replace(",", "."))        : null,
       });
+      // O card do funil mostra o nome do CONTATO (não o título do deal) quando
+      // há contato vinculado — sem isso, editar o "nome" aqui não refletia no board.
+      if (deal?.contato?.id) {
+        updateContatoMut.mutate({
+          id: deal.contato.id,
+          nome: contatoNome,
+          whatsapp: contatoWa || null,
+          cidade: contatoCidade || null,
+        });
+      }
     }
   }
 
@@ -452,6 +475,7 @@ export function DealModal({
         </div>
 
         <div className="p-5 space-y-4">
+          {!isNew && <OrigemDetalhe deal={deal as DealOrigem | null} />}
           <div>
             <label className="block text-xs font-medium text-gray-600 mb-1">Título *</label>
             <input
@@ -624,9 +648,14 @@ export function DealModal({
             </div>
           )}
 
-          {isNew && (
+          {(isNew || deal?.contato) && (
             <div className="border-t pt-4">
-              <p className="text-xs font-semibold text-gray-500 uppercase mb-3">Contato</p>
+              <p className="text-xs font-semibold text-gray-500 uppercase mb-1">Contato</p>
+              {!isNew && (
+                <p className="text-[11px] text-gray-400 mb-2">
+                  O card do funil mostra este nome, não o "Título" acima.
+                </p>
+              )}
               <div className="space-y-2">
                 <input
                   value={contatoNome}
@@ -1114,7 +1143,7 @@ export function DealModal({
             {!isNew && (
               confirmDelete ? (
                 <div className="flex items-center gap-2">
-                  <span className="text-xs text-red-600">Confirmar exclusão?</span>
+                  <span className="text-xs text-red-600">{erroExclusao ?? "Confirmar exclusão?"}</span>
                   <button
                     onClick={() => deleteMut.mutate({ id: deal!.id })}
                     disabled={deleteMut.isPending}
@@ -1437,9 +1466,13 @@ function PipelineManagerModal({ pipelineId, pipelineName: initialName, onClose }
 
 // ── Página principal ──────────────────────────────────────────────────────────
 
+const PIPELINE_STORAGE_KEY = "avoce_crm_pipeline";
+
 export default function CrmPage() {
   const navigate = useNavigate();
-  const [activePipelineId, setActivePipelineId] = useState<string | null>(null);
+  const [activePipelineId, setActivePipelineId] = useState<string | null>(
+    () => localStorage.getItem(PIPELINE_STORAGE_KEY),
+  );
   const [activeDeal, setActiveDeal] = useState<Deal | null>(null);
   const [newDealStageId, setNewDealStageId] = useState<string | null>(null);
   const [draggingDeal, setDraggingDeal] = useState<Deal | null>(null);
@@ -1488,12 +1521,17 @@ export default function CrmPage() {
   const updateTagMut = trpc.crm.updateTag.useMutation({ onSuccess: () => { refetchTags(); setEditingTag(null); } });
   const deleteTagMut = trpc.crm.deleteTag.useMutation({ onSuccess: () => { refetchTags(); } });
 
-  // Selecionar pipeline inicial automaticamente
+  // Selecionar pipeline inicial automaticamente: mantém o último funil aberto e só
+  // cai no primeiro se ele não existir mais.
   useEffect(() => {
-    if (pipelines && pipelines.length > 0 && !activePipelineId) {
-      setActivePipelineId(pipelines[0].id);
-    }
+    if (!pipelines || pipelines.length === 0) return;
+    const existe = (pipelines as Pipeline[]).some((p) => p.id === activePipelineId);
+    if (!existe) setActivePipelineId(pipelines[0].id);
   }, [pipelines, activePipelineId]);
+
+  useEffect(() => {
+    if (activePipelineId) localStorage.setItem(PIPELINE_STORAGE_KEY, activePipelineId);
+  }, [activePipelineId]);
 
   const [buscaDebounced, setBuscaDebounced] = useState("");
   useEffect(() => {

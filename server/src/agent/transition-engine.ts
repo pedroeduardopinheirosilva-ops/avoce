@@ -4,6 +4,7 @@
  */
 
 import { prisma } from "../db.js";
+import { emSilencio } from "./quiet-hours.js";
 import { callLlm } from "./llm.js";
 import { isHumanized } from "./humanizer.js";
 import { getEvolutionConfig, sendHumanized, limparResposta, sendAudioIfConfigured, dispararNotificacoes } from "./message-handler.js";
@@ -89,11 +90,18 @@ export async function transitionDeal(
   if (!novaFase) return NO_TRANSITION;
 
   let newStageId = deal.stageId;
+  // A fase pode apontar pra outro funil. Sem mover também o pipelineId, o deal fica
+  // com coluna de um funil e funil de outro — e moveDealToStage, que resolve a coluna
+  // por `deal.pipelineId`, devolve o card pro funil antigo no ciclo seguinte.
+  let newPipelineId: string | undefined;
   if (novaFase.pipelineId) {
     const newStage = await prisma.crmStage.findFirst({
       where: { pipelineId: novaFase.pipelineId, chave: novaFase.chave },
     });
-    if (newStage) newStageId = newStage.id;
+    if (newStage) {
+      newStageId = newStage.id;
+      newPipelineId = newStage.pipelineId;
+    }
   }
 
   let novaPersona = novaFase.personaChave ?? deal.iaPersonaChave;
@@ -107,6 +115,7 @@ export async function transitionDeal(
       iaStageChave: regra.stageDestinoChave,
       iaPersonaChave: novaPersona,
       stageId: newStageId,
+      ...(newPipelineId ? { pipelineId: newPipelineId } : {}),
     },
   });
 
@@ -518,7 +527,10 @@ ATENÇÃO: taxista, motorista de app de passageiros e entregador são "negou". C
     const result = await callLlm({
       projetoId, dealId, systemPrompt,
       messages: [{ role: "user", content: texto }],
-      maxTokens: 20,
+      // JSON de ~8 tokens. Com raciocínio ligado, 20 tokens voltavam VAZIOS e
+      // o catch devolvia "inconclusivo" para TODO lead (inclusive carreteiro).
+      maxTokens: 60,
+      disableThinking: true,
     });
     const parsed = JSON.parse(result.content.trim());
     const c = parsed.c as string;
@@ -569,7 +581,9 @@ async function handleCampanhaResponse(
         projetoId, dealId,
         systemPrompt: `Você é ${personaNome}, assistente jurídica. Responda APENAS com a mensagem WhatsApp, sem prefixo, sem aspas.`,
         messages: [{ role: "user", content: promptHistorico }],
-        maxTokens: 400,
+        // Folga: o raciocínio consome saída antes do texto e, se estourar,
+        // `resumo` vem vazio e a mensagem simplesmente não é enviada.
+        maxTokens: 1200,
       });
       const resumo = result.content.trim();
       if (resumo) {
@@ -760,6 +774,14 @@ export async function enviarMensagemProativa(
   const deal = await prisma.crmDeal.findUnique({ where: { id: dealId } });
   if (!deal?.iaAtiva) return;
 
+  // Janela de envio: mensagem que o SISTEMA inicia não sai de madrugada. Guard aqui (e não em
+  // cada chamador) para valer também pros próximos. Responder ao lead nunca passa por aqui —
+  // se ele escreve 03:00, a IA responde 03:00.
+  if (await emSilencio(projetoId)) {
+    console.log(`[Proativo] dealId=${dealId} motivo=${motivoCron} — fora do horário de envio, adiado`);
+    return;
+  }
+
   const stageChave = deal.iaStageChave ?? "lead_carreteiro";
   const personaChave = deal.iaPersonaChave ?? "assistente";
 
@@ -785,6 +807,10 @@ export async function enviarMensagemProativa(
     where: { projetoId_chave: { projetoId, chave: personaChave } },
   });
   if (!persona) return;
+  if (!persona.ativo) {
+    console.log(`[Proativa] dealId=${dealId} — persona "${personaChave}" desativada; nada enviado`);
+    return;
+  }
 
   const evoConfig = await getEvolutionConfig(projetoId);
   if (!evoConfig) return;
@@ -816,7 +842,7 @@ export async function enviarMensagemProativa(
       .replace(/\{nome_advogado\}/g, advNomeProativa)
       .replace(/\{nome_secretaria\}/g, await getPersonaNomeExibicao(projetoId, "secretaria"))
       .replace(/\{nome_assistente\}/g, await getPersonaNomeExibicao(projetoId, "assistente"));
-    if (!systemPrompt.includes("DATA E HORA ATUAL")) {
+    if (!systemPrompt.includes("REGRAS INVIOLÁVEIS DE COMUNICAÇÃO")) {
       systemPrompt = INSTRUCAO_BASE + "\n\n" + systemPrompt;
     }
     if (nomeCliente) {
