@@ -24,6 +24,7 @@ const EVENTOS_SUGERIDOS = [
   { value: "qualificacao_completa",            label: "Lead qualificado (Ana concluiu coleta)" },
   { value: "fluxo_concluido",                  label: "Fluxo Daniela concluído (reunião agendada)" },
   { value: "documentos_pessoais",              label: "Cliente enviou documentos pessoais" },
+  { value: "documentos_para_revisao",          label: "Documentos gerados — aguardando revisão" },
   { value: "proposta_aceita",                  label: "Proposta aceita / contrato assinado" },
   { value: "solicita_ligacao",                 label: "Lead pede ligação telefônica" },
   { value: "descarte_revisao_humana",          label: "Descarte — aguardando revisão do SDR" },
@@ -295,6 +296,7 @@ type Persona = {
   proximaPersonaChave: string | null;
   usarAudio: boolean;
   farewellTexto: string | null;
+  ativo: boolean;
 };
 
 const CATEGORIA_LABELS: Record<string, string> = {
@@ -440,9 +442,11 @@ const BLANK_REGRA = (): Partial<Regra> => ({
   parametros: null, ordem: 0, requerPrescricaoAtiva: false,
 });
 
+import ConfigAudiencias from "../components/ConfigAudiencias";
+
 export default function ConfigIAPage() {
   const [projetoId, setProjetoId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo" | "followup" | "desqualificacao">("configs");
+  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo" | "followup" | "desqualificacao" | "audiencias">("configs");
   const [followUpExpanded, setFollowUpExpanded] = useState(false);
   const [followUpMsgExpanded, setFollowUpMsgExpanded] = useState(false);
   const [stageFollowExpanded, setStageFollowExpanded] = useState<Record<string, boolean>>({});
@@ -510,6 +514,9 @@ export default function ConfigIAPage() {
 
   const upsertConfig = trpc.ia.upsertConfig.useMutation({
     onSuccess: () => configs.refetch(),
+  });
+  const setPersonaAtiva = trpc.ia.setPersonaAtiva.useMutation({
+    onSuccess: () => personas.refetch(),
   });
   const upsertPersona = trpc.ia.upsertPersona.useMutation({
     onSuccess: () => {
@@ -728,6 +735,7 @@ export default function ConfigIAPage() {
               ["proposta", "Proposta"],
               ["followup", "Follow-up"],
               ["desqualificacao", "🚫 Desqualificação"],
+              ["audiencias", "⚖️ Audiências"],
             ] as const).map(([t, label]) => (
               <button
                 key={t}
@@ -740,6 +748,8 @@ export default function ConfigIAPage() {
               </button>
             ))}
           </div>
+
+          {tab === "audiencias" && projetoId && <ConfigAudiencias projetoId={projetoId} />}
 
           {/* Configs tab */}
           {tab === "configs" && (
@@ -1281,8 +1291,13 @@ export default function ConfigIAPage() {
                       <div className="flex justify-between items-start">
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-semibold text-gray-800">{p.nomeExibicao}</span>
+                            <span className={`font-semibold ${p.ativo === false ? "text-gray-400 line-through" : "text-gray-800"}`}>
+                              {p.nomeExibicao}
+                            </span>
                             <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">{p.chave}</span>
+                            {p.ativo === false && (
+                              <span className="text-xs bg-gray-200 text-gray-600 px-2 py-0.5 rounded-full">desativada</span>
+                            )}
                             {p.llmProviderChave && (
                               <span className="text-xs bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">{p.llmProviderChave}</span>
                             )}
@@ -1290,12 +1305,28 @@ export default function ConfigIAPage() {
                           {p.descricaoPapel && <p className="text-sm text-gray-500 mt-1">{p.descricaoPapel}</p>}
                           <p className="text-xs text-gray-400 mt-2 line-clamp-2">{p.systemPrompt.slice(0, 120)}...</p>
                         </div>
-                        <button
-                          onClick={() => setEditPersona(p)}
-                          className="ml-4 text-sm text-indigo-600 hover:underline flex-shrink-0"
-                        >
-                          Editar
-                        </button>
+                        <div className="ml-4 flex items-center gap-3 flex-shrink-0">
+                          <label className="flex items-center gap-1.5 cursor-pointer select-none" title="Desativada, esta persona não responde nem envia mensagem proativa em nenhum deal">
+                            <input
+                              type="checkbox"
+                              checked={p.ativo !== false}
+                              disabled={setPersonaAtiva.isLoading}
+                              onChange={(e) => projetoId && setPersonaAtiva.mutate({
+                                projetoId, chave: p.chave, ativo: e.target.checked,
+                              })}
+                              className="w-4 h-4 rounded border-gray-300 text-brand-600"
+                            />
+                            <span className={`text-xs font-medium ${p.ativo !== false ? "text-green-600" : "text-gray-400"}`}>
+                              {p.ativo !== false ? "Ativa" : "Desativada"}
+                            </span>
+                          </label>
+                          <button
+                            onClick={() => setEditPersona(p)}
+                            className="text-sm text-indigo-600 hover:underline"
+                          >
+                            Editar
+                          </button>
+                        </div>
                       </div>
 
                       {/* Mídia de apresentação */}
@@ -1740,6 +1771,46 @@ export default function ConfigIAPage() {
                   </div>
                 </div>
 
+                {/* Revisão antes do envio */}
+                <div className="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-semibold text-gray-800 text-sm">Revisar antes de enviar</h3>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Ligado: a IA gera contrato, procuração e declaração e para. Os documentos ficam em
+                        <strong> Propostas</strong> com o selo “Em revisão” até alguém clicar em
+                        <strong> Liberar para assinatura</strong>. Desligado: vai direto para o cliente.
+                      </p>
+                    </div>
+                    <label className="flex items-center gap-2 cursor-pointer select-none flex-shrink-0 ml-4">
+                      <input
+                        type="checkbox"
+                        checked={get("proposta_revisao_manual") !== "false"}
+                        onChange={e => saveSelect("proposta_revisao_manual", e.target.checked ? "true" : "false", { descricao: "Revisar os documentos antes de enviar para assinatura" })}
+                        className="w-4 h-4 rounded border-gray-300 text-brand-600"
+                      />
+                      <span className={`text-sm font-medium ${get("proposta_revisao_manual") !== "false" ? "text-green-600" : "text-gray-400"}`}>
+                        {get("proposta_revisao_manual") !== "false" ? "✓ Com revisão" : "Sem revisão"}
+                      </span>
+                    </label>
+                  </div>
+                  {get("proposta_revisao_manual") !== "false" && (
+                    <div>
+                      <label className="block text-xs font-medium text-gray-600 mb-1">
+                        Mensagem ao cliente enquanto a revisão não sai <span className="text-gray-400">({'{{nome}}'} = primeiro nome; vazio = texto padrão)</span>
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={get("proposta_msg_revisao")}
+                        onChange={e => setEditando(prev => ({ ...prev, proposta_msg_revisao: e.target.value }))}
+                        onBlur={() => saveSelect("proposta_msg_revisao", get("proposta_msg_revisao"), { descricao: "Mensagem ao cliente enquanto os documentos estão em revisão" })}
+                        placeholder="Perfeito, {{nome}}! Recebi tudo o que precisava. Seus documentos já estão sendo preparados e passam por uma conferência final da nossa equipe. Assim que estiverem prontos eu te envio aqui os links para assinatura."
+                        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm"
+                      />
+                    </div>
+                  )}
+                </div>
+
                 {/* Templates */}
                 <div className="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
                   <h3 className="font-semibold text-gray-800 text-sm">Templates</h3>
@@ -1842,6 +1913,39 @@ export default function ConfigIAPage() {
                         {TIPOS_CONTRATO.map(t => <option key={t.v} value={t.v}>{t.l}</option>)}
                       </select>
                     </div>
+                  </div>
+
+                  {/* Signatários do contrato — cliente + RAP + 2 testemunhas */}
+                  <div className="border-t border-gray-200 pt-4 space-y-3">
+                    <div>
+                      <h4 className="font-semibold text-gray-800 text-sm">Signatários do contrato</h4>
+                      <p className="text-xs text-gray-500 mt-0.5">
+                        Além do cliente, o <strong>contrato</strong> vai para estas pessoas — cada uma recebe só o
+                        próprio link, no próprio WhatsApp. Procuração e declaração continuam apenas com o cliente.
+                        Deixe em branco para o contrato ir só com o cliente.
+                      </p>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Formato: <code>Nome|email|whatsapp</code> — ex.:{" "}
+                        <code>Maria Souza|maria@rap.adv.br|5577999998888</code>
+                      </p>
+                    </div>
+                    {([
+                      ["proposta_rap_signatario", "Assina pela RAP"],
+                      ["proposta_testemunha_1",   "Testemunha 1"],
+                      ["proposta_testemunha_2",   "Testemunha 2"],
+                    ] as const).map(([chave, rotulo]) => (
+                      <div key={chave}>
+                        <label className="block text-xs font-medium text-gray-600 mb-1">{rotulo}</label>
+                        <input
+                          type="text"
+                          value={get(chave)}
+                          onChange={e => setEditando(prev => ({ ...prev, [chave]: e.target.value }))}
+                          onBlur={() => saveSelect(chave, get(chave), { descricao: `${rotulo} — Nome|email|whatsapp` })}
+                          placeholder="Nome|email|whatsapp"
+                          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono"
+                        />
+                      </div>
+                    ))}
                   </div>
 
                   <div>

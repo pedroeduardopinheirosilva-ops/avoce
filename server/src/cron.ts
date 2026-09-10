@@ -654,19 +654,21 @@ async function detectarNoShows(): Promise<void> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /**
- * Lembra o cliente da audiência que se aproxima: semanal enquanto falta mais de
- * uma semana, diário na última semana.
+ * Lembra o cliente da audiência que se aproxima. Texto e cadência vêm do banco
+ * (IaMensagemTemplate + IaProjetoConfig categoria "audiencia"), por projeto.
  *
- * Só entra lead cuja designação já foi avisada — mandar "sua audiência está
- * chegando" para quem nunca recebeu a data seria estranho. `audienciaLembreteEm`
- * trava um envio por dia, para que um restart do processo não repita a mensagem.
+ * Roda de hora em hora e só age na hora configurada, para que mudar o horário
+ * do disparo não exija reprogramar o cron. Só entra lead cuja designação já foi
+ * enviada — "sua audiência está chegando" para quem nunca recebeu a data seria
+ * estranho. `audienciaLembreteEm` trava um envio por dia por lead.
  */
 async function enviarLembretesAudiencia(): Promise<void> {
-  const { diasAte, ehDiaDeLembrete, ehTipoValido, formatarValor, montarMensagemLembrete } =
-    await import("./services/audiencia.js");
+  const aud = await import("./services/audiencia.js");
   const { enviarTextoParaDeal, remetenteDoDeal } = await import("./services/whatsapp-deal.js");
 
   const agora = new Date();
+  const hora = aud.horaLocal(agora);
+
   const deals = await prisma.crmDeal.findMany({
     where: {
       audienciaEm: { gt: agora },
@@ -675,31 +677,47 @@ async function enviarLembretesAudiencia(): Promise<void> {
     },
     include: { contato: true },
   });
+  if (deals.length === 0) return;
+
+  const cacheCadencia = new Map<string, Awaited<ReturnType<typeof aud.carregarCadencia>>>();
+  const semModelo = new Set<string>();
 
   for (const deal of deals) {
     try {
-      if (!deal.audienciaEm || !ehTipoValido(deal.audienciaTipo)) continue;
-      if (!deal.contato?.whatsapp) continue;
+      if (!deal.audienciaEm || !deal.contato?.whatsapp) continue;
 
-      const dias = diasAte(deal.audienciaEm, agora);
-      if (!ehDiaDeLembrete(dias)) continue;
+      const projetoId = await aud.resolverProjetoId(deal);
+      if (!projetoId) continue;
 
-      // Já mandou hoje? (compara o dia local, não as 24h)
-      const ultimo = deal.audienciaLembreteEm;
-      if (ultimo && diasAte(agora, ultimo) === 0) continue;
+      let cad = cacheCadencia.get(projetoId);
+      if (!cad) { cad = await aud.carregarCadencia(projetoId); cacheCadencia.set(projetoId, cad); }
+      if (hora !== cad.hora) continue;
 
-      const texto = montarMensagemLembrete({
+      const dias = aud.diasAte(deal.audienciaEm, agora);
+      if (!aud.ehDiaDeLembrete(dias, cad)) continue;
+
+      // Já mandou hoje? (compara o dia local, não as últimas 24h)
+      if (deal.audienciaLembreteEm && aud.diasAte(agora, deal.audienciaLembreteEm) === 0) continue;
+
+      const montada = await aud.montarMensagem(projetoId, aud.CHAVE_LEMBRETE, {
         nome:       (deal.contato.nome ?? deal.titulo).trim().split(/\s+/)[0],
         em:         deal.audienciaEm,
-        tipo:       deal.audienciaTipo,
         modalidade: deal.audienciaModalidade === "virtual" ? "virtual" : "presencial",
         local:      deal.audienciaLocal,
         empresa:    null,
-        valorCausa: formatarValor(deal.valorCausaAjuizada),
+        valorCausa: aud.formatarValor(deal.valorCausaAjuizada),
       });
 
+      if (!montada) {
+        if (!semModelo.has(projetoId)) {
+          semModelo.add(projetoId);
+          console.warn(`[Audiencia] Projeto ${projetoId} sem o modelo "${aud.CHAVE_LEMBRETE}" — lembretes não serão enviados até cadastrá-lo em Config IA → Audiências`);
+        }
+        continue;
+      }
+
       const remetente = await remetenteDoDeal(deal.responsavelId);
-      await enviarTextoParaDeal(deal.id, texto, remetente);
+      await enviarTextoParaDeal(deal.id, montada.texto, remetente);
       await prisma.crmDeal.update({
         where: { id: deal.id },
         data: { audienciaLembreteEm: new Date() },
@@ -814,8 +832,8 @@ export function iniciarCron(): void {
     }
   });
 
-  // Lembretes de audiência: diário às 09:30 (depois do follow-up, no horário comercial)
-  cron.schedule("30 9 * * *", async () => {
+  // Lembretes de audiência: de hora em hora; a hora do disparo é configurável por projeto
+  cron.schedule("30 * * * *", async () => {
     try {
       await enviarLembretesAudiencia();
     } catch (err) {

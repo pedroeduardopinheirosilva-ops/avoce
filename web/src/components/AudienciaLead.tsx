@@ -22,7 +22,7 @@ function isoParaLocal(iso: string | null | undefined): string {
 
 export default function AudienciaLead({ dealId }: Props) {
   const utils = trpc.useUtils();
-  const { data: opcoes } = trpc.audiencia.opcoes.useQuery();
+  const { data: opcoes } = trpc.audiencia.opcoes.useQuery({});
   const { data: deal } = trpc.crm.getDeal.useQuery({ id: dealId }, { enabled: !!dealId });
 
   const [em, setEm] = useState("");
@@ -165,6 +165,18 @@ export default function AudienciaLead({ dealId }: Props) {
           <p className="text-xs font-medium text-gray-600 mb-1">
             Mensagem para o cliente — confira antes de enviar
           </p>
+          {preview?.semModelo && (
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-2">
+              O modelo <code>{preview.chaveTemplate}</code> ainda não foi cadastrado. Crie o texto em
+              Config IA → Audiências para que a mensagem seja montada.
+            </p>
+          )}
+          {!!preview?.faltando?.length && (
+            <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-2">
+              O modelo usa {preview.faltando.join(", ")} e esse dado está vazio no lead. Preencha no
+              cadastro ou ajuste o texto abaixo antes de enviar.
+            </p>
+          )}
           <textarea
             value={texto}
             onChange={(e) => { setTexto(e.target.value); setEditouTexto(true); }}
@@ -174,7 +186,7 @@ export default function AudienciaLead({ dealId }: Props) {
           <div className="flex items-center gap-2 mt-2">
             <button
               onClick={() => enviarMut.mutate({ dealId, texto })}
-              disabled={enviarMut.isPending || texto.trim().length < 10}
+              disabled={enviarMut.isPending || texto.trim().length < 10 || !!preview?.semModelo}
               className="px-3 py-1.5 text-xs bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
             >
               {enviarMut.isPending ? "Enviando…" : avisadaEm ? "Enviar novamente" : "Enviar no WhatsApp"}
@@ -189,10 +201,14 @@ export default function AudienciaLead({ dealId }: Props) {
             )}
             {enviado && <span className="text-xs text-green-700">Enviado ✓</span>}
           </div>
-          <p className="text-[11px] text-gray-500 mt-2">
-            Depois do envio, o lembrete sai sozinho: toda semana até faltar 7 dias, e diariamente na
-            última semana.
-          </p>
+          {preview?.previsao && preview.previsao.length > 0 && (
+            <p className="text-[11px] text-gray-500 mt-2">
+              Depois do envio, o lembrete sai sozinho faltando{" "}
+              {preview.previsao.join(", ")} dia(s) — {preview.previsao.length} mensagem(ns), às{" "}
+              {String(preview.cadencia?.hora ?? 9).padStart(2, "0")}h. A cadência e os textos são
+              editados em Config IA → Audiências.
+            </p>
+          )}
         </div>
       )}
     </div>

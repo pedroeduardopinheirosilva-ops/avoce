@@ -4,8 +4,10 @@ import { router, authProc } from "./trpc.js";
 import { prisma } from "../db.js";
 import { canOperate } from "./tenant-utils.js";
 import {
-  TIPOS_AUDIENCIA, MODALIDADES, ehTipoValido, formatarValor,
-  montarMensagemDesignacao, montarMensagemLembrete,
+  TIPOS_AUDIENCIA, MODALIDADES, VARIAVEIS, CHAVES_ESPERADAS, CHAVE_LEMBRETE,
+  CATEGORIA_CFG, CFG_DIARIO_DIAS, CFG_SEMANAL, CFG_HORA,
+  carregarCadencia, chaveDesignacao, diasAte, ehTipoValido, formatarValor,
+  montarMensagem, previsaoLembretes, resolverProjetoId, templatesFaltando,
   type DadosAudiencia, type Modalidade, type TipoAudiencia,
 } from "../services/audiencia.js";
 import { enviarTextoParaDeal, remetenteDoDeal } from "../services/whatsapp-deal.js";
@@ -15,13 +17,13 @@ const INCLUDE_DEAL = {
   vinculos: { orderBy: { ordem: "asc" as const }, take: 1 },
 } as const;
 
-type DealComAudiencia = Awaited<ReturnType<typeof carregarDeal>>;
-
 async function carregarDeal(id: string) {
   const deal = await prisma.crmDeal.findUnique({ where: { id }, include: INCLUDE_DEAL });
   if (!deal) throw new TRPCError({ code: "NOT_FOUND", message: "Lead não encontrado" });
   return deal;
 }
+
+type DealCarregado = Awaited<ReturnType<typeof carregarDeal>>;
 
 function assertAcesso(
   ctx: { empresaId?: string; empresaIds?: string[]; role?: string },
@@ -32,18 +34,16 @@ function assertAcesso(
 }
 
 /**
- * Junta o que a mensagem precisa. A empresa reclamada vem do primeiro vínculo de
- * emprego do lead (é a que foi para a inicial); o contato é a segunda fonte.
+ * Variáveis da mensagem. A empresa reclamada vem do primeiro vínculo de emprego
+ * do lead (é a que foi para a inicial); o contato é a segunda fonte.
  */
-function dadosParaMensagem(deal: DealComAudiencia): DadosAudiencia {
-  if (!deal.audienciaEm || !ehTipoValido(deal.audienciaTipo)) {
+function dadosParaMensagem(deal: DealCarregado): DadosAudiencia {
+  if (!deal.audienciaEm) {
     throw new TRPCError({ code: "BAD_REQUEST", message: "Lead sem audiência cadastrada" });
   }
-  const primeiroNome = (deal.contato?.nome ?? deal.titulo).trim().split(/\s+/)[0];
   return {
-    nome:       primeiroNome,
+    nome:       (deal.contato?.nome ?? deal.titulo).trim().split(/\s+/)[0],
     em:         deal.audienciaEm,
-    tipo:       deal.audienciaTipo as TipoAudiencia,
     modalidade: (deal.audienciaModalidade === "virtual" ? "virtual" : "presencial") as Modalidade,
     local:      deal.audienciaLocal,
     empresa:    deal.vinculos?.[0]?.empresa ?? deal.contato?.empresa ?? null,
@@ -52,11 +52,30 @@ function dadosParaMensagem(deal: DealComAudiencia): DadosAudiencia {
 }
 
 export const audienciaRouter = router({
-  /** Opções para os selects da tela — uma fonte só, para não divergir do backend. */
-  opcoes: authProc.query(() => ({
-    tipos: TIPOS_AUDIENCIA.map((t) => ({ ...t })),
-    modalidades: MODALIDADES.map((m) => m),
-  })),
+  /**
+   * Opções dos selects e o inventário de configuração: quais modelos ainda
+   * faltam cadastrar e qual a cadência em vigor. Uma fonte só para a tela.
+   */
+  opcoes: authProc
+    .input(z.object({ projetoId: z.string().optional() }).optional())
+    .query(async ({ input }) => {
+      const projetoId = input?.projetoId;
+      return {
+        tipos: TIPOS_AUDIENCIA.map((t) => ({ ...t, chaveTemplate: chaveDesignacao(t.chave) })),
+        modalidades: MODALIDADES.map((m) => m),
+        variaveis: VARIAVEIS.map((v) => ({ ...v })),
+        chavesEsperadas: CHAVES_ESPERADAS,
+        chaveLembrete: CHAVE_LEMBRETE,
+        faltando: projetoId ? await templatesFaltando(projetoId) : [],
+        cadencia: projetoId ? await carregarCadencia(projetoId) : null,
+        configChaves: {
+          categoria: CATEGORIA_CFG,
+          diarioDias: CFG_DIARIO_DIAS,
+          semanal: CFG_SEMANAL,
+          hora: CFG_HORA,
+        },
+      };
+    }),
 
   /** Cadastra ou atualiza a audiência do lead. Não envia nada. */
   salvar: authProc
@@ -96,8 +115,8 @@ export const audienciaRouter = router({
     }),
 
   /**
-   * Texto pronto para conferência antes de enviar. `qual` permite pré-visualizar
-   * também o lembrete, que é o que o cron vai mandar depois.
+   * Texto pronto para conferência. Devolve também as variáveis que vieram
+   * vazias e a previsão de lembretes, para a pessoa decidir antes de enviar.
    */
   preview: authProc
     .input(z.object({
@@ -107,19 +126,37 @@ export const audienciaRouter = router({
     .query(async ({ input, ctx }) => {
       const deal = await carregarDeal(input.dealId);
       assertAcesso(ctx, deal);
-      const dados = dadosParaMensagem(deal);
+
+      const projetoId = await resolverProjetoId(deal);
+      if (!projetoId) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Lead sem projeto de IA — não há onde buscar os modelos" });
+      }
+      if (input.qual === "designacao" && !ehTipoValido(deal.audienciaTipo)) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Selecione o tipo da audiência" });
+      }
+
+      const chave = input.qual === "lembrete"
+        ? CHAVE_LEMBRETE
+        : chaveDesignacao(deal.audienciaTipo as TipoAudiencia);
+
+      const montada = await montarMensagem(projetoId, chave, dadosParaMensagem(deal));
+      const cadencia = await carregarCadencia(projetoId);
+
       return {
-        texto: input.qual === "lembrete"
-          ? montarMensagemLembrete(dados)
-          : montarMensagemDesignacao(dados),
+        chaveTemplate: chave,
+        texto:    montada?.texto ?? null,
+        faltando: montada?.faltando ?? [],
+        semModelo: montada === null,
         destino: deal.contato?.whatsapp ?? null,
         jaAvisadoEm: deal.audienciaAvisadaEm,
+        cadencia,
+        previsao: deal.audienciaEm ? previsaoLembretes(diasAte(deal.audienciaEm), cadencia) : [],
       };
     }),
 
   /**
-   * Envia a designação ao cliente. O texto vai como parâmetro para que valha o
-   * que a pessoa leu (e eventualmente editou) na tela, não uma remontagem.
+   * Envia a designação. O texto vai como parâmetro para valer o que a pessoa
+   * leu (e eventualmente editou) na tela, não uma remontagem.
    */
   enviarDesignacao: authProc
     .input(z.object({ dealId: z.string(), texto: z.string().min(10).max(4000) }))
