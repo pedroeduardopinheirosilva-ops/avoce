@@ -24,6 +24,94 @@ async function isPaktAssinado(paktDocumentId: string | null, paktApiKey: string,
   }
 }
 
+/** Normaliza nome para comparar signatário do PAKT com o tomador da proposta. */
+function chaveNome(nome: string): string {
+  return (nome ?? "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/** E-mail genérico que o fluxo usa quando o cliente não tem e-mail — não identifica ninguém. */
+const EMAIL_GENERICO = "assinar@avoce.com.br";
+
+/**
+ * Envelope refeito à mão.
+ *
+ * Quando alguém do escritório recria os documentos direto no PAKT (upload dos
+ * .docx) em vez de reenviar pelo fluxo, a proposta continua apontando para o
+ * envelope velho: o follow-up nunca vê a assinatura e cobra por dias um cliente
+ * que já assinou. Aqui a proposta é reconciliada pelo signatário — procura na
+ * conta PAKT documentos COMPLETED do mesmo cliente criados a partir da data da
+ * proposta e que ainda não estejam no `paktDocumentId` dela.
+ *
+ * A conta PAKT é compartilhada com o PSA-MT, por isso o casamento exige
+ * e-mail igual (ignorando o genérico do fluxo) ou nome idêntico.
+ */
+export async function acharEnvelopeAssinadoFora(proposta: any): Promise<Array<{ id: string; signUrl: string; titulo: string; assinadoEm: Date }>> {
+  const email = (proposta.tomador?.email ?? "").trim().toLowerCase();
+  const nome   = chaveNome(proposta.tomador?.nome ?? "");
+  if ((!email || email === EMAIL_GENERICO) && !nome) return [];
+
+  // Ids que a proposta já conhece — o que já está nela não é envelope novo.
+  const conhecidos = new Set<string>();
+  try {
+    const parsed = JSON.parse(proposta.paktDocumentId ?? "[]");
+    for (const e of Array.isArray(parsed) ? parsed : [parsed]) {
+      const id = typeof e === "string" ? e : e?.id;
+      if (id) conhecidos.add(id);
+    }
+  } catch { /* paktDocumentId antigo era id solto */ }
+
+  const desde = new Date(proposta.criadoEm ?? 0).getTime();
+  const { paktListarDocumentos, paktObterDocumento } = await import("../lib/pakt.js");
+  const achados: Array<{ id: string; signUrl: string; titulo: string; assinadoEm: Date }> = [];
+
+  // Lista vem por createdAt desc: para de paginar ao passar da data da proposta.
+  for (let page = 1; page <= 5; page++) {
+    let lote;
+    try {
+      lote = await paktListarDocumentos(page, 100, "COMPLETED");
+    } catch (e) {
+      console.error("[FollowUp] falha ao listar documentos do PAKT:", (e as Error).message);
+      break;
+    }
+    const docs = lote?.documents ?? [];
+    if (docs.length === 0) break;
+
+    let passouDaData = false;
+    for (const doc of docs) {
+      const criadoEm = doc.createdAt ? new Date(doc.createdAt).getTime() : NaN;
+      if (!Number.isNaN(criadoEm) && criadoEm < desde) { passouDaData = true; continue; }
+      if (conhecidos.has(doc.id)) continue;
+
+      const signer = (doc.signers ?? []).find((s: any) => {
+        const e = (s.email ?? "").trim().toLowerCase();
+        if (e && e !== EMAIL_GENERICO && e === email) return true;
+        return !!nome && chaveNome(s.nome ?? "") === nome;
+      });
+      if (!signer || (signer.status ?? "").toUpperCase() !== "SIGNED") continue;
+
+      // signUrl só vem no detalhe; a lista traz os signatários sem o token.
+      let signUrl = "";
+      try {
+        const detalhe = await paktObterDocumento(doc.id);
+        signUrl = detalhe.signers?.find((s: any) => s.id === signer.id)?.signUrl ?? "";
+      } catch { /* segue sem link: o que importa é o PDF assinado */ }
+
+      achados.push({
+        id: doc.id,
+        signUrl,
+        titulo: doc.nome ?? "Documento",
+        assinadoEm: signer.signedAt ? new Date(signer.signedAt) : new Date(),
+      });
+    }
+
+    if (passouDaData || page >= (lote?.pagination?.totalPages ?? 1)) break;
+  }
+
+  return achados;
+}
+
 // Renew a PAKT document link (create new doc with same PDF)
 async function renovarLinkPakt(
   doc: { id: string; titulo: string; pdfPath: string },
@@ -145,9 +233,13 @@ async function runFollowUpProjeto(projetoId: string, paktApiKey: string, paktBas
     },
     include: { deal: { select: { id: true, projetoId: true } } },
   });
-  const propostaIdsDoProjeto = new Set(
-    notasPropostas.map(n => n.conteudo.split(": ")[1]?.split(" |")[0]?.trim()).filter(Boolean)
-  );
+  // propostaId → dealId: precisa do deal para anexar os assinados no acervo dele
+  const propostaParaDeal = new Map<string, string>();
+  for (const n of notasPropostas) {
+    const pid = n.conteudo.split(": ")[1]?.split(" |")[0]?.trim();
+    if (pid && n.deal?.id) propostaParaDeal.set(pid, n.deal.id);
+  }
+  const propostaIdsDoProjeto = new Set(propostaParaDeal.keys());
 
   const propostasFiltradas = propostas.filter((p: any) => propostaIdsDoProjeto.has(p.id));
 
@@ -167,6 +259,13 @@ async function runFollowUpProjeto(projetoId: string, paktApiKey: string, paktBas
         if (diasDesde < intervaloDias) continue;
       }
 
+      // Recolhe o que já estiver assinado, mesmo com a proposta incompleta.
+      // Rede de segurança: o caminho normal é o webhook, que chama o mesmo módulo.
+      const { anexarAssinadosAoDeal } = await import("./assinados-deal.js");
+      await anexarAssinadosAoDeal(
+        proposta.paktDocumentId, propostaParaDeal.get(proposta.id), paktApiKey, paktBaseUrl,
+      );
+
       // Check if already signed via PAKT API
       const jaAssinado = await isPaktAssinado(proposta.paktDocumentId, paktApiKey, paktBaseUrl);
       if (jaAssinado) {
@@ -175,6 +274,23 @@ async function runFollowUpProjeto(projetoId: string, paktApiKey: string, paktBas
           data: { paktAssinadoEm: new Date() },
         });
         console.log(`[FollowUp] Proposta ${proposta.id} assinada — marcando e parando follow-up`);
+        continue;
+      }
+
+      // Assinou, mas num envelope refeito à mão fora do fluxo: reconcilia e para de cobrar.
+      const refeito = await acharEnvelopeAssinadoFora(proposta);
+      if (refeito.length > 0) {
+        const novoJson = JSON.stringify(refeito.map(d => ({ id: d.id, signUrl: d.signUrl, titulo: d.titulo })));
+        const assinadoEm = refeito.reduce((max, d) => (d.assinadoEm > max ? d.assinadoEm : max), refeito[0].assinadoEm);
+        await (prisma as any).proposta.update({
+          where: { id: proposta.id },
+          data: { paktDocumentId: novoJson, paktSignUrl: refeito[0].signUrl || proposta.paktSignUrl, paktAssinadoEm: assinadoEm },
+        });
+        await anexarAssinadosAoDeal(novoJson, propostaParaDeal.get(proposta.id), paktApiKey, paktBaseUrl);
+        console.log(
+          `[FollowUp] Proposta ${proposta.id} (${proposta.tomador.nome}): assinada em envelope refeito ` +
+          `(${refeito.map(d => d.titulo).join(", ")}) — reconciliada e follow-up encerrado`,
+        );
         continue;
       }
 
