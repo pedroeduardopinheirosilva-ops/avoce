@@ -21,6 +21,7 @@ import { tenantRouter }               from "./tenants.js";
 import { assinaturaRouter }           from "./assinaturas.js";
 import { painelRouter }               from "./painel.js";
 import { audienciaRouter }            from "./audiencia.js";
+import { motoresRouter }              from "./motores.js";
 
 export type { Context } from "./trpc.js";
 
@@ -47,6 +48,7 @@ export const appRouter = router({
   assinatura:        assinaturaRouter,
   painel:            painelRouter,
   audiencia:         audienciaRouter,
+  motores:           motoresRouter,
 });
 
 export type AppRouter = typeof appRouter;

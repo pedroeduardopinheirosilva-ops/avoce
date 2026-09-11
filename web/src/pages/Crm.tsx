@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Avatar } from "../components/Avatar";
 import AudienciaLead from "../components/AudienciaLead";
+import MotorColeta from "../components/MotorColeta";
 import { OrigemBadge, OrigemDetalhe, type DealOrigem } from "../components/OrigemLead";
 import { useNavigate } from "react-router-dom";
 import {
@@ -43,6 +44,40 @@ type Pipeline = {
 };
 
 // ── Card draggável ─────────────────────────────────────────────────────────────
+
+// ── camposCustom ───────────────────────────────────────────────────────────────
+// O JSON de camposCustom vem de integrações (importações, robôs de prospecção) e
+// pode conter booleanos, listas e objetos aninhados. Jogar isso direto no JSX
+// derruba o render inteiro ("Objects are not valid as a React child"), então todo
+// valor passa por aqui antes de virar texto.
+
+const ROTULOS_CAMPO: Record<string, string> = {
+  cnpj: "CNPJ",
+  ie: "IE",
+  inscricao_estadual: "Inscrição estadual",
+  crc: "CRC",
+  uf: "UF",
+  cnae: "CNAE",
+};
+
+function rotuloCampo(chave: string): string {
+  if (ROTULOS_CAMPO[chave]) return ROTULOS_CAMPO[chave];
+  const t = chave.replace(/_/g, " ").trim();
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+function valorCampo(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "boolean") return v ? "sim" : "não";
+  if (Array.isArray(v)) return v.map(valorCampo).filter(Boolean).join(" · ");
+  if (typeof v === "object") {
+    return Object.entries(v as Record<string, unknown>)
+      .filter(([, x]) => x !== null && x !== undefined && x !== "")
+      .map(([k, x]) => `${rotuloCampo(k)}: ${valorCampo(x)}`)
+      .join(" | ");
+  }
+  return String(v);
+}
 
 function DealCard({
   deal, onOpen, onWhatsApp, onCriarReuniao, overlay = false,
@@ -737,16 +772,45 @@ export function DealModal({
                     </div>
                   </div>
                 )}
-                {d.camposCustom && Object.keys(d.camposCustom).length > 0 && (
-                  <div className="border-t pt-4">
-                    <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Campos personalizados</p>
-                    <div className="text-xs text-gray-600 space-y-1">
-                      {Object.entries(d.camposCustom as Record<string, string>).map(([k, v]) => (
-                        <p key={k}><span className="font-medium">{k}:</span> {v}</p>
-                      ))}
+                {d.camposCustom && Object.keys(d.camposCustom).length > 0 && (() => {
+                  const campos = Object.entries(d.camposCustom as Record<string, unknown>)
+                    .filter(([, v]) => v !== null && v !== undefined && v !== "" &&
+                                       !(Array.isArray(v) && v.length === 0));
+                  // Um valor pode ser objeto ou lista de objetos (integrações gravam
+                  // estruturas aqui). Renderizar objeto direto quebra o React, então as
+                  // listas de objetos saem em bloco próprio e o resto vira texto.
+                  const ehListaDeObjetos = (v: unknown) =>
+                    Array.isArray(v) && v.some((x) => x !== null && typeof x === "object");
+                  const simples = campos.filter(([, v]) => !ehListaDeObjetos(v));
+                  const listas = campos.filter(([, v]) => ehListaDeObjetos(v));
+                  return (
+                    <div className="border-t pt-4">
+                      <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Campos personalizados</p>
+                      <div className="text-xs text-gray-600 space-y-1">
+                        {simples.map(([k, v]) => (
+                          <p key={k}><span className="font-medium">{rotuloCampo(k)}:</span> {valorCampo(v)}</p>
+                        ))}
+                      </div>
+                      {listas.map(([k, v]) => {
+                        const itens = v as Record<string, unknown>[];
+                        return (
+                          <details key={k} className="mt-3">
+                            <summary className="text-xs font-semibold text-gray-500 uppercase cursor-pointer hover:text-gray-700">
+                              {rotuloCampo(k)} ({itens.length})
+                            </summary>
+                            <ul className="mt-1.5 space-y-1 text-xs text-gray-600">
+                              {itens.map((item, i) => (
+                                <li key={i} className="border-l-2 border-gray-200 pl-2">
+                                  {valorCampo(item)}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        );
+                      })}
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
               </>
             );
           })()}
@@ -1791,6 +1855,9 @@ export default function CrmPage() {
           )}
         </div>
       </div>
+
+      {/* Motores de coleta que alimentam este funil */}
+      <MotorColeta pipelineId={activePipelineId ?? ""} />
 
       {/* Busca */}
       <div className="bg-white border-b border-gray-100 px-4 py-2 flex-shrink-0">
