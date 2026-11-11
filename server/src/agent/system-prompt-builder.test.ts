@@ -36,6 +36,18 @@ describe("buildSystemPrompt", () => {
     expect(result).toContain("Você é Ana");
   });
 
+  it("assistente do carreteiro recebe as orientações fixas da RAP", () => {
+    const result = buildSystemPrompt(minimalCtx());
+    expect(result).toContain("no máximo 1 frase de 15 palavras");
+  });
+
+  it("assistente genérico (modo_sdr=generico) não recebe as orientações da RAP e responde a pergunta do lead", () => {
+    const result = buildSystemPrompt(minimalCtx({ personaNome: "Judite", assistenteGenerico: true }));
+    expect(result).not.toContain("Rocha Amorim Pires");
+    expect(result).not.toContain("no máximo 1 frase de 15 palavras");
+    expect(result).toContain("RESPONDA a pergunta dele primeiro");
+  });
+
   it("advogado with iaFlowStepChave → string contains personaInstrucoes", () => {
     const ctx = minimalCtx({
       personaChave: "advogado",

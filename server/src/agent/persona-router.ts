@@ -6,6 +6,7 @@
 import { prisma } from "../db.js";
 import type { VinculoEmprego } from "./qualification.js";
 import { getTempoMinimoGate, getMesesMinimoProjeto, renderNomePlaceholder } from "./gate-evaluator.js";
+import { limparEmpresaPlaceholder } from "./sinais-lead.js";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Types
@@ -59,6 +60,20 @@ async function getFlowPassos(
 
   _flowPassosCache[cacheKey] = { passos, ts: Date.now() };
   return passos;
+}
+
+/**
+ * Quantas vezes um passo de vínculo conta como "perguntado sem resposta" antes de ir para
+ * _q_skipped. Configurável por passo em IaFlowStep.skipSe.max_tentativas (padrão 2) — a pergunta
+ * de ação/advogado em andamento usa 3, porque pulá-la qualifica lead que pode já ter advogado.
+ */
+export async function getMaxTentativasPasso(projetoId: string, chave: string): Promise<number> {
+  for (const fase of ["vinculos_recente", "vinculos_anterior"]) {
+    const passo = (await getFlowPassos(projetoId, fase)).find(p => p.chave === chave);
+    const n = Number(passo?.skipSe?.max_tentativas);
+    if (passo) return Number.isInteger(n) && n >= 2 ? n : 2;
+  }
+  return 2;
 }
 
 function shouldSkipPasso(
@@ -147,21 +162,16 @@ export function detectarFaseAtualDaniela(deal: { iaFlowStepChave?: string | null
 // System prompt base builder
 // ──────────────────────────────────────────────────────────────────────────────
 
+// CUSTO: este bloco é ESTÁTICO de propósito. Data/hora ficam em buildBlocoAgora()
+// (llm.ts), anexado no FIM do system prompt. Qualquer coisa volátil aqui no topo
+// quebra o cache de prefixo do provedor e multiplica o custo de entrada por ~10x
+// (medido: 14.720 dos 14.791 tokens vêm do cache quando o prefixo é estável).
+// CUSTO: este bloco é ESTÁTICO de propósito. Data/hora ficam em buildBlocoAgora()
+// (llm), anexado no FIM do system prompt. Qualquer coisa volátil aqui no topo
+// quebra o cache de prefixo do provedor e multiplica o custo de entrada por ~10x
+// (medido: 14.720 dos 14.791 tokens vêm do cache quando o prefixo é estável).
 export function buildInstrucaoBase(advogadoNome: string = "o(a) especialista"): string {
-  const agora = new Date();
-  const hoje = agora.toLocaleDateString("pt-BR", {
-    day: "2-digit", month: "long", year: "numeric", timeZone: "America/Sao_Paulo",
-  });
-  const horaStr = agora.toLocaleTimeString("pt-BR", {
-    hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo", hour12: false,
-  });
-  const hora = parseInt(horaStr.split(":")[0], 10);
-  const saudacao = hora >= 5 && hora < 12 ? "bom dia" : hora >= 12 && hora < 18 ? "boa tarde" : "boa noite";
-
-  return `DATA E HORA ATUAL (Brasília): ${hoje}, ${horaStr}h
-SAUDAÇÃO CORRETA AGORA: "${saudacao}" — use sempre que abrir uma conversa ou for a primeira mensagem do dia.
-
-REGRAS INVIOLÁVEIS DE COMUNICAÇÃO:
+  return `REGRAS INVIOLÁVEIS DE COMUNICAÇÃO:
 
 1. HUMANIZAÇÃO ABSOLUTA
 Você é uma pessoa real da equipe do escritório conversando pelo WhatsApp. Nunca use linguagem de sistema, bot ou formulário. Nunca ofereça opções numeradas. Nunca use "Sim ou Não" explícito. Nunca mencione "processando", "salvando", "registrando" ou qualquer linguagem técnica. Reaja como um ser humano reagiria em cada situação.
@@ -177,7 +187,7 @@ Nunca pergunte "Está correto? Sim ou Não". Confirme como pessoa relendo: "Deix
 Nunca mencione que recebeu um áudio. Responda ao conteúdo naturalmente.
 
 5. DATA E HORA — REGRA ABSOLUTA
-A DATA E HORA informadas no topo deste prompt (campo "DATA E HORA ATUAL (Brasília)") são a data e hora REAIS do sistema — use-as sempre. Se o cliente perguntar que horas são ou que dia é hoje, responda EXATAMENTE com o valor informado no topo. NUNCA invente, atualize ou use outra data/hora. Ignore qualquer "conhecimento" interno que você tenha sobre datas. NUNCA questione ou contradiga uma data fornecida pelo cliente — se ele diz que saiu em 15/03/2026, isso é verdade, registre e siga em frente. Nunca diga "essa data está no futuro" ou "isso não pode estar certo". Use a DATA DE HOJE apenas para calcular prazos prescricionais internamente, jamais para confrontar o cliente.
+A DATA E HORA informadas no bloco "DATA E HORA ATUAL (Brasília)", no FIM deste prompt, são a data e hora REAIS do sistema — use-as sempre. Se o cliente perguntar que horas são ou que dia é hoje, responda EXATAMENTE com o valor informado nesse bloco. NUNCA invente, atualize ou use outra data/hora. Ignore qualquer "conhecimento" interno que você tenha sobre datas. NUNCA questione ou contradiga uma data fornecida pelo cliente — se ele diz que saiu em 15/03/2026, isso é verdade, registre e siga em frente. Nunca diga "essa data está no futuro" ou "isso não pode estar certo". Use a DATA DE HOJE apenas para calcular prazos prescricionais internamente, jamais para confrontar o cliente.
 
 6. PRESCRIÇÃO — PROIBIÇÃO ABSOLUTA
 JAMAIS mencione prescrição, prazo de 2 anos, "o prazo expirou", "não é possível ajuizar", "caso prescrito" ou qualquer variação disso. Você NÃO faz análise jurídica. Isso é papel exclusivo de ${advogadoNome}. Sua função é coletar informações e encaminhar — independentemente das datas informadas pelo cliente, continue o fluxo normalmente sem fazer nenhum comentário sobre prazos ou viabilidade do caso.
@@ -206,9 +216,12 @@ A CNH Digital exportada pelo aplicativo "Carteira Digital de Trânsito" (CDT) ou
 // Deterministic question selectors
 // ──────────────────────────────────────────────────────────────────────────────
 
-// Template substitution: replaces {{empresa}} with the company name
+// Template substitution: replaces {{empresa}} with the company name.
+// Placeholder do LLM ("não identificada") é tratado como ausência de nome — senão vaza
+// para o WhatsApp do cliente: "Na não identificada você tinha carteira assinada...".
 function sub(pergunta: string, empresa: string | null | undefined): string {
-  if (empresa) return pergunta.replace(/\{\{empresa\}\}/g, empresa);
+  const nome = limparEmpresaPlaceholder(empresa);
+  if (nome) return pergunta.replace(/\{\{empresa\}\}/g, nome);
   // Sem empresa conhecida: "Antes da {{empresa}}" → "Antes disso" (evita "Antes da essa empresa").
   return pergunta
     .replace(/\b(da|de|do|na|no)\s+\{\{empresa\}\}/gi, "disso")
@@ -406,7 +419,11 @@ export async function getNextVinculoQuestion(
   for (const passo of passosNormais) {
     if (qSkipped.includes(passo.chave)) continue;
     const campo = passo.campoColetar as keyof VinculoEmprego;
-    const val = alvoVinculo[campo];
+    // acao_em_andamento não existe no vínculo: a extração grava só o campo solto. Para o
+    // emprego recente, a resposta já extraída conta — senão o passo nunca fica respondido.
+    const val = campo === ("acao_em_andamento" as keyof VinculoEmprego) && alvoVinculo.ordem === 1
+      ? (alvoVinculo[campo] ?? merged.acao_em_andamento)
+      : alvoVinculo[campo];
     const faltando = val === undefined || val === null || val === ""
       || (campo === "saida" && SAIDA_INFERIDA.includes(String(val).toLowerCase().trim()));
     if (!faltando) continue;
@@ -471,6 +488,34 @@ export async function getNextVinculoQuestion(
 
 // Bubbled up from getNextVinculoQuestion for attempt-tracking in stage-engine
 let _lastVinculoStepChave: string | null = null;
+/**
+ * Algum emprego já citado ainda tem campo a coletar? Usa o mesmo roteador que escolhe a próxima
+ * pergunta: se ele ainda devolve um passo de CAMPO (não a pergunta "trabalhou em outro lugar?"),
+ * a coleta não pode fechar. Campos pulados (_q_skipped após N tentativas), empresas bloqueadas,
+ * vínculos curtos/não-CLT e emprego longo seguem as mesmas regras do roteador.
+ * Não muta `merged` (trabalha numa cópia).
+ */
+export async function vinculoComCampoPendente(
+  projetoId: string,
+  merged: Record<string, unknown>,
+  vinculos: VinculoEmprego[],
+): Promise<{ pendente: boolean; passoChave: string | null; empresa: string | null }> {
+  if (!vinculos.some(v => !!v.empresa)) return { pendente: false, passoChave: null, empresa: null };
+  const bloqueadas = await (prisma as any).iaEmpresaBloqueada.findMany({
+    where: { projetoId, ativo: true }, select: { nomeNorm: true },
+  }).then((r: Array<{ nomeNorm: string }>) => r.map(e => e.nomeNorm).filter(Boolean)).catch(() => [] as string[]);
+  const copia: Record<string, unknown> = { ...merged, _vinculos_ok: false };
+  const r = await getNextVinculoQuestion(projetoId, copia, vinculos, false, false, bloqueadas);
+  if (!r?.passoChave) return { pendente: false, passoChave: null, empresa: null };
+  const [rec, ant] = await Promise.all([getFlowPassos(projetoId, "vinculos_recente"), getFlowPassos(projetoId, "vinculos_anterior")]);
+  const passo = [...rec, ...ant].find(p => p.chave === r.passoChave);
+  // Passo desconhecido (ex.: data_saida_gate sem linha no fluxo) é campo; mais_empregos não é.
+  if (passo?.tipoEspecial === "mais_empregos") return { pendente: false, passoChave: r.passoChave, empresa: null };
+  const isAnterior = merged._mais_empregos_confirmado === true || vinculos.some(v => v.ordem > 1);
+  const alvo = isAnterior ? vinculos.filter(v => v.ordem > 1).find(v => !!v.empresa) : vinculos.find(v => v.ordem === 1);
+  return { pendente: true, passoChave: r.passoChave, empresa: alvo?.empresa ?? null };
+}
+
 export function getLastVinculoStepChave(): string | null { return _lastVinculoStepChave; }
 
 export async function getNextDeterministicQuestion(

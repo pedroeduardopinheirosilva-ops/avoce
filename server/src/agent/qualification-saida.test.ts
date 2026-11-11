@@ -102,3 +102,31 @@ describe("getNextVinculoQuestion SAIDA_INFERIDA guard (via persona-router)", () 
     }
   });
 });
+
+describe("tryExtractVinculo — correção de grafia da empresa (caso Flavio Helton 24/10)", () => {
+  it("correcao_empresa troca o nome do vínculo e não cria emprego novo", async () => {
+    mockExtractJson.mockResolvedValue({
+      sem_mais_empregos: false,
+      confirmou_mais_empregos: false,
+      correcao_empresa: { ordem: 1, empresa: "Fontanella Transportes" },
+      vinculos_atualizados: [{ ordem: 1, empresa: "Contonela Transportes" }],
+      novo_vinculo: { empresa: "Fontanella Transportes" },
+    });
+    const result = await tryExtractVinculo(
+      "proj-1",
+      "Fontanella trasportes",
+      [{ ordem: 1, empresa: "Contonela Transportes", funcao: "carreteiro" }],
+      "",
+    );
+    expect(result.vinculo).toBeNull();
+    expect(result.updatedVinculos).toHaveLength(1);
+    expect(result.updatedVinculos[0].empresa).toBe("Fontanella Transportes");
+    expect(result.updatedVinculos[0].funcao).toBe("carreteiro");
+  });
+
+  it("sem correcao_empresa o nome existente é mantido", async () => {
+    mockExtractJson.mockResolvedValue(vinculoResult(null, "Outra Grafia"));
+    const result = await tryExtractVinculo("proj-1", "x", [{ ordem: 1, empresa: "ABC" }], "");
+    expect(result.updatedVinculos[0].empresa).toBe("ABC");
+  });
+});

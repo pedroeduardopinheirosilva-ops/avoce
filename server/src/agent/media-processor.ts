@@ -51,7 +51,12 @@ export async function normalizeInput(projetoId: string, msg: EvolutionWebhookMes
   return { text, documentosEnviados: false, docJsonDireto: null, tipo, isDocAnalitico: false, midiaUrl };
 }
 
-async function tryTranscribeAudio(projetoId: string, msg: EvolutionWebhookMessage): Promise<{ text: string | null; midiaUrl?: string }> {
+/**
+ * Baixa o áudio da Evolution, guarda o arquivo para tocar na UI e transcreve.
+ * Exportada porque os áudios que o SDR humano grava no próprio WhatsApp (fromMe) passam
+ * pelo webhook em index.ts, fora do fluxo do agente, e precisam da mesma transcrição.
+ */
+export async function tryTranscribeAudio(projetoId: string, msg: EvolutionWebhookMessage): Promise<{ text: string | null; midiaUrl?: string }> {
   try {
     const audioConfigs = await prisma.iaProjetoConfig.findMany({ where: { projetoId, categoria: "audio" } });
     const getAudio = (k: string) => audioConfigs.find(c => c.chave === k)?.valor ?? "";

@@ -34,7 +34,8 @@ export async function persistMergedUpdates(
   await prisma.crmDeal.update({ where: { id: dealId }, data: splitState(novo) });
 }
 
-export async function createInitialDeal(projetoId: string, contatoId: string, nome: string) {
+/** Funil/coluna/fase de entrada do projeto — onde um lead novo do WhatsApp nasce. */
+export async function resolverEntradaProjeto(projetoId: string) {
   // 1. Pipeline explícito via IaProjetoConfig (chave pipeline_entrada_id) — fonte mais confiável
   const pipelineConfig = await prisma.iaProjetoConfig.findFirst({
     where: { projetoId, chave: "pipeline_entrada_id" },
@@ -76,6 +77,11 @@ export async function createInitialDeal(projetoId: string, contatoId: string, no
 
   if (!stageId || !pipelineId) throw new Error("Nenhum pipeline comercial configurado");
 
+  return { pipelineId, stageId, faseEntrada };
+}
+
+export async function createInitialDeal(projetoId: string, contatoId: string, nome: string) {
+  const { pipelineId, stageId, faseEntrada } = await resolverEntradaProjeto(projetoId);
   const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId }, select: { empresaId: true } });
 
   return prisma.crmDeal.create({
@@ -92,6 +98,71 @@ export async function createInitialDeal(projetoId: string, contatoId: string, no
       fonteLead: "whatsapp",
     },
   });
+}
+
+/**
+ * Cliente já GANHO neste projeto que volta a falar: a conversa continua no card ganho, sem IA.
+ * Antes nascia outro card "— WhatsApp" com a IA ligada, e a Isabella saudava de novo quem
+ * já tinha fechado (Cigano 6688 ganhou 3 cards em 06/11; Alexander e Leandro, 1 cada).
+ */
+export async function dealGanhoDoContato(projetoId: string, contatoIds: string[]) {
+  if (!contatoIds.length) return null;
+  return prisma.crmDeal.findFirst({
+    where: { contatoId: { in: contatoIds }, projetoId, status: "ganho" },
+    orderBy: [{ atualizadoEm: "desc" }],
+  });
+}
+
+/**
+ * Lead que já tinha card aberto SEM projeto de IA (importado do Supabase/Pipedrive,
+ * cadastrado à mão) e manda mensagem: o card antigo passa a ser o da conversa, em
+ * vez de nascer outro "— WhatsApp" ao lado. Gilson 5096 tinha 3 cards abertos e, em
+ * 27/10, 220 leads da RAP estavam duplicados assim.
+ *
+ * Só card comercial da mesma empresa do projeto — card processual é cliente com
+ * processo, não lead, e continua separado. Se o card está num funil que não é do
+ * projeto, vai para a entrada do projeto (é onde o SDR enxerga a conversa).
+ */
+export async function adotarDealSemProjeto(projetoId: string, contatoIds: string[]) {
+  if (!contatoIds.length) return null;
+  const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId }, select: { empresaId: true } });
+  if (!projeto?.empresaId) return null;
+  const orfao = await prisma.crmDeal.findFirst({
+    where: {
+      contatoId: { in: contatoIds }, projetoId: null, status: "aberto",
+      empresaId: projeto.empresaId, pipeline: { tipo: "comercial" },
+    },
+    orderBy: [{ ultimoContatoEm: { sort: "desc", nulls: "last" } }, { criadoEm: "desc" }],
+  });
+  if (!orfao) return null;
+
+  const entrada = await resolverEntradaProjeto(projetoId);
+  const funisDoProjeto = new Set(
+    (await prisma.iaFaseFunil.findMany({ where: { projetoId }, select: { pipelineId: true } }))
+      .map((f) => f.pipelineId).filter(Boolean) as string[],
+  );
+  funisDoProjeto.add(entrada.pipelineId);
+  const mover = !funisDoProjeto.has(orfao.pipelineId);
+
+  const adotado = await prisma.crmDeal.update({
+    where: { id: orfao.id },
+    data: {
+      projetoId,
+      // Importação grava iaAtiva=false por padrão; só respeita a pausa se alguém pausou.
+      ...(orfao.iaPausadaPor ? {} : { iaAtiva: true }),
+      ...(mover ? { pipelineId: entrada.pipelineId, stageId: entrada.stageId } : {}),
+      ...(orfao.iaStageChave ? {} : {
+        iaStageChave: entrada.faseEntrada?.chave ?? "lead_carreteiro",
+        iaPersonaChave: entrada.faseEntrada?.personaChave ?? "assistente",
+      }),
+    },
+  });
+  if (mover) {
+    await prisma.crmDealStageLog.create({
+      data: { dealId: orfao.id, stageAnteriorId: orfao.stageId, stageNovoId: entrada.stageId, motivo: "Lead voltou pelo WhatsApp — card sem projeto adotado pela IA" },
+    });
+  }
+  return adotado;
 }
 
 export async function updateDealFields(

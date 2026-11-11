@@ -117,6 +117,15 @@ export async function buildLeadBriefing(
     .find(x => x.length > 3);
   if (dor) linhas.push(`😤 Dor: ${dor.slice(0, 140)}`);
 
+  // Pergunta ética: o robô pode encerrar (intenção do lead, tentativas esgotadas) sem resposta.
+  // A SDR humana precisa saber antes de ligar.
+  if (merged.acao_em_andamento === true) {
+    linhas.push(`⚠️ JÁ TEM AÇÃO/ADVOGADO: ${String(merged.acao_em_andamento_relato ?? "").slice(0, 120)}`);
+  } else if (merged.acao_em_andamento == null) {
+    const mencao = merged._acao_suspeita_relato ? ` (citou: "${String(merged._acao_suspeita_relato).slice(0, 100)}")` : "";
+    linhas.push(`⚠️ Não confirmou se já tem advogado/ação — perguntar na ligação${mencao}`);
+  }
+
   // Reunião mais recente (agendada ou em andamento)
   const reuniao = await prisma.sessaoReuniao.findFirst({
     where: { dealId, status: { in: ["agendada", "em_andamento", "no_show"] } },

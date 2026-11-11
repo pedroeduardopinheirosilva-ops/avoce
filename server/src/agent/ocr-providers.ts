@@ -135,11 +135,25 @@ export async function ocrMistralCNHAnnotation(
 
 // ── Groq Vision ────────────────────────────────────────────────────────────────
 
+/**
+ * Modelo de visão da Groq. `meta-llama/llama-4-scout-17b-16e-instruct` foi DESCONTINUADO e
+ * passou a devolver 404 model_not_found — 124 imagens de leads em 30 dias ficaram sem leitura
+ * ("[Cliente enviou uma foto/imagem — leitura automática falhou]"). Os únicos modelos com
+ * entrada de imagem na Groq hoje são qwen3.6-27b e qwen3.8-27b; usamos o mais barato.
+ * Conferir com: GET https://api.groq.com/openai/v1/models → input_modalities inclui "image".
+ *
+ * Os qwen são modelos de RACIOCÍNIO: sem `reasoning_effort: "none"` o <think> consome o
+ * orçamento de max_tokens e o content volta VAZIO — mesma armadilha do reasoner do DeepSeek
+ * no classificador. Validado: com "none" a resposta sai limpa. Só "none" e "default" são aceitos.
+ */
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL ?? "qwen/qwen3.6-27b";
+
+
 export async function ocrGroqVision(apiKey: string, buffer: Buffer, mimetype: string): Promise<string | null> {
   const imgMime = ["image/jpeg","image/png","image/gif","image/webp"].includes(mimetype) ? mimetype : "image/jpeg";
   const client = getGroqClient(apiKey);
   const res = await client.chat.completions.create({
-    model: "meta-llama/llama-4-scout-17b-16e-instruct", max_tokens: 768,
+    model: GROQ_VISION_MODEL, max_tokens: 768, reasoning_effort: "none" as any,
     messages: [{ role: "user", content: [
       { type: "image_url", image_url: { url: `data:${imgMime};base64,${buffer.toString("base64")}` } } as any,
       { type: "text", text: OCR_EXTRACT_PROMPT },
@@ -170,7 +184,7 @@ export async function ocrGroqVisionJson(apiKey: string, buffer: Buffer, mimetype
     "Retorne SOMENTE JSON válido.";
   const client = getGroqClient(apiKey);
   const res = await client.chat.completions.create({
-    model: "meta-llama/llama-4-scout-17b-16e-instruct", max_tokens: 512,
+    model: GROQ_VISION_MODEL, max_tokens: 512, reasoning_effort: "none" as any,
     messages: [{ role: "user", content: [
       { type: "image_url", image_url: { url: `data:${imgMime};base64,${buffer.toString("base64")}` } } as any,
       { type: "text", text: prompt },

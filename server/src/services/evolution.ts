@@ -15,13 +15,20 @@ const EVOLUTION_INSTANCES_DIR = "/opt/evolution-capium/instances";
 // Cache em memória com TTL de 5min para evitar leituras repetidas de disco
 const _lidCache = new Map<string, { lid: string; expiresAt: number }>();
 
+/** JIDs que já são endereço final — não passam por resolução de LID */
+const FINAL_JID_RE = /@(g\.us|lid|broadcast|newsletter)$/i;
+
 /**
  * Resolve o endereço correto para envio ao lead.
  * Quando o WhatsApp do lead usa LID (novos dispositivos), o número @s.whatsapp.net
  * não é entregue — precisa enviar para {lid}@lid.
  * Lê o arquivo lid-mapping-{phone}.json gerado pela Evolution API ao receber mensagens LID.
+ * Grupos (@g.us) e demais JIDs finais são devolvidos intactos — cortar o sufixo faria
+ * a Evolution reclassificar o destino e a mensagem não chegaria ao grupo.
  */
 async function resolveSendAddress(phone: string): Promise<string> {
+  if (FINAL_JID_RE.test(phone)) return phone;
+
   const phoneClean = phone.replace(/@.*/, "");
 
   const cached = _lidCache.get(phoneClean);
@@ -99,10 +106,60 @@ async function fetchWithTimeout(
 // O envio é simulado (no-op) para que o processamento do funil rode até o fim sem o
 // Evolution rejeitar o número inexistente (400 exists:false) e abortar a mensagem.
 const TEST_NUMBER_PREFIX = "5500990000";
-function isTestNumber(to: string): boolean {
+export function isTestNumber(to: string): boolean {
   return to.replace(/@.*/, "").startsWith(TEST_NUMBER_PREFIX);
 }
 const TEST_SEND_RESULT = { key: { id: "TEST_SKIP" } } as unknown as SendTextResult;
+
+/**
+ * Pergunta ao WhatsApp qual é o JID real do número, em vez de deduzir.
+ *
+ * O 9º dígito do celular brasileiro não faz parte do JID de contas mais antigas:
+ * 5577991322975 é entregue como 557791322975. Não dá para aplicar a regra às
+ * cegas — ela vale para uns números e não para outros —, e errar significa
+ * mandar o link de assinatura para um destino que não existe, em silêncio.
+ * Devolve null quando o número não tem WhatsApp.
+ */
+export async function resolverJidReal(config: EvolutionConfig, telefone: string): Promise<string | null> {
+  const numero = (telefone ?? "").replace(/\D/g, "");
+  if (!numero) return null;
+  try {
+    const res = await fetch(`${config.baseUrl}/chat/whatsappNumbers/${config.instancia}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: config.apiKey },
+      body: JSON.stringify({ numbers: [numero] }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as Array<{ exists?: boolean; jid?: string }> | { exists?: boolean; jid?: string };
+    const hit = Array.isArray(body) ? body[0] : body;
+    return hit?.exists && hit.jid ? hit.jid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Foto de perfil do contato (POST /chat/fetchProfilePictureUrl).
+ * Devolve null quando o número não tem foto, a privacidade esconde ou a instância falha —
+ * nunca lança, porque roda no caminho do webhook e em cron.
+ */
+export async function fetchProfilePictureUrl(config: EvolutionConfig, telefone: string): Promise<string | null> {
+  const numero = (telefone ?? "").replace(/@.*/, "").replace(/\D/g, "");
+  if (!numero || isTestNumber(numero)) return null;
+  try {
+    const res = await fetchWithTimeout(`${config.baseUrl}/chat/fetchProfilePictureUrl/${config.instancia}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: config.apiKey },
+      body: JSON.stringify({ number: numero }),
+    }, 10_000);
+    if (!res.ok) return null;
+    const body = await res.json() as { profilePictureUrl?: string | null };
+    const url = body?.profilePictureUrl;
+    return typeof url === "string" && /^https?:\/\//.test(url) ? url : null;
+  } catch {
+    return null;
+  }
+}
 
 export async function sendText(
   config: EvolutionConfig,
@@ -113,7 +170,7 @@ export async function sendText(
   const url = `${config.baseUrl}/message/sendText/${config.instancia}`;
 
   const number = await resolveSendAddress(to);
-  if (number !== to.replace(/@.*/, "")) {
+  if (number !== to && number !== to.replace(/@.*/, "")) {
     console.log(`[Evolution] LID resolvido: ${to.replace(/@.*/, "")} → ${number}`);
   }
 
@@ -369,4 +426,42 @@ export async function downloadMedia(
   const json = (await res.json()) as { base64?: string };
   if (!json.base64) throw new Error("Evolution: no base64 in response");
   return Buffer.from(json.base64, "base64");
+}
+
+/**
+ * Apaga para todos no WhatsApp uma mensagem que NÓS enviamos
+ * (DELETE /chat/deleteMessageForEveryone). Mensagem do lead não dá para apagar
+ * do celular dele — isso só existe em grupo, para admin. O WhatsApp também
+ * recusa depois de ~2 dias do envio. Devolve { ok, erro } e nunca lança: quem
+ * chama decide se apaga só do painel quando o WhatsApp recusa.
+ */
+export async function deleteMessageForEveryone(
+  config: EvolutionConfig,
+  telefone: string,
+  messageId: string,
+): Promise<{ ok: boolean; erro?: string }> {
+  if (isTestNumber(telefone) || messageId === "TEST_SKIP") return { ok: true };
+  const tentados = new Set<string>();
+  const candidatos: string[] = [];
+  const add = (j: string | null | undefined) => { if (j && !tentados.has(j)) { tentados.add(j); candidatos.push(j); } };
+  // O remoteJid tem de ser o MESMO do envio: LID quando houver, senão o JID real
+  // (9º dígito decidido pelo WhatsApp, não por regra).
+  const enviado = await resolveSendAddress(telefone);
+  add(enviado.includes("@") ? enviado : `${enviado}@s.whatsapp.net`);
+  add(await resolverJidReal(config, telefone));
+  let ultimoErro = "";
+  for (const remoteJid of candidatos) {
+    try {
+      const res = await fetchWithTimeout(`${config.baseUrl}/chat/deleteMessageForEveryone/${config.instancia}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json", apikey: config.apiKey },
+        body: JSON.stringify({ id: messageId, remoteJid, fromMe: true }),
+      }, 15_000);
+      if (res.ok) return { ok: true };
+      ultimoErro = `${res.status} ${(await res.text()).slice(0, 200)}`;
+    } catch (e: any) {
+      ultimoErro = e?.message ?? String(e);
+    }
+  }
+  return { ok: false, erro: ultimoErro || "sem JID para o contato" };
 }

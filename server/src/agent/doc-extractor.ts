@@ -43,32 +43,55 @@ function findRg(sources: string[]): { rg: string | null; orgao: string | null } 
   return { rg: null, orgao: null };
 }
 
+/**
+ * Leitura DETERMINÍSTICA de CNH — MRZ + tesseract + regex, com validação de
+ * dígito do CPF. Nenhuma chamada de IA. Serve tanto para o PDF da CNH digital
+ * (dados nos JPEGs embarcados) quanto para a foto da CNH física.
+ * Devolve null quando não conseguiu nada de útil, para o chamador cair no fallback.
+ */
+async function extrairCnhLocalmente(
+  buffer: Buffer,
+  mimetype: string,
+  subtipo: "CNH_E" | "CNH_FOTO",
+): Promise<DocJsonResult | null> {
+  try {
+    const py: CNHExtractorResult = await extractCNHData(buffer, undefined, { mimetype, usarIa: false });
+    if (!py.nome && !py.cpf && !py.rg) return null;
+
+    let cpf = py.cpf ?? null;
+    let rg  = py.rg  ?? null;
+    if (cpf && !validarCPF(cpf)) {
+      if (rg && validarCPF(rg)) { [cpf, rg] = [rg, cpf]; } else { cpf = null; }
+    }
+    if (cpf) cpf = formatCpf(cpf);
+    return {
+      tipo_documento: "CNH", subtipo, nome: py.nome ?? null, cpf, rg,
+      orgao_emissor_rg: py.orgao_emissor_rg ?? null, uf_emissor_rg: py.uf_emissor_rg ?? null,
+      data_nascimento: py.data_nascimento ?? null, local_nascimento: py.local_nascimento ?? null,
+      // `naturalidade` (naturalidade/local de nascimento) e `nacionalidade` (BRASILEIRA) são
+      // conceitos diferentes — antes o valor de nacionalidade era jogado no campo naturalidade
+      // e nunca chegava em CAMPOS_PESSOAIS (coleta-docs-context.ts), então cd_nacionalidade
+      // sempre perguntava de novo mesmo com a CNH já lida.
+      naturalidade: null, nacionalidade: py.nacionalidade ?? null, filiacao_pai: py.filiacao_pai ?? null,
+      filiacao_mae: py.filiacao_mae ?? null,
+      pis: null, numero_ctps: null, serie_ctps: null, endereco: null, bairro: null, cidade: null, uf: null, cep: null,
+    };
+  } catch { return null; }
+}
+
+/** Aceita o resultado local de imediato só quando o CPF passou na validação —
+ *  é o campo que inviabiliza a procuração se vier errado. */
+function localSuficiente(r: DocJsonResult | null): boolean {
+  return !!(r && r.cpf && validarCPF(r.cpf));
+}
+
 async function extractDocFromPdf(
   keys: OcrKeys,
   buffer: Buffer,
 ): Promise<DocJsonResult | null> {
-  // Strategy 1: Python CNH-e extractor (Claude Vision)
-  if (keys.anthropicKey) {
-    try {
-      const py: CNHExtractorResult = await extractCNHData(buffer, keys.anthropicKey);
-      if (py.nome || py.cpf || py.rg) {
-        let cpf = py.cpf ?? null;
-        let rg  = py.rg  ?? null;
-        if (cpf && !validarCPF(cpf)) {
-          if (rg && validarCPF(rg)) { [cpf, rg] = [rg, cpf]; } else { cpf = null; }
-        }
-        if (cpf) cpf = formatCpf(cpf);
-        return {
-          tipo_documento: "CNH", subtipo: "CNH_E", nome: py.nome ?? null, cpf, rg,
-          orgao_emissor_rg: py.orgao_emissor_rg ?? null, uf_emissor_rg: py.uf_emissor_rg ?? null,
-          data_nascimento: py.data_nascimento ?? null, local_nascimento: py.local_nascimento ?? null,
-          naturalidade: py.nacionalidade ?? null, filiacao_pai: py.filiacao_pai ?? null,
-          filiacao_mae: py.filiacao_mae ?? null,
-          pis: null, numero_ctps: null, serie_ctps: null, endereco: null, bairro: null, cidade: null, uf: null, cep: null,
-        };
-      }
-    } catch { /* fallthrough */ }
-  }
+  // Estratégia 1: extrator local (MRZ + tesseract). Sem IA, sem custo.
+  const local = await extrairCnhLocalmente(buffer, "application/pdf", "CNH_E");
+  if (localSuficiente(local)) return local;
 
   // Strategy 2: Groq Vision (first page as JPEG) + Mistral OCR (parallel)
   const [pageImg, mistralResult] = await Promise.all([
@@ -89,11 +112,22 @@ async function extractDocFromPdf(
   const sources = [visionText ?? "", visionJson ? JSON.stringify(visionJson) : "", mistralResult.text ?? ""];
   const cpf = findValidCpf(sources);
   const { rg, orgao } = findRg(sources);
+  // Último caso é OUTRO, não CNH: o default anterior arquivava como CNH todo PDF cuja leitura
+  // falhasse — comprovante de rendimentos, rescisão e CTPS digital entraram no acervo como CNH,
+  // e o loader do coleta_docs trata CNH como documento de identidade confiável, puxando
+  // nome/CPF/RG de um papel que não os tem.
+  const corpus = sources.join(" ").toUpperCase();
   const tipoFallback: DocJsonResult["tipo_documento"] = visionJson?.tipo_documento ?? (
-    sources.join(" ").includes("HABILITAÇÃO") || sources.join(" ").includes("CNH") ? "CNH" :
-    sources.join(" ").includes("CARTEIRA DE TRABALHO") ? "CTPS" :
-    sources.join(" ").includes("REGISTRO GERAL") ? "RG" : "CNH"
+    corpus.includes("HABILITAÇÃO") || corpus.includes("HABILITACAO") || corpus.includes("CNH") ? "CNH" :
+    corpus.includes("CARTEIRA DE TRABALHO") || corpus.includes("CTPS") ? "CTPS" :
+    corpus.includes("REGISTRO GERAL") || corpus.includes("CARTEIRA DE IDENTIDADE") ? "RG" :
+    corpus.includes("COMPROVANTE DE ENDEREÇO") || corpus.includes("COMPROVANTE DE RESIDÊNCIA") ? "COMPROVANTE_ENDERECO" :
+    "OUTRO"
   );
+
+  // Nada melhor apareceu: se o extrator local trouxe algo (nome/RG mesmo sem CPF),
+  // ele vale mais que um fallback de visão vazio.
+  if (local && !cpf && !visionJson?.nome) return local;
 
   return {
     tipo_documento: tipoFallback, nome: visionJson?.nome ?? null, cpf,
@@ -108,7 +142,7 @@ async function extractDocFromPdf(
 
 const DOC_CAMPOS = [
   "rg", "orgao_emissor_rg", "uf_emissor_rg", "cpf", "nome",
-  "data_nascimento", "local_nascimento", "naturalidade",
+  "data_nascimento", "local_nascimento", "naturalidade", "nacionalidade",
   "filiacao_pai", "filiacao_mae",
   "pis", "numero_ctps", "serie_ctps",
   "endereco", "bairro", "cidade", "uf", "cep",
@@ -153,7 +187,7 @@ export function applyDocJsonToMerged(
   // CNH_E / CNH_FOTO: always overwrite identity fields (corrects prior bad extractions)
   const isCnhConfiavel = docJson.subtipo === "CNH_E" || docJson.subtipo === "CNH_FOTO";
   const camposSempre   = isCnhConfiavel
-    ? new Set(["rg", "orgao_emissor_rg", "uf_emissor_rg", "nome", "data_nascimento", "local_nascimento", "filiacao_pai", "filiacao_mae"])
+    ? new Set(["rg", "orgao_emissor_rg", "uf_emissor_rg", "nome", "data_nascimento", "local_nascimento", "filiacao_pai", "filiacao_mae", "nacionalidade"])
     : new Set<string>();
 
   // COMPROVANTE_ENDERECO: address fields always overwrite (more authoritative than self-reported)
@@ -202,6 +236,11 @@ export async function extractDocumentJson(
     return r;
   };
 
+  // Extrator local primeiro (MRZ + tesseract + validação de CPF): resolve a foto de CNH
+  // sem gastar IA. Só se ele não fechar um CPF válido é que os provedores entram.
+  const local = await extrairCnhLocalmente(buffer, mimetype, "CNH_FOTO");
+  if (localSuficiente(local)) return local;
+
   // Claude Vision primeiro: melhor extração de CPF/RG em foto de CNH. Só aceita de imediato se trouxe
   // CPF válido (o ponto fraco do Groq); senão guarda o parcial e tenta os outros provedores.
   let claudeFallback: DocJsonResult | null = null;
@@ -218,8 +257,8 @@ export async function extractDocumentJson(
     const result = normalize(await ocrGroqVisionJson(keys.groqKey, buffer, mimetype).catch(() => null));
     if (result && (result.cpf || result.nome || result.rg)) return result;
   }
-  // Nenhum trouxe CPF válido — devolve o melhor parcial do Claude (nome/RG/nascimento), se houve.
-  return claudeFallback;
+  // Nenhum trouxe CPF válido — devolve o melhor parcial que houver (Claude ou o local).
+  return claudeFallback ?? local;
 }
 
 function sanitizeOcrText(text: string): string {

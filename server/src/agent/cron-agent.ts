@@ -11,6 +11,7 @@
 
 import { prisma } from "../db.js";
 import { transitionDeal, enviarMensagemProativa, getEvolutionConfig, respondFromDealState } from "./stage-engine.js";
+import { podeEnviarAgora, limparCacheSilencio } from "./quiet-hours.js";
 import { setEngagementTag } from "./transition-engine.js";
 
 function horaAtualBrasilia(): number {
@@ -20,24 +21,17 @@ function horaAtualBrasilia(): number {
   );
 }
 
-const _horarioCache = new Map<string, { ini: number; fim: number }>();
-
+/**
+ * Horário em que a IA pode iniciar conversa. Delega para quiet-hours.ts (fonte única, mesmas
+ * chaves horario_ini/horario_fim). Esta função existia aqui desde sempre mas NÃO era chamada
+ * em lugar nenhum — por isso lembrete e proativo saíam de madrugada (caso Edgar 9312).
+ */
 async function isHorarioComercial(projetoId: string): Promise<boolean> {
-  if (!_horarioCache.has(projetoId)) {
-    const cfgs = await prisma.iaProjetoConfig.findMany({
-      where: { projetoId, chave: { in: ["horario_ini", "horario_fim"] } },
-    });
-    const ini = parseInt(cfgs.find(c => c.chave === "horario_ini")?.valor ?? "6", 10);
-    const fim = parseInt(cfgs.find(c => c.chave === "horario_fim")?.valor ?? "22", 10);
-    _horarioCache.set(projetoId, { ini, fim });
-  }
-  const { ini, fim } = _horarioCache.get(projetoId)!;
-  const h = horaAtualBrasilia();
-  return h >= ini && h < fim;
+  return podeEnviarAgora(projetoId);
 }
 
 export function limparCacheHorario(): void {
-  _horarioCache.clear();
+  limparCacheSilencio();
 }
 
 export async function processarTimeoutsAgente(): Promise<void> {
@@ -65,10 +59,23 @@ export async function processarTimeoutsAgente(): Promise<void> {
   if (!deals.length) return;
   console.log(`[CronAgent] Verificando ${deals.length} deal(s) ativos`);
 
+  // Personas com fluxo próprio conduzem a conversa por conta: coleta de documentos,
+  // agendamento da secretária, parecer da advogada. O cron aqui decide tudo pelo
+  // STAGE, e o stage não muda quando a coleta começa — o lead segue em
+  // `lead_carreteiro`. Sem esta guarda, um cliente no meio da coleta recebia o
+  // follow-up de SDR ("ainda estou por aqui caso queira continuar nossa conversa
+  // sobre seus direitos trabalhistas"), assinado com o nome da persona da coleta,
+  // e ainda podia ser transicionado de stage por "sem resposta".
+  const PERSONAS_COM_FLUXO = new Set(["coleta_docs", "secretaria", "advogado"]);
+
   for (const deal of deals) {
     if (!deal.projetoId || !deal.iaStageChave) continue;
     const phone = deal.contato?.whatsapp;
     if (!phone) continue;
+    if (deal.iaPersonaChave && PERSONAS_COM_FLUXO.has(deal.iaPersonaChave)) {
+      console.log(`[CronAgent] Deal ${deal.id} pulado — fluxo de "${deal.iaPersonaChave}" em andamento`);
+      continue;
+    }
 
     const projetoId = deal.projetoId;
     const stageChave = deal.iaStageChave;

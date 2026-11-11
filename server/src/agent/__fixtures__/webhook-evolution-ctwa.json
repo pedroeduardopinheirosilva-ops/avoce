@@ -1,0 +1,85 @@
+{
+  "anuncio_ctwa": {
+    "event": "messages.upsert",
+    "instance": "avoce",
+    "data": {
+      "key": {
+        "id": "3EB0FIXTUREB44614BD30DD",
+        "fromMe": false,
+        "remoteJid": "111111111111111@lid",
+        "participant": "",
+        "remoteJidAlt": "5577900000001@s.whatsapp.net",
+        "addressingMode": "lid"
+      },
+      "pushName": "Lead Teste",
+      "message": {
+        "conversation": "Olá, vi o vídeo de vocês e gostaria de obter mais informações."
+      },
+      "contextInfo": {
+        "ctwaPayload": "FIXTURE_edd12b3e0c1f62acfca6f9bf",
+        "ctwaSignals": "all,all",
+        "mentionedJid": [],
+        "groupMentions": [],
+        "conversionData": "FIXTURE_edd12b3e0c1f62acfca6f9bf",
+        "externalAdReply": {
+          "body": "Esse é um exemplo realista de um motorista CLT que pode receber até R$ 467.000,00 (quatrocentos e sessenta e sete mil reais na Justiça).\nO valor é resultado de jornadas extensas, pagamentos “por fora” e outros direitos não cumpridos.\n🚨 Se você vive uma rotina parecida, é hora de investigar sua situação.\nFale com um advogado especialista e verifique seus direitos!\n\nDaniela Pires – Advogada | OAB/DF 84.901\n⚖️ RAP Advogados Associados\nCompromisso com a informação jurídica responsável.",
+          "title": "Fale com um Advogado Especialista",
+          "ctwaClid": "AfhFIXTUREf5935b1942c519619d9303f423bd64179e3262ca",
+          "mediaUrl": "https://example.invalid/mediaUrl",
+          "sourceId": "120233076428680484",
+          "mediaType": 2,
+          "sourceApp": "facebook",
+          "sourceUrl": "https://fb.me/5gjk7zPi4",
+          "sourceType": "ad",
+          "disableNudge": false,
+          "thumbnailUrl": "https://example.invalid/thumbnailUrl",
+          "wtwaAdFormat": false,
+          "originalImageUrl": "https://example.invalid/originalImageUrl",
+          "containsAutoReply": false,
+          "showAdAttribution": true,
+          "clickToWhatsappCall": true,
+          "greetingMessageBody": "Olá, seja bem-vindo à Rocha Amorim Pires – Advogados Associados. ⚖️\nSomos especialistas na defesa dos direitos dos motoristas CLT.",
+          "renderLargerThumbnail": true,
+          "adContextPreviewDismissed": false,
+          "automatedGreetingMessageShown": true
+        },
+        "conversionSource": "FB_Ads",
+        "trustBannerAction": 4294967295,
+        "statusAttributions": [],
+        "conversionDelaySeconds": 34,
+        "entryPointConversionApp": "facebook",
+        "entryPointConversionSource": "ctwa_ad",
+        "entryPointConversionDelaySeconds": 32
+      },
+      "messageType": "conversation",
+      "messageTimestamp": 1789274552
+    }
+  },
+  "link_site": {
+    "event": "messages.upsert",
+    "instance": "avoce",
+    "data": {
+      "key": {
+        "id": "3EB0FIXTURE2A9FD2102AF4",
+        "fromMe": false,
+        "remoteJid": "111111111111111@lid",
+        "participant": "",
+        "remoteJidAlt": "5577900000001@s.whatsapp.net",
+        "addressingMode": "lid"
+      },
+      "pushName": "Lead Teste",
+      "message": {
+        "conversation": "Bom dia quando estiver parado tiro uma opinião com você"
+      },
+      "contextInfo": {
+        "mentionedJid": [],
+        "groupMentions": [],
+        "statusAttributions": [],
+        "entryPointConversionSource": "click_to_chat_link",
+        "entryPointConversionDelaySeconds": 107339
+      },
+      "messageType": "conversation",
+      "messageTimestamp": 1789306982
+    }
+  }
+}

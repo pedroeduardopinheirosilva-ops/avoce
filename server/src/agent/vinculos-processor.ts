@@ -277,8 +277,13 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
 
       // Auto-close when mais_empregos question was asked 2× without answer (added to _q_skipped).
       // "Melhor qualificação incompleta que nada" — don't block the flow waiting indefinitely.
+      // Não vale quando o lead CONFIRMOU outro emprego ou acabou de citar um (caso Cigano 04/11:
+      // "Sim, na Tombini" chegou com mais_empregos_rec em _q_skipped pelo guard anti-repetição, e
+      // a coleta fechou com _mais_empregos_negado=true sem perguntar nada da Tombini).
       const qSkippedArr = (merged._q_skipped as string[] | undefined) ?? [];
-      if (!w._vinculos_ok && qSkippedArr.some(c => c.startsWith("mais_empregos"))) {
+      const leadConfirmouOutro = w.tem_emprego_anterior === true || w._mais_empregos_confirmado === true
+        || vinculosAtuais.length > vinculos.length;
+      if (!w._vinculos_ok && !leadConfirmouOutro && qSkippedArr.some(c => c.startsWith("mais_empregos"))) {
         const temMinimo = vinculosAtuais.some((v: VinculoEmprego) => v.empresa && (v.vinculo || v.saida));
         if (temMinimo) {
           w._mais_empregos_negado = true;
@@ -289,6 +294,25 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
 
     } catch (err: any) {
       console.warn("[VinculosLoop] Erro na extração:", err?.message ?? err);
+    }
+
+    // Todo emprego citado precisa ser qualificado antes de fechar a coleta. Os fechamentos acima
+    // olham "mínimo viável" (empresa+vínculo+saída do recente) e deixavam o emprego anterior só
+    // com o nome. Se o roteador ainda tem campo a perguntar de algum vínculo, reabre.
+    // Prescrição (todos fora do prazo) fecha de verdade — não há o que qualificar.
+    if (w._vinculos_ok === true && !w._vinculos_todos_prescritos) {
+      const vinsFinal = Array.isArray(w.vinculos) ? (w.vinculos as VinculoEmprego[]) : vinculos;
+      try {
+        const { vinculoComCampoPendente } = await import("./persona-router.js");
+        const pend = await vinculoComCampoPendente(projetoId, w, vinsFinal);
+        if (pend.pendente) {
+          delete w._vinculos_ok;
+          notas.push(`[IA] Coleta mantida aberta: falta qualificar ${pend.empresa ?? "um vínculo"} (passo ${pend.passoChave})`);
+          console.log(`[VinculosLoop] fechamento adiado — ${pend.empresa ?? "?"} ainda tem campo pendente (${pend.passoChave})`);
+        }
+      } catch (err: any) {
+        console.warn("[VinculosLoop] Checagem de vínculo pendente falhou:", err?.message ?? err);
+      }
     }
 
     vinculos = Array.isArray(w.vinculos) ? (w.vinculos as VinculoEmprego[]) : vinculos;
@@ -308,8 +332,9 @@ export async function processVinculos(input: VinculosProcessorInput): Promise<Vi
     if (algumNaoClt && !algumClt) { w.e_clt = false; }
   }
 
-  // 7c. Sync vinculos[0/1] → flat fields when _vinculos_ok is set
-  if (w._vinculos_ok === true && vinculos.length > 0) {
+  // 7c. Sync vinculos[0/1] → flat fields. Não espera _vinculos_ok: a coleta pode fechar no
+  // mesmo turno (assistente-agents) e o aviso de qualificação saía com o campo solto antigo.
+  if (vinculos.length > 0) {
     const flatSync = buildFlatSync(vinculos, merged);
     if (Object.keys(flatSync).length > 0) {
       Object.assign(w, flatSync);
@@ -333,15 +358,18 @@ function buildFlatSync(vinculos: VinculoEmprego[], merged: Record<string, unknow
   const isNull = (x: unknown) => x === undefined || x === null;
   const v0 = vinculos[0], v1 = vinculos[1];
   if (v0) {
-    if (!merged.empresa_recente && v0.empresa) s.empresa_recente = v0.empresa;
-    if (!merged.funcao_recente && v0.funcao) s.funcao_recente = v0.funcao;
-    if (!merged.vinculo_recente && v0.vinculo) s.vinculo_recente = v0.vinculo;
-    if (!merged.tempo_recente && v0.tempo) s.tempo_recente = v0.tempo;
-    if (!merged.saida_recente && (v0.saida ?? v0.data_saida)) s.saida_recente = v0.saida ?? v0.data_saida;
-    if (!merged.frota_recente && v0.frota) s.frota_recente = v0.frota;
-    if (isNull(merged.horas_extras_recentes) && !isNull(v0.horas_extras)) s.horas_extras_recentes = v0.horas_extras;
-    if (isNull(merged.pagamento_fora_recente) && !isNull(v0.pagamento_fora)) s.pagamento_fora_recente = v0.pagamento_fora;
-    if (isNull(merged.injustica_recente) && !isNull(v0.injustica)) s.injustica_recente = v0.injustica;
+    // vinculos[] é a fonte de verdade também para o emprego recente. Antes o campo solto
+    // vencia (primeiro valor gravado): nome transcrito errado do áudio e "pagamento por fora"
+    // inferido antes da pergunta nunca eram corrigidos (caso Flavio Helton 24/10).
+    if (v0.empresa) { s.empresa_recente = v0.empresa; s.empresa_principal = v0.empresa; }
+    if (v0.funcao) s.funcao_recente = v0.funcao;
+    if (v0.vinculo) s.vinculo_recente = v0.vinculo;
+    if (v0.tempo) s.tempo_recente = v0.tempo;
+    if (v0.saida ?? v0.data_saida) s.saida_recente = v0.saida ?? v0.data_saida;
+    if (v0.frota) s.frota_recente = v0.frota;
+    if (!isNull(v0.horas_extras)) s.horas_extras_recentes = v0.horas_extras;
+    if (!isNull(v0.pagamento_fora)) s.pagamento_fora_recente = v0.pagamento_fora;
+    if (!isNull(v0.injustica)) s.injustica_recente = v0.injustica;
   }
   if (v1) {
     // vinculos[] is authoritative for emprego_anterior_* — always overwrite (no isNull guard)
@@ -354,6 +382,10 @@ function buildFlatSync(vinculos: VinculoEmprego[], merged: Record<string, unknow
     if (!isNull(v1.horas_extras))   s.emprego_anterior_horas_extras   = v1.horas_extras;
     if (!isNull(v1.pagamento_fora)) s.emprego_anterior_pagamento_fora = v1.pagamento_fora;
     if (v1.injustica) s.emprego_anterior_injustica = v1.injustica;
+  }
+  // Só o que mudou — sem isso a nota "Sync vínculos→flat" repetia tudo a cada mensagem.
+  for (const k of Object.keys(s)) {
+    if (JSON.stringify(s[k]) === JSON.stringify(merged[k])) delete s[k];
   }
   return s;
 }

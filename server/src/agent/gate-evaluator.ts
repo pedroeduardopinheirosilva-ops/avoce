@@ -7,6 +7,7 @@
  *   prescricao       → vinculosTodosPrescritos (já computado pelo vinculos-processor)
  *   tempo_minimo     → tempo do vínculo mais recente < mesesMin
  *   empresa_bloqueada → tratado separadamente em assistente-agents.ts
+ *   campo_igual      → genérico: campo coletado == valor configurado
  */
 
 import { prisma } from "../db.js";
@@ -123,13 +124,17 @@ function checkGate(
       if (campo === "e_clt" && valorDesq === false) {
         const CLT_RE = /clt|carteira/i;
         if (vinculos.some(v => v.vinculo && CLT_RE.test(String(v.vinculo)))) return false;
+        // Período misto (parte com carteira, parte sem) qualifica — é pedido de reconhecimento
+        // de vínculo, não motivo de descarte.
+        if (vinculos.some(v => v.periodo_sem_registro)) return false;
         // Guard: vinculo_recente or clt_anterior extracted as CLT → don't fire yet
         if (merged.vinculo_recente && CLT_RE.test(String(merged.vinculo_recente))) return false;
         if (merged.clt_anterior && CLT_RE.test(String(merged.clt_anterior))) return false;
-        const maisEmpregosInvestigado =
-          merged._mais_empregos_negado === true ||
-          merged._mais_empregos_perguntado === true;
-        if (!maisEmpregosInvestigado) return false;
+        // Só depois de o lead NEGAR outros empregos. Antes a condição também aceitava
+        // `_mais_empregos_perguntado`, ou seja, bastava a pergunta ter SIDO FEITA: a Keylla
+        // (553298491459) respondeu "Sim, trabalhei em outro lugar" e foi descartada no mesmo
+        // minuto, sem ninguém olhar o emprego anterior.
+        if (merged._mais_empregos_negado !== true) return false;
       }
       return true;
     }
@@ -154,6 +159,29 @@ function checkGate(
       // Só desqualifica após negação EXPLÍCITA do lead (via vinculos-processor).
       // Ignorar tem_emprego_anterior do LLM — pode ser falso (e.g. "último" lido como "único").
       return merged._mais_empregos_negado === true;
+    }
+
+    case "campo_igual": {
+      // Gate genérico, sem nada de Carreteiros: dispara quando um campo coletado
+      // fica igual ao valor configurado. Serve para funis que não têm vínculo
+      // nem prescrição — o de defesa de ICMS usa para separar autuação de outro
+      // Estado, consulta sem autuação e caso que já virou execução fiscal.
+      //
+      //   condicaoJson: { "campo": "uf_autuacao", "valorDesqualifica": "outro_estado" }
+      //
+      // Só avalia depois que o campo existe: campo não coletado nunca dispara,
+      // senão o gate mataria a conversa na primeira mensagem.
+      const cond = gate.condicaoJson ?? {};
+      const campo = (cond.campo as string) ?? gate.campoGatilho;
+      if (!campo) return false;
+      const val = merged[campo];
+      if (val === undefined || val === null || val === "") return false;
+      const esperado = "valorDesqualifica" in cond ? cond.valorDesqualifica : cond.igual;
+      if (esperado === undefined) return false;
+      if (typeof val === "string" && typeof esperado === "string") {
+        return val.trim().toLowerCase() === esperado.trim().toLowerCase();
+      }
+      return val === esperado;
     }
 
     case "empresa_bloqueada":

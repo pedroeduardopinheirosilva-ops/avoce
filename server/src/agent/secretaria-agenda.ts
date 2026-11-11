@@ -36,6 +36,33 @@ function formatSlotLabel(inicio: Date): string {
     : `${dia} (${dd}/${mm}) às ${hh}h${mn}`;
 }
 
+/**
+ * Taxa de comparecimento por faixa de horário, medida sobre 214 agendamentos reais
+ * (planilha da equipe, 05/06 a 17/09/2026 — auditoria de 26/08). Carreteiro de manhã cedo
+ * está saindo ou carregando: a faixa das 8h às 10h perde metade das reuniões marcadas.
+ *
+ *   08-10h  48,8%   (n=41)  ← pior
+ *   10-12h  68,6%   (n=51)  ← melhor
+ *   12-14h  71,4%   (n=7)   amostra pequena, tratada como média
+ *   14-16h  54,7%   (n=53)
+ *   16-18h  60,5%   (n=43)
+ *   18-21h  68,4%   (n=19)
+ *
+ * Usado só para ORDENAR o que já está publicado — nenhum horário é escondido do lead.
+ * Rever quando houver mais dados; a fonte é a planilha, não o banco.
+ */
+export function pesoComparecimento(inicio: Date): number {
+  const h = Number(new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo", hour: "2-digit", hour12: false,
+  }).format(inicio));
+  if (h < 10) return 0.49;
+  if (h < 12) return 0.69;
+  if (h < 14) return 0.61;   // n=7: puxado para a média em vez de confiar no 71%
+  if (h < 16) return 0.55;
+  if (h < 18) return 0.61;
+  return 0.68;
+}
+
 export async function getSlotsDisponiveis(
   projetoId: string,
   quantidade = 8,
@@ -43,6 +70,7 @@ export async function getSlotsDisponiveis(
   const agora = new Date();
   const limite = new Date(agora.getTime() + 21 * 24 * 60 * 60 * 1000);
 
+  // Busca um lote maior do que vai oferecer, para ter o que priorizar.
   const rows = await (prisma as any).agendaSlot.findMany({
     where: {
       projetoId,
@@ -51,11 +79,23 @@ export async function getSlotsDisponiveis(
       inicio: { gt: agora, lte: limite },
     },
     orderBy: { inicio: "asc" },
-    take: quantidade,
+    take: Math.max(quantidade * 4, 24),
     select: { id: true, inicio: true, fim: true },
   });
 
-  return rows.map((r: any) => ({
+  // Ordena por comparecimento esperado, com desempate pela proximidade — oferecer um
+  // horário bom daqui a duas semanas seria pior que um razoável amanhã.
+  const t0 = agora.getTime();
+  const escolhidos = [...rows]
+    .sort((a: any, b: any) => {
+      const pa = pesoComparecimento(a.inicio) - (a.inicio.getTime() - t0) / (21 * 24 * 3600 * 1000) * 0.25;
+      const pb = pesoComparecimento(b.inicio) - (b.inicio.getTime() - t0) / (21 * 24 * 3600 * 1000) * 0.25;
+      return pb - pa;
+    })
+    .slice(0, quantidade)
+    .sort((a: any, b: any) => a.inicio.getTime() - b.inicio.getTime());  // exibir em ordem cronológica
+
+  return escolhidos.map((r: any) => ({
     id: r.id,
     inicio: r.inicio,
     fim: r.fim,
@@ -129,8 +169,8 @@ export function buildSlotsInstrucoes(slots: SlotDisponivel[], advogadoNome: stri
     return [
       `⚠️ HORÁRIOS DISPONÍVEIS NA AGENDA DE ${advogadoNome.toUpperCase()}: NENHUM HORÁRIO PRÉ-CADASTRADO NO MOMENTO.`,
       `CRÍTICO: NÃO invente horários. NÃO mencione qualquer hora específica (ex: 10h, 14h, etc).`,
-      `Instrução obrigatória: pergunte ao cliente qual dia e horário seria melhor para ele e confirme que a equipe vai verificar a disponibilidade e enviar o link em seguida.`,
-      `Exemplo: "Qual dia e horário seria melhor pra você? Assim que você me informar, confirmo com ${advogadoNome} e já te mando o link da reunião."`,
+      `Instrução obrigatória: pergunte ao cliente qual dia e horário seria melhor para ele e diga que a equipe vai confirmar.`,
+      `NUNCA diga que vai mandar link nem que a reunião está marcada — nenhuma reunião foi criada.`,
       OBJECTIONS_BLOCK,
     ].join("\n");
   }
@@ -144,12 +184,47 @@ export function buildSlotsInstrucoes(slots: SlotDisponivel[], advogadoNome: stri
     `INSTRUÇÕES OBRIGATÓRIAS:`,
     `- Apresente SEMPRE estes horários numerados ao cliente, assim que possível.`,
     `- Exemplo: "Tenho esses horários disponíveis:\n1. Segunda-feira (26/05) às 10h\n2. ..."`,
-    `- Quando o cliente confirmar um número ou descrever o horário, confirme e diga que o link chegará em instantes.`,
+    `- Quando o cliente confirmar um número ou descrever o horário, confirme o horário. NÃO fale em link — a confirmação sai pelo sistema.`,
     `- NÃO invente horários que não estejam nesta lista.`,
     `- NÃO pergunte "qual horário você prefere?" sem antes apresentar esta lista.`,
     `- CRÍTICO: Ao confirmar o horário escolhido, copie o nome do dia EXATAMENTE como aparece na lista acima. NUNCA reformule o nome do dia da semana — ex: se a lista diz "Quarta-feira", não escreva "Terça-feira".`,
     OBJECTIONS_BLOCK,
   ].join("\n");
+}
+
+/**
+ * Renderiza o placeholder {horarios} de uma mensagem QUE VAI PARA O CLIENTE.
+ *
+ * Com slots → lista numerada. Sem slots → o texto configurado no banco em
+ * IaProjetoConfig (categoria "reuniao", chave "agenda_sem_slots_texto"), que
+ * SUBSTITUI a mensagem inteira — o template fala "tenho estes horários" e
+ * sem horário nenhum o texto ao redor não faz sentido.
+ *
+ * Nunca injetar aqui instrução de prompt: este retorno é enviado literalmente
+ * ao lead (o step é determinístico, não passa pelo LLM).
+ */
+export async function renderHorarios(
+  projetoId: string,
+  texto: string,
+  slots: SlotDisponivel[],
+): Promise<string> {
+  if (!texto.includes("{horarios}")) return texto;
+
+  if (slots.length > 0) {
+    return texto.replace("{horarios}", slots.map((s, i) => `${i + 1}. ${s.label}`).join("\n"));
+  }
+
+  const cfg = await prisma.iaProjetoConfig.findFirst({
+    where: { projetoId, categoria: "reuniao", chave: "agenda_sem_slots_texto" },
+  }).catch(() => null);
+  const configurado = (cfg?.valor ?? "").trim();
+  if (configurado) return configurado;
+
+  // Sem config no projeto: nada de texto fixo no código (o antigo prometia um link que
+  // nunca era enviado). Vazio → o step não manda texto determinístico e a LLM responde.
+  // O correto é cadastrar `agenda_sem_slots_texto` para este projeto.
+  console.warn(`[SecretariaAgenda] projeto ${projetoId} sem "agenda_sem_slots_texto" e sem slots — sem texto determinístico`);
+  return "";
 }
 
 /** Finds which slot the lead's text refers to, using number matching first then LLM. */

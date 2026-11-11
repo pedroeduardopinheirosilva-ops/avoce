@@ -68,26 +68,34 @@ export async function downloadAudioFromEvolution(
   instancia: string,
   msg: any
 ): Promise<{ buffer: Buffer; mimetype: string } | null> {
-  try {
-    const res = await fetch(`${baseUrl}/chat/getBase64FromMediaMessage/${instancia}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", apikey: apiKey },
-      body: JSON.stringify({
-        message: { key: msg.key, message: msg.message },
-        convertToMp4: false,
-      }),
-    });
+  // Duas tentativas: primeiro com o payload completo do webhook; se a Evolution recusar,
+  // de novo só com a key — nesse formato ela busca a mensagem no próprio banco.
+  // Faz diferença quando o webhook entrega o audioMessage sem os campos de mídia: o payload
+  // completo devolve 400 "Cannot derive from empty media key", enquanto só a key funciona.
+  const tentativas: any[] = [
+    { key: msg.key, message: msg.message },
+    { key: msg.key },
+  ];
 
-    if (!res.ok) return null;
-    const data = await res.json() as { base64?: string; mediaType?: string };
-    if (!data.base64) return null;
-
-    const buffer = Buffer.from(data.base64, "base64");
-    const mimetype = data.mediaType ?? "audio/ogg; codecs=opus";
-    return { buffer, mimetype };
-  } catch {
-    return null;
+  for (const message of tentativas) {
+    try {
+      const res = await fetch(`${baseUrl}/chat/getBase64FromMediaMessage/${instancia}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", apikey: apiKey },
+        body: JSON.stringify({ message, convertToMp4: false }),
+      });
+      if (!res.ok) continue;
+      const data = await res.json() as { base64?: string; mediaType?: string };
+      if (!data.base64) continue;
+      return {
+        buffer: Buffer.from(data.base64, "base64"),
+        mimetype: data.mediaType ?? "audio/ogg; codecs=opus",
+      };
+    } catch {
+      // tenta o próximo formato
+    }
   }
+  return null;
 }
 
 function mimetypeToExt(mimetype: string): string {

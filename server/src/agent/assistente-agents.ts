@@ -27,6 +27,39 @@ const CAMPOS_REQ: Array<keyof VinculoEmprego> = [
   "horas_extras", "pagamento_fora", "injustica",
 ];
 
+const NON_CLT_RE = /autônomo|autonomo|avulso|cooperado|agregado|\btac\b|transportador\s+autonomo/i;
+const CLT_RE_AA  = /clt|carteira/i;
+
+/**
+ * Autonomia REAL (dono do próprio caminhão, cooperado, avulso, app).
+ * "informal"/"sem registro"/PJ forçado NÃO entram — motorista subordinado sem carteira
+ * qualifica (reconhecimento de vínculo). CLT/carteira tem prioridade em vínculo misto.
+ */
+export function isNaoCltSdr(vinculo: string | null | undefined): boolean {
+  return vinculo != null && !CLT_RE_AA.test(String(vinculo)) && NON_CLT_RE.test(String(vinculo));
+}
+
+/**
+ * Há pelo menos um vínculo aproveitável: empresa não bloqueada, tempo >= mínimo do projeto
+ * e sem autonomia real. O segundo termo é belt-and-suspenders: o LLM extraiu CLT nos campos
+ * flat mesmo com vinculos[].vinculo errado.
+ */
+export function temVinculoValidoSdr(
+  vinculos: VinculoEmprego[],
+  merged: Record<string, unknown>,
+  mesesMin: number,
+  isBlocked: (empresa: string | null | undefined) => boolean,
+): boolean {
+  const tempoOk = (v: VinculoEmprego) =>
+    !isBlocked(v.empresa) && v.tempo != null && v.tempo !== "" &&
+    parseTempToMeses(String(v.tempo)) >= mesesMin;
+  if (vinculos.some(v => tempoOk(v) && !isNaoCltSdr(v.vinculo))) return true;
+  const cltNosFlats =
+    (!!merged.vinculo_recente && CLT_RE_AA.test(String(merged.vinculo_recente))) ||
+    (!!merged.clt_anterior    && CLT_RE_AA.test(String(merged.clt_anterior)));
+  return cltNosFlats && vinculos.some(tempoOk);
+}
+
 function isVinculoComplete(v: VinculoEmprego): boolean {
   return CAMPOS_REQ.every(k => {
     const val = v[k];
@@ -129,22 +162,8 @@ export async function runAssistenteAgent(ctx: AgentContext): Promise<AgentResult
     // Cobre: Uber/iFood autônomo / dono do caminhão → não-CLT → nenhum válido.
     // RECONHECIMENTO DE VÍNCULO: "informal"/"sem registro"/"PJ forçado" (pejotização) QUALIFICAM
     // (motorista subordinado sem carteira) → NÃO entram no NON_CLT_RE.
-    const NON_CLT_RE = /autônomo|autonomo|avulso|cooperado|agregado|\btac\b|transportador\s+autonomo/i;
-    const CLT_RE_AA = /clt|carteira/i;
-    // CLT/carteira tem prioridade: vínculo misto ("metade CLT, depois PJ") qualifica.
-    const isNaoClt = (vinculo: string | null | undefined) =>
-      vinculo != null && !CLT_RE_AA.test(String(vinculo)) && NON_CLT_RE.test(String(vinculo));
-    const temVinculoValido = ctx.vinculos.some(v =>
-      !isBlocked(v.empresa) &&
-      v.tempo != null && v.tempo !== "" &&
-      parseTempToMeses(String(v.tempo)) >= mesesMin &&
-      !isNaoClt(v.vinculo)
-    ) || (
-      // Belt-and-suspenders: LLM extracted CLT in qualificacao fields even if vinculos[].vinculo is wrong
-      (ctx.merged.vinculo_recente && CLT_RE_AA.test(String(ctx.merged.vinculo_recente)) ||
-       ctx.merged.clt_anterior    && CLT_RE_AA.test(String(ctx.merged.clt_anterior))) &&
-      ctx.vinculos.some(v => !isBlocked(v.empresa) && v.tempo != null && v.tempo !== "" && parseTempToMeses(String(v.tempo)) >= mesesMin)
-    );
+    const isNaoClt = isNaoCltSdr;
+    const temVinculoValido = temVinculoValidoSdr(ctx.vinculos, ctx.merged, mesesMin, isBlocked);
 
     if (todosVinculosBloqueados || (!temVinculoValido && ctx.vinculos.length > 0)) {
       // Detecta a razão de não haver vínculo válido para usar o gate correto.
@@ -168,7 +187,12 @@ export async function runAssistenteAgent(ctx: AgentContext): Promise<AgentResult
                      : tipoRazao === "nao_clt"   ? "vinculo_invalido"
                      : "tempo_minimo";
       const gate = await prisma.iaGateSdr.findFirst({
-        where: { projetoId: ctx.projetoId, tipo: tipoGate, ativo: true },
+        // O gate de ação em andamento também é `vinculo_invalido` (campo acao_em_andamento): sem
+        // filtrar o campo, agregado/autônomo recebia "já existe um advogado cuidando" (09/11).
+        where: {
+          projetoId: ctx.projetoId, tipo: tipoGate, ativo: true,
+          ...(tipoGate === "vinculo_invalido" ? { OR: [{ campoGatilho: "e_clt" }, { campoGatilho: null }] } : {}),
+        },
       });
       // empresa_bloqueada tem flag investigarAnterior; para os demais a semântica é a mesma.
       const investigarAnterior = (gate?.condicaoJson as any)?.investigarAnterior !== false;

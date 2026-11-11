@@ -37,21 +37,23 @@ const IDENTITY_PATTERNS: RegExp[] = [
   /e\s+automatizado/,
   /sistema\s+automatico/,
   /\b(chatgpt|chat\s?gpt|claude|gemini|gpt)\b/,
-  /\brobo\b/,                                   // qualquer menção a robô
-  // Perguntas de legitimidade do escritório (suspeita de golpe)
+  /\brob[oô]\b/,                                // qualquer menção a robô
+  // Perguntas de legitimidade do escritório (suspeita de golpe).
+  // Os padrões aqui precisam exigir CONTEXTO: transcrição de áudio embolada disparava o bloco
+  // "golpes no WhatsApp / CNPJ do escritório" no meio de uma conversa sobre folga
+  // (Carlos 5521995367039, 18/08 11:28). Regex de palavra solta (/\bgolpe\b/, /cnpj\b/,
+  // /onde ficam?\b/) causava falso positivo.
   /(voces?|vcs?)\s+(tem|têm|possuem)\s+cnpj/,
-  /onde\s+(fica|ficam|é|esta|e)\s+(o\s+)?(escritorio|escritório|advogad)/,
-  /onde\s+(vcs?|voces?|voce)\s+ficam?/,       // "onde vcs ficam"
-  /onde\s+ficam?\b/,                            // "onde ficam" genérico
-  /quero\s+saber\s+onde/,                       // "quero saber onde vcs ficam"
+  /onde\s+(fica|ficam|é|esta|e)\s+(o\s+)?(escritorio|escritório|advogad|voces|vcs)/,
+  /onde\s+(que\s+)?(vcs?|voces?|voce)\s+(ficam?|sao|estao|e|fica)/,   // "onde vcs ficam", "de onde vocês são"
+  /quero\s+saber\s+(onde|quem)\s+(vcs?|voces?|fica|é)/,
   /(endereço|endereco)\s+d[oa]\s+(escritorio|escritório)/,
-  /\bgolpe\b/,                                  // qualquer menção a golpe
+  /(isso|isto|nao|não|sera|será|e|eh|é)\s+(e|eh|é)?\s*(um\s+)?golpe/, // "isso é golpe?", "não é golpe?"
   /\bgolpes?\b.*\bwhatsapp\b|\bwhatsapp\b.*\bgolpes?\b/,
-  /n[aã]o\s+[eé]\s+golpe/,                     // "se não é golpe"
-  /[eé]\s+golpe\??/,                            // "é golpe?"
+  /(medo|receio|desconfi|cuidado|caio|cair)\w*.*\bgolpe/,
   /ja\s+(fui|me)\s*(enganad|golpe|fraude)/,
   /cnpj.*escritorio|escritorio.*cnpj/,
-  /cnpj\b/,                                     // qualquer pergunta com CNPJ
+  /(qual|manda|passa|informa|me\s+d[aá])\w*\s+(o\s+)?cnpj/,   // pede o CNPJ, não só cita
 ];
 
 export function detectIdentityQuestion(message: string): boolean {

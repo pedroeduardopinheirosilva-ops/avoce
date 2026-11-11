@@ -53,6 +53,8 @@ export interface SystemPromptContext {
 
   // Lead asked an unexpected off-flow question — LLM should answer then return to flow
   leadFezPerguntaInesperada?: boolean;
+  /** modo_sdr = "generico": pula as orientações fixas da assistente do funil de carreteiros. */
+  assistenteGenerico?: boolean;
 
   // Identity data to inject when lead asked a complex question containing identity keywords
   identityContextInject?: string | null;
@@ -147,8 +149,9 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
     .replace("{INSTRUÇÃO BASE}", ctx.instrucaoBase)
     .replace(/\{nome_persona\}/g, personaNome)
     .replace(/\{nome_advogado\}/g, ctx.advogadoNome ?? personaNome)
+    .replace(/\{nome_assistente\}/g, ctx.assistenteNome ?? "assistente")
     .replace(/\{nome_escritorio\}/g, ctx.escritorioNome ?? "escritório");
-  if (!userSystem.includes("DATA E HORA ATUAL")) userSystem = ctx.instrucaoBase + "\n\n" + userSystem;
+  if (!userSystem.includes("REGRAS INVIOLÁVEIS DE COMUNICAÇÃO")) userSystem = ctx.instrucaoBase + "\n\n" + userSystem;
 
   // coleta_docs uses a visible name prefix on every message so the lead always knows who's writing.
   const identidadeExtra = personaChave === "coleta_docs"
@@ -158,7 +161,16 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
     `\n\nIdentidade: você é ${personaNome}.${identidadeExtra}` +
     `\n\nSe o cliente perguntar se você é robô, IA, bot, ou pedir CNPJ/endereço/legitimidade do escritório: mantenha a persona e RESPONDA a preocupação com dados reais. NUNCA diga "isso não importa agora" ou desvie — isso parece golpe. Diga que é a ${personaNome}, da equipe do escritório, que a preocupação é válida, e forneça os dados de legitimidade disponíveis (CNPJ, cidade, advogado responsável). Se não tiver os dados, oriente a verificar na OAB e ofereça passar o contato do advogado.`;
 
-  if (personaChave === "assistente") {
+  if (personaChave === "assistente" && ctx.assistenteGenerico) {
+    // Funil que não é de carreteiro: as regras de conversa estão no systemPrompt da
+    // persona. Só o essencial comum a qualquer SDR.
+    userSystem +=
+      `\n\nOrientações para ${personaNome}:` +
+      `\n- Se o lead fizer uma pergunta, RESPONDA a pergunta dele primeiro, de forma completa e objetiva. Só depois conduza a conversa.` +
+      `\n- Nunca repita uma pergunta que você já fez e que o lead já respondeu, nem a mesma pergunta da sua mensagem anterior.` +
+      `\n- Se o lead aceitar algo que você ofereceu ("pode", "sim", "pode explicar"), entregue o que ofereceu nesta mesma mensagem — não pergunte de novo se pode.` +
+      `\n- NUNCA prometa valores, prazos ou garantia de resultado.`;
+  } else if (personaChave === "assistente") {
     userSystem +=
       `\n\nOrientações para a assistente (${personaNome}):` +
       `\n- Uma pergunta por mensagem. Nada mais.` +
@@ -242,7 +254,13 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
         if (key === "resposta_lead") return ctx.incomingText?.trim() || "[sem resposta do lead]";
         const val = merged[key];
         return val != null && String(val).trim() !== "" ? String(val) : (key === "empresa" ? "a empresa" : key === "nome" ? "o cliente" : `[${key}]`);
-      });
+      })
+        // Nomes das personas vêm do banco (IaPersona.nomeExibicao) — sem eles a instrução
+        // vazaria "{nome_persona}"/"{nome_assistente}" literal para dentro do prompt.
+        .replace(/\{nome_persona\}/g, personaNome)
+        .replace(/\{nome_advogado\}/g, ctx.advogadoNome ?? personaNome)
+        .replace(/\{nome_assistente\}/g, ctx.assistenteNome ?? "assistente")
+        .replace(/\{nome_escritorio\}/g, ctx.escritorioNome ?? "escritório");
       let instrucaoLlm = `\n\nInstruções para este turno:\n${instrucaoTexto}\nElabore com base nos dados reais do lead. Não peça documentos nem colete dados pessoais nesta resposta.`;
       if (ctx.valueInjection) instrucaoLlm += `\n\n${ctx.valueInjection}`;
       userSystem += instrucaoLlm;
@@ -296,17 +314,33 @@ Instrução obrigatória:
 
   // Pre-filled data from meeting transcription or document OCR — show explicitly so LLM can
   // confirm briefly and skip collecting those fields again.
-  if (personaChave === "advogado" || personaChave === "secretaria") {
-    const pfEntries = Object.entries(ctx.iaFlowStepData)
-      .filter(([k]) => k.startsWith("_pf_"))
+  if (personaChave === "advogado" || personaChave === "secretaria" || personaChave === "coleta_docs") {
+    // Na coleta_docs os _pf_* vivem em iaFlags (via loadColetaDocsContext), não em
+    // iaFlowStepData — ler só iaFlowStepData deixava o LLM às cegas e ele repedia
+    // documento e dado que o cliente já tinha mandado.
+    const pfFonte = { ...merged, ...ctx.iaFlowStepData };
+    const pfEntries = Object.entries(pfFonte)
+      .filter(([k, v]) => k.startsWith("_pf_") && typeof v === "string" && v.trim())
       .map(([k, v]) => `- ${k.replace("_pf_", "")}: ${v}`);
     if (pfEntries.length > 0) {
-      const pfNome = ctx.iaFlowStepData._pf_nome as string | undefined;
+      const pfNome = (pfFonte._pf_nome ?? undefined) as string | undefined;
       userSystem +=
         `\n\nDADOS JÁ OBTIDOS (da reunião ou documentos — NÃO pergunte esses campos):\n${pfEntries.join("\n")}` +
         `\nNa primeira mensagem desta coleta, confirme esses dados brevemente e de forma natural` +
         (pfNome ? ` (ex: "Você é ${pfNome}, né?")` : "") +
         ` e vá direto para os campos que faltam.`;
+    }
+
+    // Documentos já recebidos: sem isto o LLM pedia a CNH de novo depois de o cliente
+    // já tê-la enviado, e um humano tinha que entrar na conversa pra desmentir.
+    const docsRecebidos: string[] = [];
+    if (merged._cnh_recebida === true) docsRecebidos.push("CNH / documento de identidade com foto");
+    if (merged._comprovante_recebido === true) docsRecebidos.push("comprovante de endereço");
+    if (docsRecebidos.length > 0) {
+      userSystem +=
+        `\n\nDOCUMENTOS JÁ RECEBIDOS E LIDOS: ${docsRecebidos.join(", ")}.` +
+        ` NUNCA peça esses documentos de novo, nem "pra confirmar" ou "pra formalizar" —` +
+        ` já estão no processo. Se o cliente perguntar, confirme que foram recebidos.`;
     }
   }
 

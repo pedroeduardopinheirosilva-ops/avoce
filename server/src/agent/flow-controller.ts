@@ -790,6 +790,15 @@ async function advanceToNextStep(
         return { nextQuestion: null, nextStepChave: "__done__" };
       }
 
+      // context_load é passo interno de pré-processamento — não tem pergunta e nunca pode ser o
+      // passo onde o fluxo estaciona. Parar nele devolve nextQuestion vazio, o stage-engine
+      // perde a pergunta determinística e o LLM responde livre: volta a qualificar o lead com
+      // as perguntas do stage (SDR) no meio da coleta de documentos.
+      if (candidate.stepType === "context_load") {
+        console.log(`[FlowController] Pulando step interno "${candidate.chave}" (context_load)`);
+        continue;
+      }
+
       // Pre-skip: campo já coletado — usa merged (qualificacao + stepData) exceto para campos
       // que precisam ser confirmados explicitamente (nunca pular via chat-inferred data).
       // _pf_* (prefill from transcription/OCR) bypasses NUNCA_PULAR — data is authoritative.

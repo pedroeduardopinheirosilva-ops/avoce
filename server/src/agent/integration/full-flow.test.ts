@@ -78,6 +78,8 @@ vi.mock("../../db.js", () => ({
         if (where?.whatsapp === state.contato.whatsapp) return state.contato;
         return null;
       }),
+      findMany: vi.fn(async ({ where }: any) =>
+        (where?.whatsapp?.in ?? []).includes(state.contato.whatsapp) ? [state.contato] : []),
       create: vi.fn(async ({ data }: any) => { Object.assign(state.contato, data); return state.contato; }),
       update: vi.fn(async ({ data }: any) => { Object.assign(state.contato, data); return state.contato; }),
     },
@@ -280,6 +282,7 @@ vi.mock("../deal-repository.js", () => ({
   atualizarMergedFlags: vi.fn(async (_id: string, _merged: any, flags: any) => {
     Object.assign(state.deal.iaFlags, flags);
   }),
+  adotarDealSemProjeto: vi.fn(async () => null),
   createInitialDeal: vi.fn(async () => {
     state.isNewDeal = false;
     return state.deal;

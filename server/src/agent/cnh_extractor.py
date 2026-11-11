@@ -20,7 +20,9 @@ Para uso no sistema AvoceSystem / PSA Docs
 import re
 import sys
 import json
+import os
 import subprocess
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -135,10 +137,24 @@ def extract_mrz_from_image(image_path: str) -> list:
         text = result.stdout
         lines = [l.strip() for l in text.split('\n') if l.strip()]
 
-        # Filtrar apenas linhas que parecem MRZ (contêm < e têm ~30 chars)
-        mrz_lines = [l for l in lines if '<' in l and len(l) > 20]
+        # Filtro grosso: contém '<' e tem comprimento de MRZ
+        candidatas = [l for l in lines if '<' in l and len(l) > 20]
 
-        return mrz_lines
+        # Filtro fino — SEM ele qualquer ruído de OCR com '<' virava "MRZ" e o
+        # parser gerava nome-lixo (ex.: 'Ss)=|\\S=|$22XSSooMS |' saiu de uma
+        # conta de luz). A MRZ da CNH usa só A-Z, 0-9 e '<'; a primeira linha
+        # começa com I<BRA. Exige as duas coisas antes de aceitar.
+        limpas = []
+        for l in candidatas:
+            compacta = l.replace(' ', '').upper()
+            validos = sum(1 for ch in compacta if ch.isalnum() or ch == '<')
+            if validos / max(1, len(compacta)) >= 0.95:
+                limpas.append(compacta)
+
+        if not any(l.startswith('I<BRA') or l.startswith('L<BRA') for l in limpas):
+            return []
+
+        return limpas
     except Exception as e:
         print(f"  [WARN] Tesseract MRZ failed: {e}", file=sys.stderr)
         return []
@@ -232,7 +248,9 @@ def parse_ocr_text(text: str) -> 'CNHData':
         data.numero_registro = reg_match.group(1)
 
     # --- NACIONALIDADE ---
-    nac_match = re.search(r'BRASILEIRO\w*', full_text, re.IGNORECASE)
+    # A CNH sempre imprime "BRASILEIRA" (concorda com o substantivo feminino "nacionalidade",
+    # não com o sexo do titular) — o regex antigo só aceitava a forma masculina e nunca batia.
+    nac_match = re.search(r'BRASILEIR[OA]\w*', full_text, re.IGNORECASE)
     if nac_match:
         data.nacionalidade = nac_match.group(0).upper()
 
@@ -269,11 +287,137 @@ def parse_ocr_text(text: str) -> 'CNHData':
     return data
 
 
-def extract_via_fullpage_ocr(main_image_path: str) -> 'CNHData':
-    text = ocr_full_page(main_image_path)
-    if not text.strip():
-        return CNHData()
-    return parse_ocr_text(text)
+def _variantes_imagem(image_path: str, work_dir: str) -> list:
+    """Gera versões pré-processadas da foto para o tesseract.
+
+    Foto de celular de CNH plastificada (brilho, baixo contraste, resolução de
+    tela) sai ilegível no tesseract cru — na medição, a foto rendeu um único
+    número e o nome corrompido. Escala de cinza + autocontraste + upscale é o
+    que normalmente separa lixo de texto utilizável.
+    """
+    saidas = [image_path]
+    try:
+        from PIL import Image, ImageOps, ImageFilter
+    except Exception:
+        return saidas
+
+    try:
+        base = Image.open(image_path)
+        if base.mode != 'L':
+            base = base.convert('L')
+
+        cinza = ImageOps.autocontrast(base)
+        p1 = str(Path(work_dir) / 'v_cinza.png')
+        cinza.save(p1)
+        saidas.append(p1)
+
+        # Upscale 2x com filtro: dígito pequeno de CPF só aparece com mais pixels.
+        w, h = cinza.size
+        grande = cinza.resize((w * 2, h * 2), Image.LANCZOS).filter(ImageFilter.SHARPEN)
+        p2 = str(Path(work_dir) / 'v_2x.png')
+        grande.save(p2)
+        saidas.append(p2)
+
+        # Binarização simples sobre o upscale — ajuda em papel amarelado.
+        limiar = 140
+        p3 = str(Path(work_dir) / 'v_bin.png')
+        binaria = grande.point(lambda v: 255 if v > limiar else 0, mode='1')
+        binaria.save(p3)
+        saidas.append(p3)
+
+        # A CNH é paisagem; foto de celular costuma vir em retrato. Girada, o
+        # tesseract perde a adjacência rótulo→valor e as regex ficam cegas mesmo
+        # com o texto legível na imagem. Só gera as rotações quando a foto está
+        # em retrato, para não dobrar o trabalho à toa.
+        if h > w:
+            for graus in (270, 90):
+                pr = str(Path(work_dir) / f'v_rot{graus}.png')
+                binaria.rotate(graus, expand=True).save(pr)
+                saidas.append(pr)
+    except Exception as e:
+        print(f"  [WARN] pré-processamento falhou: {e}", file=sys.stderr)
+
+    return saidas
+
+
+def _tesseract(image_path: str, psm: str) -> str:
+    for args in (['-l', 'por+eng'], []):
+        try:
+            r = subprocess.run(
+                ['tesseract', image_path, 'stdout', '--psm', psm] + args,
+                capture_output=True, text=True, timeout=30,
+                env={**os.environ, 'OMP_THREAD_LIMIT': '1'},
+            )
+            if r.stdout.strip():
+                return r.stdout
+        except Exception:
+            continue
+    return ''
+
+
+def _tem_cpf_valido(texto: str) -> bool:
+    for c in re.findall(r'\d{3}[.\s]?\d{3}[.\s]?\d{3}[-.\s]?\d{2}|\d{11}', texto):
+        if validar_cpf(c):
+            return True
+    return False
+
+
+def extract_via_fullpage_ocr(main_image_path: str, corpus_out: list = None) -> 'CNHData':
+    """OCR determinístico com várias tentativas.
+
+    Percorre combinações de pré-processamento × modo de segmentação e para na
+    primeira cujo texto contenha um CPF que passa no dígito verificador — esse
+    é um critério de aceitação exato, sem chute: um OCR errado praticamente
+    nunca produz 11 dígitos que fecham a conta. Não achando CPF em nenhuma,
+    fica com o texto mais longo, que é o mais provável de ter os demais campos.
+    """
+    import tempfile, time
+    work_dir = tempfile.mkdtemp(prefix='cnh_prep_')
+    # Orçamento de tempo: o documento chega no meio de uma conversa e o lead fica
+    # esperando a resposta. Varrer todas as variantes leva ~30s; o CPF costuma sair
+    # nas primeiras. Passado o limite, devolve o que já achou.
+    limite = time.monotonic() + 12.0
+    try:
+        com_cpf, sem_cpf = [], []
+        melhor = ''
+        estourou = False
+        for img in _variantes_imagem(main_image_path, work_dir):
+            if estourou:
+                break
+            for psm in ('3', '6'):
+                if time.monotonic() > limite and (com_cpf or sem_cpf):
+                    print("    OCR: orçamento de tempo esgotado", file=sys.stderr)
+                    estourou = True
+                    break
+                texto = _tesseract(img, psm)
+                if not texto.strip():
+                    continue
+                if len(texto) > len(melhor):
+                    melhor = texto
+                if corpus_out is not None:
+                    corpus_out.append(texto)
+                dados = parse_ocr_text(texto)
+                if _tem_cpf_valido(texto):
+                    print(f"    OCR: CPF válido em {Path(img).name} psm={psm}", file=sys.stderr)
+                    com_cpf.append(dados)
+                    # CPF válido + qualquer outro campo de identidade já basta:
+                    # o resto vem da MRZ ou de outra variante. Sem esta saída
+                    # antecipada o PDF, que resolve na primeira tentativa, pagava
+                    # todas as variantes à toa.
+                    if dados.nome or dados.rg or dados.data_nascimento:
+                        return merge_results(*com_cpf, *sem_cpf)
+                elif any(getattr(dados, f) for f in ('nome', 'rg', 'data_nascimento')):
+                    sem_cpf.append(dados)
+
+        if com_cpf or sem_cpf:
+            # CPF válido tem prioridade; o resto completa os campos que faltarem.
+            return merge_results(*com_cpf, *sem_cpf)
+        if not melhor.strip():
+            return CNHData()
+        print(f"    OCR: nenhum campo reconhecido; usando o texto mais longo", file=sys.stderr)
+        return parse_ocr_text(melhor)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ============================================================
@@ -379,6 +523,19 @@ Retorne APENAS o JSON, sem markdown, sem explicação."""
 # PIPELINE PRINCIPAL
 # ============================================================
 
+IMAGE_SUFFIXES = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tif', '.tiff'}
+
+
+def eh_pdf(caminho: str) -> bool:
+    """PDF pela assinatura do arquivo, nao pela extensao — o WhatsApp entrega
+    nome generico ('doc.bin') e o mimetype nem sempre vem."""
+    try:
+        with open(caminho, 'rb') as f:
+            return f.read(5) == b'%PDF-'
+    except Exception:
+        return Path(caminho).suffix.lower() == '.pdf'
+
+
 def extract_images_from_pdf(pdf_path: str, output_dir: str) -> list:
     """Extrai imagens embarcadas do PDF usando pdfimages."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -390,6 +547,22 @@ def extract_images_from_pdf(pdf_path: str, output_dir: str) -> list:
 
     images = sorted(Path(output_dir).glob('img-*.png'))
     return [str(p) for p in images]
+
+
+def preparar_imagens(caminho: str, output_dir: str) -> list:
+    """Devolve a lista de imagens a analisar.
+
+    CNH digital (PDF do SENATRAN): a camada de texto so tem o aviso do Assinador
+    Serpro — os dados estao em JPEGs embarcados, entao extrai com pdfimages.
+    CNH fisica (foto): o proprio arquivo ja e a imagem.
+    """
+    if eh_pdf(caminho):
+        return extract_images_from_pdf(caminho, output_dir)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    destino = str(Path(output_dir) / ('foto' + (Path(caminho).suffix.lower() or '.jpg')))
+    shutil.copyfile(caminho, destino)
+    return [destino]
 
 
 def merge_results(*results: 'CNHData') -> 'CNHData':
@@ -410,63 +583,66 @@ def merge_results(*results: 'CNHData') -> 'CNHData':
     return merged
 
 
-def extract_cnh_data(pdf_path: str, claude_api_key: str = None) -> 'CNHData':
+def extract_cnh_data(caminho: str, claude_api_key: str = None, usar_ia: bool = True) -> 'CNHData':
     """
-    Pipeline principal de extração.
+    Pipeline principal de extração. Aceita CNH digital (PDF do SENATRAN) OU
+    foto da CNH física — em ambos os casos as duas primeiras estratégias são
+    100% locais (tesseract + regex), sem chamada a nenhuma IA.
 
     Tenta na ordem:
-    1. MRZ parse (rápido, grátis, pega nome + data nasc + validade)
-    2. OCR por regiões (grátis, pega todos os campos se Tesseract OK)
-    3. Claude Vision (pago, mais confiável, fallback inteligente)
+    1. MRZ parse (determinístico: nome, nascimento, nº registro, validade)
+    2. OCR full-page + regex (determinístico: CPF, RG, órgão emissor, filiação)
+    3. Claude Vision — só quando `usar_ia` e há chave; é a única etapa paga.
 
-    Retorna resultado mesclado das 3 estratégias.
+    Retorna resultado mesclado das estratégias.
     """
     import tempfile
-    import shutil
 
     output_dir = tempfile.mkdtemp(prefix='cnh_extract_')
 
     try:
-        print(f"[CNH Extractor] Processando: {pdf_path}", file=sys.stderr)
+        print(f"[CNH Extractor] Processando: {caminho}", file=sys.stderr)
 
-        # Extrair imagens
-        images = extract_images_from_pdf(pdf_path, output_dir)
-        print(f"  Imagens extraídas: {len(images)}", file=sys.stderr)
+        images = preparar_imagens(caminho, output_dir)
+        print(f"  Imagens para analisar: {len(images)}", file=sys.stderr)
 
-        if len(images) < 2:
-            raise ValueError(f"PDF não contém imagens suficientes ({len(images)}) para ser uma CNH-e")
+        if not images:
+            raise ValueError("Nenhuma imagem para analisar")
 
-        # Identificar imagens por tamanho
-        # CNH-e embarca 3 imagens 963x680:
-        #   img-001 (~530KB) = frente da CNH (dados pessoais)
-        #   img-002 (~170KB) = categorias + observações
-        #   img-003 (~280KB) = legenda + MRZ
+        # A CNH-e embarca 3 imagens 963x680 (frente / categorias / legenda+MRZ);
+        # a foto da CNH física é uma imagem só. Trata os dois casos: fica com as
+        # grandes quando existirem, senão com a maior que houver.
         from PIL import Image
+
+        candidatas = []
+        for img_path in images:
+            try:
+                w, h = Image.open(img_path).size
+            except Exception:
+                continue
+            file_size = Path(img_path).stat().st_size
+            print(f"  {Path(img_path).name}: {w}x{h}, {file_size:,} bytes", file=sys.stderr)
+            candidatas.append((img_path, file_size, w, h))
+
+        if not candidatas:
+            raise ValueError("Nenhuma imagem legível")
+
+        large_images = [(p, sz) for (p, sz, w, h) in candidatas if w >= 900 and h >= 600]
+        if not large_images:
+            # Foto de celular ou digitalização menor — usa a maior disponível.
+            candidatas.sort(key=lambda x: x[1], reverse=True)
+            large_images = [(candidatas[0][0], candidatas[0][1])]
 
         main_img = None
         mrz_img = None
-        large_images = []
-
-        for img_path in images:
-            img = Image.open(img_path)
-            w, h = img.size
-            file_size = Path(img_path).stat().st_size
-            print(f"  {Path(img_path).name}: {w}x{h}, {file_size:,} bytes", file=sys.stderr)
-
-            if w >= 900 and h >= 600:
-                large_images.append((img_path, file_size))
-
-        if not large_images:
-            raise ValueError("PDF não contém imagens grandes o suficiente — não é uma CNH-e")
 
         # A maior é a frente da CNH (dados pessoais)
         large_images.sort(key=lambda x: x[1], reverse=True)
         main_img = large_images[0][0]
 
-        # MRZ: testar cada imagem grande que não seja a principal
-        for img_path, _ in large_images:
-            if img_path == main_img:
-                continue
+        # MRZ: nas outras imagens grandes (CNH-e) ou na própria foto, quando é só uma
+        alvos_mrz = [p for p, _ in large_images if p != main_img] or [main_img]
+        for img_path in alvos_mrz:
             test_lines = extract_mrz_from_image(img_path)
             if test_lines:
                 mrz_img = img_path
@@ -491,14 +667,29 @@ def extract_cnh_data(pdf_path: str, claude_api_key: str = None) -> 'CNHData':
             results.append(CNHData())
 
         # --- Estratégia 2: OCR por regiões ---
+        corpus = []
         if main_img:
             print("\n  [Estratégia 2] OCR full-page + regex na imagem principal...", file=sys.stderr)
-            ocr_data = extract_via_fullpage_ocr(main_img)
+            ocr_data = extract_via_fullpage_ocr(main_img, corpus)
             print(f"    Resultado OCR: {ocr_data.to_dict()}", file=sys.stderr)
             results.append(ocr_data)
 
+        # --- Portão de evidência ---------------------------------------------
+        # Este extrator é de CNH. Sem esta checagem ele declarava CNH qualquer
+        # documento em que achasse um CPF válido — e conta de luz, holerite e
+        # CTPS têm CPF. Uma conta de luz virou "CNH" e sobrescreveu o nome do
+        # deal com lixo. Só segue se houver marca de CNH: MRZ válida ou termo
+        # do documento no texto lido.
+        texto_todo = ' '.join(corpus).upper()
+        marcas = ('HABILITA', 'CARTEIRA NACIONAL', 'DETRAN', 'PERMISSAO PARA DIRIGIR',
+                  'PERMISSÃO PARA DIRIGIR', 'CONDUTOR', 'CAT. HAB', 'CATEGORIA')
+        tem_marca = any(m in texto_todo for m in marcas)
+        if not mrz_img and not tem_marca:
+            print("  [Portão] Sem marca de CNH (MRZ ou termo do documento) — não é CNH", file=sys.stderr)
+            return CNHData()
+
         # --- Estratégia 3: Claude Vision ---
-        if claude_api_key and main_img:
+        if usar_ia and claude_api_key and main_img:
             print("\n  [Estratégia 3] Claude Vision API...", file=sys.stderr)
             try:
                 vision_data = extract_via_claude_vision(main_img, claude_api_key)
@@ -508,7 +699,7 @@ def extract_cnh_data(pdf_path: str, claude_api_key: str = None) -> 'CNHData':
                 print(f"    Claude Vision falhou: {e}", file=sys.stderr)
 
         # Mesclar resultados (prioridade: Vision > OCR > MRZ se Vision disponível)
-        if claude_api_key:
+        if usar_ia and claude_api_key:
             results.reverse()  # Vision primeiro se disponível
         final = merge_results(*results)
 
@@ -528,15 +719,17 @@ def extract_cnh_data(pdf_path: str, claude_api_key: str = None) -> 'CNHData':
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Extrai dados de CNH-e digital')
-    parser.add_argument('pdf_path', help='Caminho do PDF da CNH-e')
+    parser = argparse.ArgumentParser(description='Extrai dados de CNH (PDF digital ou foto da física)')
+    parser.add_argument('arquivo', help='Caminho do PDF da CNH-e ou da foto da CNH')
     parser.add_argument('--api-key', help='Anthropic API key (para Claude Vision)')
+    parser.add_argument('--no-ai', action='store_true',
+                        help='Só estratégias locais (MRZ + tesseract), sem chamar IA')
     parser.add_argument('--json', action='store_true', dest='json_output',
                         help='Output apenas JSON no stdout (logs vão para stderr)')
 
     args = parser.parse_args()
 
-    result = extract_cnh_data(args.pdf_path, args.api_key)
+    result = extract_cnh_data(args.arquivo, args.api_key, usar_ia=not args.no_ai)
 
     if args.json_output:
         print(json.dumps(result.to_dict(), ensure_ascii=False))

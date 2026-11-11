@@ -9,6 +9,7 @@ import { extractJson } from "./llm.js";
 import type { VinculoCalculo } from "./calc-trabalhista.js";
 import type { VinculoEmprego } from "./types.js";
 import { parseBrNumber } from "./qualification-utils.js";
+import { limparEmpresaPlaceholder } from "./sinais-lead.js";
 
 // Re-export for backward compat — callers should migrate to types.ts
 export type { VinculoEmprego };
@@ -104,6 +105,7 @@ export async function tryExtractVinculo(
     vinculos.map((v) => ({
       ordem: v.ordem, empresa: v.empresa ?? null, funcao: v.funcao ?? null,
       vinculo: v.vinculo ?? null, tempo: v.tempo ?? null, data_saida: v.data_saida ?? null,
+      periodo_sem_registro: v.periodo_sem_registro ?? null,
       saida: v.saida ?? null, horas_extras: v.horas_extras ?? null,
       pagamento_fora: v.pagamento_fora ?? null, injustica: v.injustica ?? null, frota: v.frota ?? null,
       salario_holerite: v.salario_holerite ?? null, salario_por_fora: v.salario_por_fora ?? null,
@@ -116,10 +118,12 @@ export async function tryExtractVinculo(
   const result = await extractJson<{
     sem_mais_empregos?: boolean;
     confirmou_mais_empregos?: boolean;
+    correcao_empresa?: { ordem: number; empresa: string } | null;
     vinculos_atualizados?: Array<{
       ordem: number; empresa?: string | null; funcao?: string | null; vinculo?: string | null;
       tempo?: string | null; data_saida?: string | null; saida?: string | null;
       horas_extras?: string | null; pagamento_fora?: string | null; injustica?: string | null; frota?: string | null;
+      periodo_sem_registro?: string | null;
       salario_holerite?: number | null; salario_por_fora?: number | null;
       jornada_inicio?: string | null; jornada_fim?: string | null; intervalo_minutos?: number | null;
       jornada_descricao?: string | null;
@@ -128,6 +132,7 @@ export async function tryExtractVinculo(
       empresa?: string | null; funcao?: string | null; vinculo?: string | null;
       tempo?: string | null; data_saida?: string | null; saida?: string | null;
       horas_extras?: string | null; pagamento_fora?: string | null; injustica?: string | null; frota?: string | null;
+      periodo_sem_registro?: string | null;
       salario_holerite?: number | null; salario_por_fora?: number | null;
       jornada_inicio?: string | null; jornada_fim?: string | null; intervalo_minutos?: number | null;
       jornada_descricao?: string | null;
@@ -149,6 +154,7 @@ TAREFA:
    - Se o cliente mencionar uma empresa que JÁ ESTÁ na lista de vínculos → marque true (está descrevendo trajetória já coletada).
    - NUNCA inferir de frases passivas como "por último", "meu último emprego", "saí de lá e" — essas frases NÃO confirmam ausência de empregos anteriores.
 4. Marque "confirmou_mais_empregos": true quando o cliente confirmou que teve outro emprego mas NÃO deu o nome ainda (ex: "sim", "sim trabalhei", "tive mais", "trabalhei sim", "tinha outro"). Só marque true se NÃO colocou o nome em novo_vinculo.
+5. CORREÇÃO DE NOME: se o cliente reescreveu ou corrigiu o nome de uma empresa JÁ listada — grafia parecida (erro de áudio/digitação: "Contonela" → "Fontanella trasportes"), ou disse "escrevi errado", "é a mesma", "só uma empresa" — preencha "correcao_empresa": { "ordem": <ordem do vínculo>, "empresa": "<nome corrigido>" } e NÃO crie novo_vinculo. Isso NÃO é outro emprego. Sem correção: "correcao_empresa": null.
 
 REGRA CRÍTICA — confirmação + nome de empresa na mesma mensagem:
 Se a mensagem contém confirmação de outro emprego (ex: "sim", "trabalhei sim", "tive", "antes trabalhei", "antes da [empresa] trabalhei") E o nome de uma empresa NÃO listada no array atual, preencha AMBOS:
@@ -196,6 +202,14 @@ CAMPOS A EXTRAIR (para cada vínculo):
   • "informal" → o cliente trabalhava como MOTORISTA DA EMPRESA de forma SUBORDINADA (tinha chefe/encarregado, cumpria escala/rota/ordens da empresa, dirigia caminhão DA EMPRESA ou exclusivo dela) MAS SEM carteira assinada — OU foi obrigado a abrir PJ/MEI para fazer o MESMO trabalho de empregado (pejotização). ISSO É RECONHECIMENTO DE VÍNCULO e QUALIFICA — é uma grande oportunidade. Sinais: "sem carteira", "sem registro", "não assinaram", "por fora", "no recibo", "me recontrataram sem carteira", "tive que abrir firma/MEI/PJ pra continuar", "era PJ mas trabalhava igual empregado". Na DÚVIDA entre informal e autônomo, para um motorista que rodava para UMA empresa, prefira "informal".
   • "autônomo" → AUTONOMIA REAL: dono do PRÓPRIO caminhão rodando para VÁRIOS embarcadores/clientes, sem subordinação a uma empresa; OU plataforma de app (ver gig economy abaixo). Só marque "autônomo" se ficar claro que ele era DONO do veículo e/ou rodava para vários clientes sem chefe. NÃO use "autônomo" só porque não tinha carteira.
   • "avulso" / "cooperado" → trabalhador avulso (sindicato/OGMO) ou cooperado de cooperativa.
+  ⚠️ PERÍODO MISTO (parte com carteira, parte sem) NA MESMA EMPRESA — muito comum e NUNCA é motivo
+  de descarte. Se o cliente disser que ficou um tempo sem registro e depois foi registrado (ou o
+  contrário), marque vinculo: "CLT" e descreva o trecho sem registro em periodo_sem_registro. É um
+  caso BOM: pede reconhecimento do período sem registro somado ao período anotado.
+  Ex: "trabalhei numa firma de carteira assinada durante três meses e os outros 5 meses sem carteira"
+  → vinculo: "CLT", tempo: "8 meses", periodo_sem_registro: "5 meses sem registro, 3 meses com carteira"
+  Ex: "trabalhei um mês e dez dias antes de assinarem minha carteira"
+  → vinculo: "CLT", periodo_sem_registro: "1 mês e 10 dias antes do registro"
   EXCEÇÃO OBRIGATÓRIA — GIG ECONOMY: Se a empresa for uma plataforma de aplicativo/gig economy (Uber, 99, Cabify, iFood, Rappi, Loggi, Lalamove, Shein Flex, Amazon Flex, Mottu, Shopper, Getninjas, TaskRabbit, ou qualquer outra plataforma onde o trabalhador usa o próprio veículo e recebe por corrida/entrega via app), marque OBRIGATORIAMENTE vinculo: "autônomo". Essas plataformas NUNCA geram vínculo CLT. Exceção: se o cliente disser literalmente "minha carteira foi assinada na Uber" ou equivalente muito explícito, honre o que disse.
 - tempo: tempo total de trabalho lá — ⚠️ CRÍTICO: NÃO confunda com tempo DESDE A SAÍDA. "saí há 4 meses", "já tem 4 meses que saí", "faz 4 meses que saí" NÃO é tempo de serviço — é referência temporal de saída (use em data_saida e DEIXE tempo NULL se a duração do emprego não foi dita). Ex: "saí dessa empresa em fevereiro, já tem 4 meses" → tempo: null, data_saida calculada.
 - data_saida: data de rescisão/demissão no formato MM/AAAA — CRÍTICO para prescrição. OBRIGATÓRIO calcular a partir de expressões relativas usando a DATA ATUAL acima. Exemplos: "há 60 dias" → subtraia 60 dias da data atual e formate MM/AAAA; "há 2 meses" → subtraia 2 meses; "saí há 3 meses" → subtraia 3 meses; "mês passado" → mês anterior ao atual; "ano passado" → MM/AAAA correspondente. Sempre calcule e preencha quando o cliente deu qualquer referência temporal de saída.
@@ -203,6 +217,9 @@ CAMPOS A EXTRAIR (para cada vínculo):
 - horas_extras: horas extras além da jornada normal. Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
 - pagamento_fora: pagamentos fora do holerite (PIX, Pamcard, dinheiro). Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
 - injustica: irregularidades sofridas. Só preencha se o cliente mencionou EXPLICITAMENTE. Se não mencionou: DEIXE NULL.
+- periodo_sem_registro: trecho do contrato trabalhado SEM carteira assinada, quando houve período
+  misto na mesma empresa (texto livre, ex.: "os 5 primeiros meses sem registro"). DEIXE NULL se
+  o cliente não mencionou período sem registro.
 - frota: tamanho da frota da empresa (se mencionado)
 - salario_holerite: número — valor NOMINAL registrado na carteira de trabalho/CTPS (o que aparecia formalmente no holerite como salário base), independentemente do que o cliente recebeu na prática. REGRA CRÍTICA: se o cliente diz "no holerite não recebia nada / era descontado da comissão" isso descreve o FUNCIONAMENTO do pagamento, não que o valor registrado era zero — capture o valor que ele informar como sendo o do holerite. Ex: "2000 na carteira" → 2000, "Era 2.970,00" (em resposta à pergunta sobre holerite) → 2970, "recebia 1.400 de registro" → 1400. DEIXE NULL apenas se o cliente não mencionou nenhum valor numérico para o salário registrado.
 - salario_por_fora: número — valor recebido fora do holerite (PIX, Pamcard, dinheiro, comissão por frete) em R$ por mês. Se percentual sem valor mensal (ex: "12% do frete"), registre null. Ex: "8000 por fora" → 8000. DEIXE NULL se não mencionado.
@@ -215,6 +232,7 @@ Responda APENAS JSON no formato:
 {
   "sem_mais_empregos": false,
   "confirmou_mais_empregos": false,
+  "correcao_empresa": null,
   "vinculos_atualizados": [
     { "ordem": 1, "empresa": "...", "funcao": null, ... }
   ],
@@ -255,9 +273,10 @@ Responda APENAS JSON no formato:
         const existing = updatedVinculos[idx];
         updatedVinculos[idx] = {
           ...existing,
-          empresa:           existing.empresa           ?? (upd.empresa           ?? undefined),
+          empresa:           existing.empresa           ?? limparEmpresaPlaceholder(upd.empresa),
           funcao:            existing.funcao            ?? (upd.funcao            ?? undefined),
           vinculo:           existing.vinculo           ?? (upd.vinculo           ?? undefined),
+          periodo_sem_registro: existing.periodo_sem_registro ?? (upd.periodo_sem_registro ?? undefined),
           tempo:             existing.tempo             ?? (upd.tempo             ?? undefined),
           data_saida:        existing.data_saida        ?? (upd.data_saida        ?? undefined),
           saida:             existing.saida             ?? (upd.saida             ?? undefined),
@@ -276,12 +295,29 @@ Responda APENAS JSON no formato:
     }
   }
 
-  if (result.novo_vinculo?.empresa) {
+  // Correção de grafia: o merge acima nunca sobrescreve empresa (primeiro valor vence), então
+  // um nome transcrito errado do áudio ficava para sempre e a versão digitada virava emprego novo.
+  const corr = result.correcao_empresa;
+  const empresaCorrigida = limparEmpresaPlaceholder(corr?.empresa);
+  if (corr && empresaCorrigida && !maisEmpregosConfirmado) {
+    const idx = updatedVinculos.findIndex((v) => v.ordem === corr.ordem);
+    if (idx >= 0 && updatedVinculos[idx].empresa !== empresaCorrigida) {
+      console.log(`[tryExtractVinculo] correção de empresa: "${updatedVinculos[idx].empresa}" → "${empresaCorrigida}"`);
+      updatedVinculos[idx] = { ...updatedVinculos[idx], empresa: empresaCorrigida };
+      if (result.novo_vinculo && limparEmpresaPlaceholder(result.novo_vinculo.empresa) === empresaCorrigida) {
+        result.novo_vinculo = null;
+      }
+    }
+  }
+
+  const empresaNova = limparEmpresaPlaceholder(result.novo_vinculo?.empresa);
+  if (result.novo_vinculo && empresaNova) {
     const novoVinculo: VinculoEmprego = {
       ordem: updatedVinculos.length + 1,
-      empresa:           result.novo_vinculo.empresa           ?? undefined,
+      empresa:           empresaNova,
       funcao:            result.novo_vinculo.funcao            ?? undefined,
       vinculo:           result.novo_vinculo.vinculo           ?? undefined,
+      periodo_sem_registro: result.novo_vinculo.periodo_sem_registro ?? undefined,
       tempo:             result.novo_vinculo.tempo             ?? undefined,
       data_saida:        result.novo_vinculo.data_saida        ?? undefined,
       saida:             result.novo_vinculo.saida             ?? undefined,
@@ -306,7 +342,7 @@ Responda APENAS JSON no formato:
 
   // LLM não marcou sem_mais_empregos, mas o lead deu negação curta inequívoca e não adicionou
   // vínculo novo → trata como negação (cobre leitura errada do modelo flaky). Caso Uber A3.
-  if (negacaoCurtaMaisEmpregos && !result.novo_vinculo?.empresa) {
+  if (negacaoCurtaMaisEmpregos && !empresaNova) {
     console.warn(`[tryExtractVinculo] override: negação curta com LLM sem_mais_empregos=false → true`);
     return { vinculo: null, semMaisEmpregos: true, updatedVinculos, confirmouMaisEmpregos: false };
   }

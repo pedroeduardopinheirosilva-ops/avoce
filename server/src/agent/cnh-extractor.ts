@@ -36,28 +36,44 @@ export interface CNHExtractorResult {
   data_validade?: string;
 }
 
+function extensaoPara(mimetype?: string): string {
+  const map: Record<string, string> = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/webp": "webp", "image/bmp": "bmp", "image/tiff": "tiff",
+  };
+  return map[(mimetype ?? "").toLowerCase()] ?? "bin";
+}
+
 /**
- * Extract structured data from a CNH-e digital PDF using the Python extractor.
- * Throws if the PDF is not a CNH-e (insufficient embedded images).
+ * Extrai dados de CNH pelo extrator Python. Aceita o PDF da CNH-e digital e
+ * também a foto da CNH física.
+ *
+ * `usarIa: false` (padrão) roda só o que é determinístico — MRZ + tesseract +
+ * regex, com validação de dígito do CPF. Sem chamada a nenhuma API paga.
  */
 export async function extractCNHData(
-  pdfBuffer: Buffer,
-  claudeApiKey?: string
+  buffer: Buffer,
+  claudeApiKey?: string,
+  opts: { mimetype?: string; usarIa?: boolean } = {}
 ): Promise<CNHExtractorResult> {
   const tmpDir = await mkdtemp(join(tmpdir(), "cnh-"));
-  const pdfPath = join(tmpDir, "cnh.pdf");
-  await writeFile(pdfPath, pdfBuffer);
+  const arquivo = join(tmpDir, `cnh.${extensaoPara(opts.mimetype)}`);
+  await writeFile(arquivo, buffer);
 
   try {
     const scriptPath = join(__dirname_local, "cnh_extractor.py");
-    const args = [scriptPath, "--json", pdfPath];
-    if (claudeApiKey) {
+    const args = [scriptPath, "--json", arquivo];
+    if (!opts.usarIa) args.push("--no-ai");
+    if (claudeApiKey && opts.usarIa) {
       args.push("--api-key", claudeApiKey);
     }
 
     const { stdout, stderr } = await execFileAsync("python3", args, {
       timeout: 90_000,
-      env: { ...process.env },
+      // OMP_THREAD_LIMIT=1: o tesseract usa OpenMP e, sem limite, um único
+      // documento abre uma thread por core e satura a CPU do servidor.
+      env: { ...process.env, OMP_THREAD_LIMIT: "1" },
     });
 
     // Log Python stderr (debug info) through Node's console

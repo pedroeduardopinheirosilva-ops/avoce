@@ -12,16 +12,23 @@ import { buildHandoffSnapshot } from "./handoff-snapshot.js";
 import { validarCPF } from "./qualification-utils.js";
 import { extractQualificacaoData, extractVinculosFromMerged } from "./qualification.js";
 import { buildInstrucaoBase, invalidateFlowCache } from "./persona-router.js";
+import { atualizarFotoPerfilEmSegundoPlano, fotoPerfilEstaFresca } from "../services/foto-perfil.js";
+import { registrarOrigemDeal } from "./lead-origem.js";
+import { variantesTelefone } from "./projeto-resolver.js";
 import {
   sendHumanized, sendHumanizedSafe, sendHumanizedOrAudio, normalizarTexto, limparResposta,
   getEvolutionConfig, respondFromDealState, sendAudioIfConfigured, dispararNotificacoes,
   checkAndNotifySolicitaLigacao, type EvolutionConfig,
 } from "./message-handler.js";
 import { transitionDeal, checkTransitions, enviarMensagemProativa, getPersonaNomeExibicao, applyAutoTags, setEngagementTag } from "./transition-engine.js";
+import { sanitizeNomeLead, isNomePlaceholder } from "./nome-lead.js";
+import { jaPerguntouEFoiRespondida, ehReenvioDoLead, respostaJaFazPergunta } from "./pergunta-repetida.js";
+import { decidirAcaoEmAndamento, isDispensaPorAdvogado, detectaPedidoContato, trechoAdvogadoContraparte, numeroProcessoCnj } from "./sinais-lead.js";
+import { classificarConfirmacao, marcarConfirmacao } from "./confirmacao-reuniao.js";
 import { criarPropostaAutomatica, resendPropostaLinks, PEDIDO_LINK_REGEX } from "./proposal-engine.js";
 import { scheduleLlmRetry } from "./retry-queue.js";
 import {
-  splitState, atualizarMergedFlags, createInitialDeal,
+  splitState, atualizarMergedFlags, createInitialDeal, adotarDealSemProjeto, dealGanhoDoContato,
   persistMergedUpdates, moveToDescarte, saveParecerValue,
 } from "./deal-repository.js";
 import { type EvolutionWebhookMessage, extractText } from "./webhook-parser.js";
@@ -68,12 +75,49 @@ const HINTS_ASSISTENTE = [
 
 async function findOrCreateDeal(projetoId: string, msg: EvolutionWebhookMessage) {
   const phone = msg.key.remoteJid.replace(/@.*/, "");
-  let contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
-  let deal    = contato
-    ? await prisma.crmDeal.findFirst({ where: { contatoId: contato.id, projetoId, status: "aberto" }, orderBy: { criadoEm: "desc" } })
+  // O telefone pode estar em mais de um contato (contador e empresa cliente
+  // dividem o celular) e gravado com ou sem o 9º dígito. Primeiro procura, entre
+  // todos eles, o que já tem deal aberto NESTE projeto; só depois cai no primeiro.
+  const contatosDoFone = await prisma.crmContato.findMany({
+    where: { whatsapp: { in: variantesTelefone(phone) } },
+    orderBy: { criadoEm: "asc" },
+  });
+  let deal = contatosDoFone.length
+    ? await prisma.crmDeal.findFirst({
+        where: { contatoId: { in: contatosDoFone.map((c) => c.id) }, projetoId, status: "aberto" },
+        orderBy: [{ ultimoContatoEm: { sort: "desc", nulls: "last" } }, { criadoEm: "desc" }],
+      })
     : null;
-  if (!contato) contato = await prisma.crmContato.create({ data: { nome: msg.pushName ?? `Lead ${phone}`, whatsapp: phone } });
-  const isNewDeal = !deal;
+  let contato = (deal && contatosDoFone.find((c) => c.id === deal!.contatoId))
+    ?? contatosDoFone.find((c) => c.whatsapp === phone)
+    ?? contatosDoFone[0]
+    ?? null;
+  if (!contato) {
+    const nomeInicial = sanitizeNomeLead(msg.pushName) ?? `Lead ${phone}`;
+    contato = await prisma.crmContato.create({ data: { nome: nomeInicial, whatsapp: phone } });
+  }
+  // Sem card deste projeto: antes de criar, adota o card aberto sem projeto do mesmo
+  // lead (importado/cadastrado à mão). Sem mensagem nenhuma ainda, conta como novo
+  // para a saudação; com histórico, a conversa só continua.
+  let isNewDeal = !deal;
+  if (!deal) {
+    const ganho = await dealGanhoDoContato(projetoId, contatosDoFone.map((c) => c.id));
+    if (ganho) {
+      deal = ganho;
+      contato = contatosDoFone.find((c) => c.id === ganho.contatoId) ?? contato;
+      isNewDeal = false;
+      console.log(`[StageEngine] dealId=${ganho.id} — cliente ganho voltou a falar (${phone}); mensagem no card ganho, sem IA`);
+    }
+  }
+  if (!deal) {
+    const adotado = await adotarDealSemProjeto(projetoId, contatosDoFone.map((c) => c.id));
+    if (adotado) {
+      deal = adotado;
+      contato = contatosDoFone.find((c) => c.id === adotado.contatoId) ?? contato;
+      isNewDeal = (await prisma.crmMensagemWhatsapp.count({ where: { dealId: adotado.id } })) === 0;
+      console.log(`[StageEngine] dealId=${adotado.id} — card sem projeto adotado para ${phone}`);
+    }
+  }
   if (!deal) deal = await createInitialDeal(projetoId, contato.id, contato.nome);
   return { contato, deal, isNewDeal };
 }
@@ -86,6 +130,10 @@ async function saveIncomingMessage(
     await prisma.crmMensagemWhatsapp.create({
       data: { dealId: deal.id, contatoId: contato.id, direcao: "in", remetente: msg.key.remoteJid.replace(/@.*/, ""), tipo, conteudo: text ?? "", evolutionMessageId: msg.key.id },
     });
+    // Toda mensagem recebida é contato — inclusive quando a IA está pausada e quem responde é
+    // um atendente pelo celular. Sem isso o deal fica com ultimoContatoEm congelado, afunda na
+    // ordenação da caixa de conversas e a mensagem some do painel mesmo estando gravada.
+    await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
     return "ok";
   } catch (err: any) {
     if (err?.code !== "P2002") throw err;
@@ -102,6 +150,46 @@ async function saveIncomingMessage(
     }
     return "early_path";
   }
+}
+
+/** Só nos projetos com `detectar_advogado_contraparte`=true: em funil de empresa (subvenção,
+ *  contadores) o advogado da empresa pode ser justamente o lead. Cache de 5 min. */
+const _contraparteCache = new Map<string, { v: boolean; em: number }>();
+async function detectaContraparteLigado(projetoId: string): Promise<boolean> {
+  const c = _contraparteCache.get(projetoId);
+  if (c && Date.now() - c.em < 300_000) return c.v;
+  const cfg = await prisma.iaProjetoConfig.findFirst({ where: { projetoId, chave: "detectar_advogado_contraparte" } });
+  const v = cfg?.valor === "true";
+  _contraparteCache.set(projetoId, { v, em: Date.now() });
+  return v;
+}
+
+/**
+ * Advogado da parte contrária: pausa a IA, marca o card (etiqueta + flag + nota) e avisa a
+ * equipe (evento `advogado_contraparte`). Nenhuma mensagem automática vai para ele.
+ */
+async function tratarAdvogadoContraparte(projetoId: string, deal: any, contato: any, phone: string, texto: string, trecho: string) {
+  const flags = { ...((deal.iaFlags as Record<string, unknown>) ?? {}), _contraparte: true };
+  const processo = numeroProcessoCnj(texto);
+  const empresaId = deal.empresaId ?? null;
+  const NOME_TAG = "Advogado (acordo)";
+  const tag = await prisma.crmTag.findFirst({ where: { nome: NOME_TAG, empresaId } })
+    ?? await prisma.crmTag.create({ data: { nome: NOME_TAG, empresaId, cor: "#b45309" } });
+  await prisma.crmDeal.update({
+    where: { id: deal.id },
+    data: { iaAtiva: false, iaPausadaEm: new Date(), iaFlags: flags as any, tags: { connect: { id: tag.id } } },
+  });
+  await prisma.crmNota.create({
+    data: {
+      dealId: deal.id,
+      conteudo: `[IA] Advogado(a) da outra parte — não é lead. IA pausada, sem resposta automática.\nTrecho: "${trecho}"${processo ? `\nProcesso: ${processo}` : ""}`,
+    },
+  });
+  console.log(`[StageEngine] dealId=${deal.id} — advogado da parte contrária (${phone}): "${trecho.slice(0, 80)}"`);
+  dispararNotificacoes(projetoId, "advogado_contraparte", {
+    dealId: deal.id, nome: contato?.nome ?? "", telefone: phone,
+    mensagem: texto.slice(0, 500), processo: processo ?? "não informado",
+  }).catch((err) => console.warn(`[StageEngine] aviso advogado_contraparte falhou: ${err?.message ?? err}`));
 }
 
 async function handleNewDealGreeting(projetoId: string, deal: any, contato: any, phone: string) {
@@ -163,9 +251,9 @@ async function extractAndApplyQual(
   projetoId: string, deal: any, contato: any,
   merged: Record<string, unknown>, history: any[], perguntas: any[],
   personaChave: string, text: string | null, personaLlmChave: string | null = null,
-): Promise<{ merged: Record<string, unknown>; contato: any }> {
+): Promise<{ merged: Record<string, unknown>; contato: any; dadosNovos: number; ack: boolean }> {
   const charsUteis = (text ?? "").replace(/\s/g, "").length;
-  if (charsUteis < 2 || ACKS_REGEX.test((text ?? "").trim())) return { merged, contato };
+  if (charsUteis < 2 || ACKS_REGEX.test((text ?? "").trim())) return { merged, contato, dadosNovos: 0, ack: true };
 
   // Regex pre-check for e_carreteiro: detect taxi/autonomous drivers before LLM extraction.
   // The LLM returns null for ambiguous cases (taxi *can* be CLT), so this hardcoded check
@@ -200,10 +288,10 @@ async function extractAndApplyQual(
   if (personaChave === "assistente") {
     for (const h of HINTS_ASSISTENTE) { if (merged[h.chave] == null && !pendentes.find((p: any) => p.chave === h.chave)) pendentes.push(h as any); }
   }
-  if (!pendentes.length) return { merged, contato };
+  if (!pendentes.length) return { merged, contato, dadosNovos: 0, ack: false };
   const texto     = history.slice(-16).map(m => `${m.direcao === "out" ? "Bot" : "Cliente"}: ${m.conteudo ?? ""}`).filter(l => l.length > 6).join("\n");
   const extracted = await extractQualificacaoData(projetoId, texto || `Cliente: ${text ?? ""}`, pendentes, merged, personaLlmChave).catch(() => null);
-  if (!extracted) return { merged, contato };
+  if (!extracted) return { merged, contato, dadosNovos: 0, ack: false };
   const novos: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(extracted)) {
     if (v != null && (merged[k] === undefined || merged[k] === null)) { merged[k] = v; novos[k] = v; }
@@ -215,19 +303,27 @@ async function extractAndApplyQual(
       if (k.startsWith("emprego_anterior_")) { delete merged[k]; delete novos[k]; }
     }
   }
-  if (!Object.keys(novos).length) return { merged, contato };
+  if (!Object.keys(novos).length) return { merged, contato, dadosNovos: 0, ack: false };
   await prisma.crmDeal.update({ where: { id: deal.id }, data: splitState(merged) });
   prisma.crmNota.create({ data: { dealId: deal.id, conteudo: `[IA] Qualificação:\n${Object.entries(novos).map(([k, v]) => `${k}: ${v}`).join("\n")}` } }).catch(() => {});
   if (novos.nome && typeof novos.nome === "string") {
-    const nome = novos.nome.trim();
-    await prisma.crmContato.update({ where: { id: contato.id }, data: { nome } });
-    await prisma.crmDeal.update({ where: { id: deal.id }, data: { titulo: nome } });
-    contato = { ...contato, nome };
+    // Nunca gravar o nome cru da extração: ASR quebrado já transformou
+    // "What the me oftension da Cunha de Maceió" em um contato chamado "What".
+    const nome = sanitizeNomeLead(novos.nome);
+    if (nome) {
+      await prisma.crmContato.update({ where: { id: contato.id }, data: { nome } });
+      await prisma.crmDeal.update({ where: { id: deal.id }, data: { titulo: nome } });
+      contato = { ...contato, nome };
+    } else {
+      console.log(`[Nome] dealId=${deal.id} — descartado ${JSON.stringify(novos.nome)} (não parece nome)`);
+      delete merged.nome;                                  // deixa o campo pendente → repergunta
+      await prisma.$executeRaw`UPDATE "CrmDeal" SET qualificacao = qualificacao - 'nome' WHERE id = ${deal.id}`;
+    }
   }
   for (const [src, dst] of [["empresa_recente", "empresa_principal"], ["frota_recente", "frota"]] as [string, string][]) {
     if (merged[src] && !merged[dst]) { merged[dst] = merged[src]; await prisma.crmDeal.update({ where: { id: deal.id }, data: splitState(merged) }); }
   }
-  return { merged, contato };
+  return { merged, contato, dadosNovos: Object.keys(novos).length, ack: false };
 }
 
 async function callLlmWithRetry(
@@ -235,6 +331,10 @@ async function callLlmWithRetry(
   messages: { role: "user" | "assistant"; content: string }[],
   personaChave: string, llmChave: string | null, stageChave: string,
   allowLong = false,
+  // modo_sdr "generico": o lead pede explicação (serviço, currículo, programa) e a
+  // resposta precisa caber. O corte de 3 frases/420 chars é do carreteiro e, com a
+  // ordem "mantenha apenas a pergunta principal", transformava a explicação em pergunta.
+  generico = false,
 ): Promise<string> {
   const msgs = [...messages];
   let last   = "";
@@ -248,11 +348,13 @@ async function callLlmWithRetry(
       continue;
     }
     const sentencas  = r.split(/[.!?](?:\s|$)/).filter(s => s.trim().length > 0).length;
-    const muitoLonga = r.length > 420 || sentencas > 3;
+    const muitoLonga = generico ? (r.length > 900 || sentencas > 7) : (r.length > 420 || sentencas > 3);
     if (isHumanized(r) && !muitoLonga) return r;
     msgs.push({ role: "assistant", content: r });
     msgs.push({ role: "user", content: muitoLonga
-      ? "Mensagem longa demais. Reescreva em no máximo 2 frases curtas e simples. Mantenha apenas a pergunta principal."
+      ? (generico
+          ? "Mensagem longa demais. Reescreva em até 5 linhas, mantendo a resposta ao que o lead perguntou ou pediu."
+          : "Mensagem longa demais. Reescreva em no máximo 2 frases curtas e simples. Mantenha apenas a pergunta principal.")
       : "Reescreva sem padrões robóticos." });
   }
   return last;
@@ -344,6 +446,19 @@ async function dedupAndSend(
   return true;
 }
 
+// proximaPersonaChave só vale se a persona de destino existir e estiver ativa em Config IA.
+// Sem isso o deal era entregue a uma persona desligada (ex.: Daniela) e a conversa morria
+// no meio, ou o cron respondia no nome dela.
+async function proximaPersonaAtiva(projetoId: string, chave: string | null | undefined): Promise<boolean> {
+  if (!chave) return false;
+  const p = await prisma.iaPersona.findUnique({ where: { projetoId_chave: { projetoId, chave } }, select: { ativo: true } });
+  if (!p?.ativo) {
+    console.log(`[StageEngine] proximaPersonaChave="${chave}" desativada/inexistente — sem handoff`);
+    return false;
+  }
+  return true;
+}
+
 // Deduplicates send_proativa actions by dealId before scheduling to prevent
 // double-sending when both transitionDeal and checkTransitions return actions.
 function scheduleProativasDeduped(
@@ -415,6 +530,16 @@ export async function processIncomingMessage(
   const { contato: c0, deal: d0, isNewDeal } = await findOrCreateDeal(projetoId, msg);
   let contato = c0, deal = d0;
 
+  // Origem (anúncio/plataforma) — só existe na 1ª mensagem; grava uma vez por deal.
+  if (!(deal as any).origemEm || (deal as any).origemAnuncioId === "perfil") await registrarOrigemDeal(deal, msg);
+
+  // Foto de perfil do WhatsApp — em segundo plano, nunca atrasa a resposta ao lead.
+  if (!fotoPerfilEstaFresca(contato.fotoPerfilEm)) {
+    getEvolutionConfig(projetoId)
+      .then((evo) => atualizarFotoPerfilEmSegundoPlano(contato, evo))
+      .catch(() => {});
+  }
+
   // B2b: per-deal lock — prevents two parallel processings when Evolution sends
   // duplicate webhooks for the same audio (different IDs, same content — LID mode).
   // Mensagens distintas que chegam durante o processamento NÃO podem ser descartadas
@@ -458,14 +583,79 @@ export async function processIncomingMessage(
     });
   }
 
+  // B3c: arquivar documento/foto recebido — ANTES de qualquer guard.
+  // Ficava lá embaixo, depois de `if (!deal.iaAtiva) return`, do `isNewDeal` e do guard de
+  // fase que exige ação humana: com a IA pausada (atendimento humano) ou no primeiro contato,
+  // a foto do cliente era baixada, passava pelo OCR e ia pro lixo. Só 20 de 171 mídias de 30
+  // dias viraram DealAnexo. O anexo guarda ocrTexto + dadosExtraidos, então o coleta_docs
+  // recupera os campos depois via loadColetaDocsContext, mesmo do que chegou fora do fluxo.
+  if (documentosEnviados) {
+    if (mediaBuffer && mediaBuffer.length > 0) {
+      import("./deal-anexos.js").then(({ salvarAnexoDeal }) => {
+        const ocrFull = typeof text === "string" && text.startsWith("[Documento recebido") ? text : null;
+        salvarAnexoDeal(deal.id, mediaBuffer!, mediaMimetype ?? "application/octet-stream", mediaOriginalName, ocrFull, docJsonDireto)
+          .catch((err: unknown) => console.warn(`[DealAnexo] Erro ao salvar dealId=${deal.id}: ${(err as any)?.message}`));
+      }).catch((err: unknown) => console.warn(`[DealAnexo] Import falhou: ${(err as any)?.message}`));
+    } else {
+      console.warn(`[DealAnexo] Skipped dealId=${deal.id} — mediaBuffer ausente (download falhou ou Evolution API sem mídia)`);
+    }
+  }
+
+  // B3c2: advogado da outra parte (empresa/reclamada) se apresentando para tratar de acordo.
+  // Não é lead: a IA não saúda nem qualifica — o card fica com a IA pausada, etiqueta e aviso
+  // no grupo da equipe. Vale em qualquer mensagem enquanto a IA está ligada (às vezes o
+  // "boa tarde" vem antes e a apresentação na 2ª mensagem).
+  if (deal.status === "aberto" && deal.iaAtiva && !((deal as any).iaFlags as any)?._contraparte
+      && await detectaContraparteLigado(projetoId)) {
+    const trechoAdv = trechoAdvogadoContraparte(text);
+    if (trechoAdv) {
+      await tratarAdvogadoContraparte(projetoId, deal, contato, phone, text ?? "", trechoAdv);
+      return;
+    }
+  }
+
+  // B3d: reenvio do lead — o mesmo texto de novo, segundos depois, quando a IA já respondeu o
+  // primeiro. Fica salvo no histórico, mas não gera resposta: senão a IA refaz a pergunta que
+  // acabou de mandar (caso Cigano 04/11: "Mas de 200" ×2 → "Anotado, mais de 200. E antes da Buzin...").
+  if (!isNewDeal && !documentosEnviados && (text ?? "").trim().length > 0) {
+    const recentes = await prisma.crmMensagemWhatsapp.findMany({
+      where: { dealId: deal.id },
+      orderBy: { enviadaEm: "desc" },
+      take: 8,
+      select: { direcao: true, conteudo: true, transcricao: true, enviadaEm: true, evolutionMessageId: true },
+    });
+    if (ehReenvioDoLead(recentes, msg.key.id)) {
+      console.log(`[StageEngine] dealId=${deal.id} — lead reenviou a mesma mensagem ("${(text ?? "").slice(0, 40)}"); sem nova resposta`);
+      return;
+    }
+  }
+
   // B4: new deal → greet and stop
   if (isNewDeal) { await handleNewDealGreeting(projetoId, deal, contato, phone); return; }
 
   // B5: guards
+  // Na coleta de documentos, "assumir a conversa" é ajuda pontual, não handoff:
+  // o atendente entra para explicar como tirar o comprovante, o cliente manda o
+  // documento — e antes disto o fluxo ficava morto até alguém lembrar de clicar
+  // em reativar. A chegada do documento é sinal inequívoco de que o cliente fez
+  // o que foi pedido, então a máquina retoma sozinha. Mensagem de texto NÃO
+  // retoma: enquanto o atendente conversa, o bot continua calado.
+  if (!deal.iaAtiva && deal.status === "aberto" && deal.iaPersonaChave === "coleta_docs" && documentosEnviados) {
+    await prisma.crmDeal.update({
+      where: { id: deal.id },
+      data: { iaAtiva: true, iaPausadaEm: null, iaPausadaPor: null },
+    });
+    deal = { ...deal, iaAtiva: true } as typeof deal;
+    console.log(`[ColetaDocs] dealId=${deal.id} — documento recebido durante intervenção manual; coleta retomada`);
+  }
   if (!deal.iaAtiva) return;
-  if (msg.pushName && contato.nome.startsWith("Lead ")) {
-    await prisma.crmContato.update({ where: { id: contato.id }, data: { nome: msg.pushName } });
-    contato = { ...contato, nome: msg.pushName };
+  // pushName do WhatsApp também é palpite: vem como "Marcell | 7227", "~Junior 😎", "Cliente".
+  if (msg.pushName && isNomePlaceholder(contato.nome)) {
+    const nomePush = sanitizeNomeLead(msg.pushName);
+    if (nomePush) {
+      await prisma.crmContato.update({ where: { id: contato.id }, data: { nome: nomePush } });
+      contato = { ...contato, nome: nomePush };
+    }
   }
 
   // B6: load stage, persona, history, questions
@@ -481,9 +671,24 @@ export async function processIncomingMessage(
   let personaChave = deal.iaPersonaChave || fase.personaChave || "assistente";
   let persona      = await prisma.iaPersona.findUnique({ where: { projetoId_chave: { projetoId, chave: personaChave } } });
   if (!persona) return;
+  // Persona desligada em Config IA → Personas: ela não fala mais sozinha. O deal
+  // continua vivo e a conversa fica com a equipe. É o desligamento por persona,
+  // e não do projeto inteiro, que ficaria grosso demais.
+  if (!persona.ativo) {
+    console.log(`[StageEngine] dealId=${deal.id} — persona "${personaChave}" desativada; IA não responde`);
+    return;
+  }
   const historyRaw   = await prisma.crmMensagemWhatsapp.findMany({ where: { dealId: deal.id }, orderBy: { enviadaEm: "desc" }, take: 20 });
   const history      = historyRaw.reverse();
-  const perguntas    = await prisma.iaPerguntaQualificacao.findMany({ where: { projetoId, stageColeta: stageChave, ativo: true }, orderBy: { ordem: "asc" } });
+  // modo_sdr "generico": a etapa não anda pelo fluxo (fica em lead_novo / em_contato), então
+  // filtrar as perguntas pela etapa deixava a extração vazia — e-mail e horário nunca gravavam.
+  // Nesses funis toda pergunta do projeto vale em qualquer etapa.
+  const modoSdrExtracao = await prisma.iaProjetoConfig.findFirst({ where: { projetoId, chave: "modo_sdr" }, select: { valor: true } });
+  const extracaoGenerica = modoSdrExtracao?.valor === "generico";
+  const perguntas    = await prisma.iaPerguntaQualificacao.findMany({
+    where: { projetoId, ativo: true, ...(extracaoGenerica ? {} : { stageColeta: stageChave }) },
+    orderBy: { ordem: "asc" },
+  });
   // GARANTIA DE IDEMPOTÊNCIA: `merged` é sempre construído a partir do banco
   // (deal.qualificacao + deal.iaFlags persistidos). Isso garante que
   // getNextDeterministicQuestion nunca repergunta um campo já persistido,
@@ -586,7 +791,88 @@ export async function processIncomingMessage(
   const mergedComFlow = { ...merged, ...((deal as any).iaFlowStepData as Record<string, unknown> ?? {}) };
 
   // B9a: extract + apply qualification fields
-  ({ merged, contato } = await extractAndApplyQual(projetoId, deal, contato, merged, history, perguntas, personaChave, text, (persona as any).llmProviderChave ?? null));
+  const qualResult = await extractAndApplyQual(projetoId, deal, contato, merged, history, perguntas, personaChave, text, (persona as any).llmProviderChave ?? null);
+  ({ merged, contato } = qualResult);
+  // Turno em que o lead falou algo substantivo mas NADA foi extraído: ele não respondeu a
+  // pergunta (mudou de assunto, pediu outra coisa, ou o áudio veio embolado). Não gastar a
+  // tentativa do passo nem despejar o próximo template — deixar o LLM tratar o que ele disse.
+  // Caso Tarcísio 553183987227: pediu 4× "responde por áudio" e o fluxo avançou 3 fases
+  // como se ele tivesse confirmado ser motorista e citado uma empresa.
+  const turnoSemResposta = !qualResult.ack && qualResult.dadosNovos === 0 && (text ?? "").trim().length >= 8;
+
+  // B9a-bis: sinais determinísticos — a extração LLM só preenche campos AINDA NULOS,
+  // então "não" na primeira pergunta congelava acao_em_andamento=false e o lead podia
+  // dizer depois "eu já tenho ação contra eles" sem que nada mudasse (Ledison 26/08 12:09).
+  // A dispensa por ética só vale para quem respondeu à pergunta direta. Menção solta, ou extração
+  // LLM sem pergunta, vira suspeita: limpa o campo para o fluxo perguntar (José Olívio 09/11).
+  {
+    let idxSaida = history.length - 1;
+    while (idxSaida >= 0 && history[idxSaida].direcao === "in") idxSaida--;
+    const saidasIa: string[] = [];
+    for (; idxSaida >= 0 && history[idxSaida].direcao === "out" && saidasIa.length < 3; idxSaida--) {
+      saidasIa.push(history[idxSaida].conteudo ?? "");
+    }
+    const decisaoAcao = decidirAcaoEmAndamento({
+      valorAtual: merged.acao_em_andamento,
+      confirmada: merged._acao_confirmada === true,
+      texto: text,
+      saidasIa,
+    });
+    const relato = (text ?? "").trim().slice(0, 300);
+    if (decisaoAcao === "confirmar") {
+      merged.acao_em_andamento = true;
+      merged._acao_confirmada = true;
+      merged.acao_em_andamento_relato = relato;
+      await persistMergedUpdates(deal.id, merged, { acao_em_andamento: true, _acao_confirmada: true, acao_em_andamento_relato: relato });
+      prisma.crmNota.create({ data: { dealId: deal.id, conteudo: `[IA] ⚠️ Lead confirmou ação/advogado já existente: "${relato}"` } }).catch(() => {});
+      console.warn(`[StageEngine] dealId=${deal.id} — acao_em_andamento confirmada na resposta à pergunta direta`);
+    } else if (decisaoAcao === "suspeita" || decisaoAcao === "negou") {
+      const negou = decisaoAcao === "negou";
+      const primeiraSuspeita = !merged._acao_suspeita_em;
+      // Depois de perguntar uma vez, um "não" gravado continua valendo: não pergunta em loop.
+      if (negou || merged.acao_em_andamento === true || primeiraSuspeita) {
+        const updates: Record<string, unknown> = {
+          acao_em_andamento: negou ? false : null,
+          _acao_confirmada: false,
+          _acao_suspeita_em: merged._acao_suspeita_em ?? new Date().toISOString(),
+          _acao_suspeita_relato: relato,
+        };
+        if (Array.isArray(merged._q_skipped)) {
+          updates._q_skipped = (merged._q_skipped as string[]).filter(c => !c.startsWith("acao_andamento"));
+        }
+        Object.assign(merged, updates);
+        await persistMergedUpdates(deal.id, merged, updates);
+        if (negou || primeiraSuspeita) {
+          prisma.crmNota.create({ data: {
+            dealId: deal.id,
+            conteudo: negou
+              ? `[IA] Lead negou ter advogado/ação: "${relato}"`
+              : `[IA] Menção a advogado/ação, sem confirmar. A IA vai perguntar: "${relato}"`,
+          } }).catch(() => {});
+        }
+      }
+      // Dispensado por engano: volta para a esteira em vez de ficar parado em desqualificado.
+      if (stageChave === "lead_desqualificado"
+        && history.some(m => m.direcao === "out" && isDispensaPorAdvogado(m.conteudo))) {
+        const crmStageVolta = await prisma.crmStage.findFirst({ where: { chave: "lead_carreteiro" } });
+        await prisma.crmDeal.update({
+          where: { id: deal.id },
+          data: { iaStageChave: "lead_carreteiro", ...(crmStageVolta ? { stageId: crmStageVolta.id } : {}) },
+        });
+        console.log(`[StageEngine] dealId=${deal.id} — dispensa por advogado revertida`);
+      }
+    }
+  }
+
+  // Lead com reunião marcada: registrar se ele confirmou presença ou pediu para remarcar.
+  // 34,7% dos agendados não atendiam a ligação e ninguém sabia antes da hora.
+  if (stageChave === "aguardando_reuniao" && text) {
+    const sinal = classificarConfirmacao(text);
+    if (sinal !== "nenhum") {
+      marcarConfirmacao(deal.id, sinal).catch(() => {});
+      console.log(`[Confirmação] dealId=${deal.id} lead ${sinal} a presença na reunião`);
+    }
+  }
   applyAutoTags(projetoId, deal.id, merged).catch(() => {});
   // Lead respondeu → marca engajamento "Respondendo" (remove "Não Respondendo")
   setEngagementTag(deal.id, true).catch(() => {});
@@ -611,29 +897,21 @@ export async function processIncomingMessage(
     }
   }
 
-  // B9b2: persist media to deal document folder (fire-and-forget)
-  if (documentosEnviados) {
-    if (mediaBuffer && mediaBuffer.length > 0) {
-      import("./deal-anexos.js").then(({ salvarAnexoDeal }) => {
-        const ocrFull = typeof text === "string" && text.startsWith("[Documento recebido") ? text : null;
-        salvarAnexoDeal(deal.id, mediaBuffer!, mediaMimetype ?? "application/octet-stream", mediaOriginalName, ocrFull, docJsonDireto)
-          .catch((err: unknown) => console.warn(`[DealAnexo] Erro ao salvar dealId=${deal.id}: ${(err as any)?.message}`));
-      }).catch((err: unknown) => console.warn(`[DealAnexo] Import falhou: ${(err as any)?.message}`));
-    } else {
-      console.warn(`[DealAnexo] Skipped dealId=${deal.id} — mediaBuffer ausente (download falhou ou Evolution API sem mídia)`);
-    }
-  }
-
   // B9c: vinculos loop — skipped in SDR simplificado (modo_sdr: "simples") e triagem (modo_sdr: "triagem")
   const modoSdrCfg  = await prisma.iaProjetoConfig.findFirst({ where: { projetoId, chave: "modo_sdr" } });
   const isSdrSimples  = modoSdrCfg?.valor === "simples"  && personaChave === "assistente";
   const isSdrTriagem  = modoSdrCfg?.valor === "triagem"  && personaChave === "assistente";
+  // SDR genérico (modo_sdr: "generico"): funis que não são de carreteiro — contadores,
+  // subvenção, defesa de ICMS. Sem vínculos de emprego, sem o agente de fases do
+  // carreteiro e sem as orientações fixas da assistente da RAP (system-prompt-builder):
+  // quem conduz a conversa é o systemPrompt da persona. Extração e gates seguem valendo.
+  const isSdrGenerico = modoSdrCfg?.valor === "generico" && personaChave === "assistente";
 
   let vinculos: import("./types.js").VinculoEmprego[] = [];
   let vinculosOk             = false;
   let vinculosTodosPrescritos = false;
 
-  if (!isSdrSimples && !isSdrTriagem) {
+  if (!isSdrSimples && !isSdrTriagem && !isSdrGenerico) {
     const ultimaMsgBot       = history.filter(m => m.direcao === "out").slice(-1)[0]?.conteudo ?? "";
     const maisEmpregosPerguntado =
       merged._mais_empregos_perguntado === true ||
@@ -652,11 +930,16 @@ export async function processIncomingMessage(
   }
 
 
-  // B9c: acao_em_andamento — notificar equipe se lead já tem ação trabalhista (BUG-032)
-  if (personaChave === "assistente" && merged.acao_em_andamento === true) {
+  // B9c: acao_em_andamento — notificar equipe se lead já tem ação trabalhista (BUG-032).
+  // Uma vez por deal: o campo é sticky, e sem a flag a equipe recebia o alerta a cada
+  // mensagem seguinte do lead.
+  if (personaChave === "assistente" && merged.acao_em_andamento === true && !merged._notif_acao_at) {
     dispararNotificacoes(projetoId, "acao_em_andamento", {
       dealId: deal.id, nome: String(merged.nome ?? contato.nome ?? ""), telefone: phone,
+      mensagem: String(merged.acao_em_andamento_relato ?? ""),
     }).catch(() => {});
+    await atualizarMergedFlags(deal.id, merged, { _notif_acao_at: new Date().toISOString() });
+    merged._notif_acao_at = new Date().toISOString();
     console.warn(`[StageEngine] ALERTA: dealId=${deal.id} — lead tem ação em andamento (acao_em_andamento=true)`);
   }
 
@@ -667,6 +950,42 @@ export async function processIncomingMessage(
   ]);
   const empresasBloqueadas: string[] = (empresasBloqueadasRows as Array<{ nomeNorm: string }>)
     .map(e => e.nomeNorm).filter(Boolean);
+
+  // B10a-bis: intenção explícita do lead ("pode ligar", "quero sim") encerra a coleta.
+  // Sem isso a fila de perguntas atropelava o sinal de compra: o Ledison pediu ligação
+  // 29/08 12:31, informou o melhor horário, e a resposta seguinte foi mais uma pergunta
+  // de qualificação — o lead ficou parado em lead_carreteiro sem ninguém acionado.
+  // Só encerra com vínculo aproveitável: sem isso o allDone entrega lixo para a advogada
+  // (ou pior, dispara descarte) só porque o lead pediu ligação.
+  if (
+    text && personaChave === "assistente" && !isSdrSimples && !isSdrTriagem &&
+    !vinculosOk && vinculos.length > 0 && !vinculosTodosPrescritos &&
+    detectaPedidoContato(text)
+  ) {
+    const { getMesesMinimoProjeto: getMesesMinIntencao } = await import("./gate-evaluator.js");
+    const { temVinculoValidoSdr } = await import("./assistente-agents.js");
+    const normIntencao = (x: string | null | undefined) =>
+      (x ?? "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const isBlockedIntencao = (empresa: string | null | undefined) =>
+      !!empresa && empresasBloqueadas.some(b => normIntencao(empresa).includes(normIntencao(b)));
+    const mesesMinIntencao = await getMesesMinIntencao(projetoId);
+    if (temVinculoValidoSdr(vinculos, merged, mesesMinIntencao, isBlockedIntencao)) {
+      vinculosOk = true;
+      merged._vinculos_ok = true;
+      merged._coleta_encerrada_por_intencao = true;
+      await atualizarMergedFlags(deal.id, merged, {
+        _vinculos_ok: true,
+        _coleta_encerrada_por_intencao: true,
+      });
+      prisma.crmNota.create({ data: {
+        dealId: deal.id,
+        conteudo: `[IA] Coleta encerrada por intenção explícita do lead: "${text.trim().slice(0, 160)}"`,
+      } }).catch(() => {});
+      console.log(`[StageEngine] dealId=${deal.id} — pedido de contato detectado → coleta encerrada, handoff`);
+    } else {
+      console.log(`[StageEngine] dealId=${deal.id} — pedido de contato detectado, mas sem vínculo válido → segue coletando`);
+    }
+  }
 
   // Reabertura pós-descarte: lead desqualificado que informa DEPOIS um vínculo CLT válido
   // (tempo >= mínimo, empresa não bloqueada, dentro do prazo) volta para a esteira.
@@ -705,6 +1024,20 @@ export async function processIncomingMessage(
         dealId: deal.id, nome: String(merged.nome ?? contato.nome ?? ""), telefone: phone, empresa: String(vinculoValidoReopen.empresa ?? ""),
       }).catch(() => {});
       console.log(`[StageEngine] dealId=${deal.id} reaberto pós-descarte (vínculo válido: ${vinculoValidoReopen.empresa})`);
+    }
+  }
+
+  // Lead das redes (comentário) espera em "Pré-qualificação" até confirmar o vínculo de motorista;
+  // confirmado, vai para a coluna da fase em que está (Lead Carreteiro). Descarte e qualificação
+  // continuam movendo pelas regras de sempre.
+  if (deal.stageId && vinculos.some(v => !!v.empresa && /clt|carteira|informal/i.test(String(v.vinculo ?? "")))) {
+    const { ETAPA_PRE_QUALIFICACAO } = await import("../lib/meta-social.js");
+    const preQ = await prisma.crmStage.findFirst({ where: { id: deal.stageId, chave: ETAPA_PRE_QUALIFICACAO } });
+    const destino = preQ && await prisma.crmStage.findFirst({ where: { pipelineId: preQ.pipelineId, chave: stageChave } });
+    if (destino) {
+      await prisma.crmDeal.update({ where: { id: deal.id }, data: { stageId: destino.id } });
+      await prisma.crmNota.create({ data: { dealId: deal.id, conteudo: `[IA] Vínculo de motorista confirmado — saiu da pré-qualificação para "${destino.nome}"` } });
+      console.log(`[StageEngine] dealId=${deal.id} pré-qualificação → ${destino.nome}`);
     }
   }
 
@@ -753,7 +1086,7 @@ export async function processIncomingMessage(
     }
   }
 
-  if (personaChave === "assistente" && !isSdrSimples) {
+  if (personaChave === "assistente" && !isSdrSimples && !isSdrGenerico) {
     const qAskedAtBefore = JSON.stringify(merged._q_asked_at ?? {});
     const { runAssistenteAgent } = await import("./assistente-agents.js");
     assistenteAgentResult = await runAssistenteAgent({ projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount });
@@ -786,7 +1119,7 @@ export async function processIncomingMessage(
       // Off-flow question (client asked a side question, not answering the flow step):
       // restore _q_asked_at so the same unanswered question is returned again on this
       // turn's --- append and on the next turn, instead of advancing prematurely.
-      if (isPerguntaComplexa && !frustrationHandling) {
+      if ((isPerguntaComplexa || turnoSemResposta) && !frustrationHandling) {
         merged._q_asked_at = JSON.parse(qAskedAtBefore);
         const { runAssistenteAgent: runAgentRestore } = await import("./assistente-agents.js");
         const restored = await runAgentRestore({ projetoId, merged, vinculos, vinculosOk, vinculosTodosPrescritos, empresasBloqueadas, outgoingCount });
@@ -810,8 +1143,8 @@ export async function processIncomingMessage(
     // add it to _q_skipped so the next turn skips it and advances.
     // Off-flow questions don't count as unanswered attempts — client is asking a side question,
     // not refusing to answer the flow step. Skip counter only increments on real answer attempts.
-    if (personaChave === "assistente" && !(isPerguntaComplexa && !frustrationHandling)) {
-      const { getLastVinculoStepChave } = await import("./persona-router.js");
+    if (personaChave === "assistente" && !((isPerguntaComplexa || turnoSemResposta) && !frustrationHandling)) {
+      const { getLastVinculoStepChave, getMaxTentativasPasso } = await import("./persona-router.js");
       const currentStepChave = getLastVinculoStepChave();
       // Detecção por step chave — mais confiável que regex de texto.
       // Cobre pivots cujo texto não bate nos padrões do regex (ex: "Vamos investigar outro vínculo?").
@@ -823,16 +1156,23 @@ export async function processIncomingMessage(
       // Antes, 2 ACKs consecutivos adicionavam o step ao _q_skipped permanentemente.
       const isAck = ACKS_REGEX.test((text ?? "").trim()) || (text?.replace(/\s/g, "").length ?? 0) < 2;
       if (currentStepChave && nextQDeterministico && !isAck) {
-        const lastDq = (merged._last_dq as { chave: string; count: number } | undefined) ?? undefined;
-        const sameStep = lastDq?.chave === currentStepChave;
-        const newCount = sameStep ? (lastDq!.count + 1) : 1;
-        if (newCount >= 2 && !((merged._q_skipped as string[] | undefined)?.includes(currentStepChave))) {
+        // Contagem ACUMULADA por step. Antes só o último step era contado (`_last_dq`), então
+        // alternar entre `acao_andamento_rec` e `acao_andamento_ant` — que fazem a MESMA
+        // pergunta em fases diferentes — zerava o contador e a pergunta voltava para sempre
+        // (Carlos 5521995367039 levou 4×). `_last_dq` continua escrito por compatibilidade.
+        const dqCount = (merged._dq_count && typeof merged._dq_count === "object")
+          ? { ...(merged._dq_count as Record<string, number>) } : {};
+        const newCount = (dqCount[currentStepChave] ?? 0) + 1;
+        dqCount[currentStepChave] = newCount;
+        merged._dq_count = dqCount;
+        const maxTentativas = await getMaxTentativasPasso(projetoId, currentStepChave);
+        if (newCount >= maxTentativas && !((merged._q_skipped as string[] | undefined)?.includes(currentStepChave))) {
           const qSkipped = Array.isArray(merged._q_skipped)
             ? [...(merged._q_skipped as string[]), currentStepChave]
             : [currentStepChave];
           merged._q_skipped = qSkipped;
           merged._last_dq = null;
-          await atualizarMergedFlags(deal.id, merged, { _q_skipped: qSkipped, _last_dq: null });
+          await atualizarMergedFlags(deal.id, merged, { _q_skipped: qSkipped, _last_dq: null, _dq_count: dqCount });
           console.log(`[StageEngine] Step "${currentStepChave}" asked ${newCount}× without answer → skipped`);
           // Re-run to get the NEXT question (skip takes effect immediately on this turn).
           const { runAssistenteAgent: runAgentRerun } = await import("./assistente-agents.js");
@@ -855,7 +1195,7 @@ export async function processIncomingMessage(
           }
         } else {
           merged._last_dq = { chave: currentStepChave, count: newCount };
-          await atualizarMergedFlags(deal.id, merged, { _last_dq: { chave: currentStepChave, count: newCount } });
+          await atualizarMergedFlags(deal.id, merged, { _last_dq: { chave: currentStepChave, count: newCount }, _dq_count: dqCount });
         }
       }
     }
@@ -864,7 +1204,7 @@ export async function processIncomingMessage(
     // Example: _conta_caso_enviada is set when conta_caso step is returned.
     // Persists ALL new flags at once (not one at a time) to avoid turn-to-turn race conditions.
     const existingIaFlags = ((deal as any).iaFlags as Record<string, unknown> | null) ?? {};
-    const EXCLUDED_FLAGS = new Set(["_q_asked_at", "_saudacao_enviada", "_vinculos_ok", "_vinculos_todos_prescritos", "_mais_empregos_negado", "_mais_empregos_confirmado", "_pos_vinculos_fase", "_valor_apresentado"]);
+    const EXCLUDED_FLAGS = new Set(["_q_asked_at", "_dq_count", "_saudacao_enviada", "_vinculos_ok", "_vinculos_todos_prescritos", "_mais_empregos_negado", "_mais_empregos_confirmado", "_pos_vinculos_fase", "_valor_apresentado"]);
     const newFlags: Record<string, unknown> = {};
     for (const k of Object.keys(merged)) {
       if (k.startsWith("_") && !EXCLUDED_FLAGS.has(k) && merged[k] === true && existingIaFlags[k] !== true) {
@@ -940,7 +1280,7 @@ export async function processIncomingMessage(
           persona = nextInlinePersona;
 
           if (nextPersonaChave === "secretaria") {
-            const { getSlotsDisponiveis: fetchSlots, buildSlotsInstrucoes: buildSlotInstr } = await import("./secretaria-agenda.js");
+            const { getSlotsDisponiveis: fetchSlots, buildSlotsInstrucoes: buildSlotInstr, renderHorarios: renderHorariosInline } = await import("./secretaria-agenda.js");
             const slotsDanielaDone = await fetchSlots(projetoId);
             const advNomeInline = await getPersonaNomeExibicao(projetoId, "advogado");
             secretariaInstrucoes = buildSlotInstr(slotsDanielaDone, advNomeInline);
@@ -959,11 +1299,8 @@ export async function processIncomingMessage(
             advFlowNextStepChave = inlineSecFlow.nextStepChave ?? null;
             advFlowCampoColetar  = inlineSecFlow.campoColetar ?? null;
 
-            if (nextQDeterministico?.includes("{horarios}")) {
-              const listaSlots = slotsDanielaDone.length > 0
-                ? slotsDanielaDone.map((s, i) => `${i + 1}. ${s.label}`).join("\n")
-                : "Nenhum horário disponível no momento — pergunte ao cliente qual dia e hora seria melhor.";
-              nextQDeterministico = nextQDeterministico.replace("{horarios}", listaSlots);
+            if (nextQDeterministico) {
+              nextQDeterministico = await renderHorariosInline(projetoId, nextQDeterministico, slotsDanielaDone);
             }
             if (nextQDeterministico) {
               const { renderNomePlaceholder } = await import("./gate-evaluator.js");
@@ -986,7 +1323,7 @@ export async function processIncomingMessage(
     }
   } else if (personaChave === "secretaria" && deal.iaAtiva) {
     // Fetch available agenda slots for this project (used for system prompt + meeting creation)
-    const { getSlotsDisponiveis, buildSlotsInstrucoes, encontrarSlotPorTexto, buildEscaladaAgendamento } = await import("./secretaria-agenda.js");
+    const { getSlotsDisponiveis, buildSlotsInstrucoes, encontrarSlotPorTexto, buildEscaladaAgendamento, renderHorarios } = await import("./secretaria-agenda.js");
     const slotsDisponiveis = await getSlotsDisponiveis(projetoId);
     const advNomeSec = await getPersonaNomeExibicao(projetoId, "advogado");
     secretariaInstrucoes = buildSlotsInstrucoes(slotsDisponiveis, advNomeSec);
@@ -1010,11 +1347,8 @@ export async function processIncomingMessage(
     advFlowSilentReturn  = secFlow.silentReturn === true;
 
     // Substitute {horarios} whenever the placeholder is present (including step already init'd)
-    if (nextQDeterministico?.includes("{horarios}")) {
-      const listaSlots = slotsDisponiveis.length > 0
-        ? slotsDisponiveis.map((s, i) => `${i + 1}. ${s.label}`).join("\n")
-        : "Nenhum horário disponível no momento — pergunte ao cliente qual dia e hora seria melhor.";
-      nextQDeterministico = nextQDeterministico.replace("{horarios}", listaSlots);
+    if (nextQDeterministico) {
+      nextQDeterministico = await renderHorarios(projetoId, nextQDeterministico, slotsDisponiveis);
     }
     if (nextQDeterministico) {
       const { renderNomePlaceholder } = await import("./gate-evaluator.js");
@@ -1101,7 +1435,7 @@ export async function processIncomingMessage(
     }
 
     // When secretaria flow ends → hand off to next persona (configured via persona.proximaPersonaChave)
-    if (advFlowNextStepChave === "__done__" && (persona as any).proximaPersonaChave) {
+    if (advFlowNextStepChave === "__done__" && await proximaPersonaAtiva(projetoId, (persona as any).proximaPersonaChave)) {
       const nextChaveAfterSec = (persona as any).proximaPersonaChave as string;
       await (prisma.crmDeal as any).update({
         where: { id: deal.id },
@@ -1316,6 +1650,7 @@ export async function processIncomingMessage(
     cidadeCliente: typeof merged.cidade === "string" ? merged.cidade : null,
     incomingText: text,
     leadFezPerguntaInesperada,
+    assistenteGenerico: isSdrGenerico,
     identityContextInject,
     assistenteNome: assistNomeGlobal,
     escritorioNome: escritorioNomeGlobal,
@@ -1326,6 +1661,26 @@ export async function processIncomingMessage(
   // B12: call LLM (up to 3 humanization attempts)
   // Pre-compute whether we will override with a deterministic question so we can skip
   // the LLM call entirely — saves 3–10 s per coleta_docs / advogado deterministic step.
+  // Guard final anti-repetição: se a pergunta que vamos mandar já foi feita e o lead JÁ RESPONDEU,
+  // não repetir. Cobre qualquer origem — passo determinístico, variante da mesma pergunta em outra
+  // fase (acao_andamento_rec × _ant) ou pergunta gerada pelo LLM. O step vai para _q_skipped para o
+  // fluxo andar, e a resposta passa a sair do LLM, que tem o histórico e responde ao que ele disse.
+  if (nextQDeterministico && advFlowStepType !== "saudacao" && advFlowStepType !== "llm_generated" && advFlowStepType !== "llm_gate") {
+    const repetida = await jaPerguntouEFoiRespondida(deal.id, nextQDeterministico).catch(() => false);
+    if (repetida) {
+      const stepRepetido = advFlowNextStepChave ?? (await import("./persona-router.js")).getLastVinculoStepChave();
+      console.log(`[StageEngine] dealId=${deal.id} — "${nextQDeterministico.slice(0, 50)}" já perguntada e respondida; não repetindo (step=${stepRepetido ?? "?"})`);
+      if (stepRepetido && !((merged._q_skipped as string[] | undefined)?.includes(stepRepetido))) {
+        const qSkipped = Array.isArray(merged._q_skipped)
+          ? [...(merged._q_skipped as string[]), stepRepetido]
+          : [stepRepetido];
+        merged._q_skipped = qSkipped;
+        await atualizarMergedFlags(deal.id, merged, { _q_skipped: qSkipped });
+      }
+      nextQDeterministico = null;
+    }
+  }
+
   const willOverrideDeterministic =
     // secretaria is fully flow-controlled — never let unexpected questions bypass deterministic steps
     (!leadFezPerguntaInesperada || personaChave === "secretaria") &&
@@ -1335,6 +1690,9 @@ export async function processIncomingMessage(
     !isDocAnalitico &&
     (personaChave === "assistente" || personaChave === "advogado" || personaChave === "secretaria" || personaChave === "coleta_docs" || personaChave === "calculo") &&
     !!nextQDeterministico &&
+    // Turno sem resposta: mandar o próximo template por cima do que a pessoa disse é o que
+    // fez a IA parecer surda nos áudios. O LLM responde e reencaixa a pergunta.
+    !(turnoSemResposta && personaChave === "assistente" && advFlowStepType !== "saudacao") &&
     advFlowStepType !== "llm_generated" &&
     advFlowStepType !== "llm_gate" &&   // llm_gate/gate pergunta = LLM instruction, never send verbatim
     advFlowStepType !== "gate" &&
@@ -1346,7 +1704,7 @@ export async function processIncomingMessage(
     resposta = nextQDeterministico!;
   } else {
     try {
-      resposta = await callLlmWithRetry(projetoId, deal.id, systemPrompt, llmMessages, personaChave, (persona as any).llmProviderChave ?? null, stageChave, advFlowStepType === "llm_generated");
+      resposta = await callLlmWithRetry(projetoId, deal.id, systemPrompt, llmMessages, personaChave, (persona as any).llmProviderChave ?? null, stageChave, advFlowStepType === "llm_generated", isSdrGenerico);
     } catch {
       console.warn(`[StageEngine] Todos os LLMs falharam para deal ${deal.id} — agendando retry`);
       scheduleLlmRetry(projetoId, deal.id, phone);
@@ -1370,7 +1728,12 @@ export async function processIncomingMessage(
     const lastOutMsg = history.filter(m => m.direcao === "out").slice(-1)[0]?.conteudo ?? "";
     const normQ = (s: string) => s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim().slice(0, 70);
     const qAlreadyLastSent = normQ(lastOutMsg).includes(normQ(nextQDeterministico));
-    if (!qAlreadyLastSent) {
+    // Caso Cigano 04/11: o LLM já devolveu a pergunta obrigatória (ela vai no system prompt) e a
+    // segunda bolha repetia a mesma pergunta 3 s depois, com outras palavras.
+    const llmJaPerguntou = respostaJaFazPergunta(resposta, nextQDeterministico);
+    if (llmJaPerguntou) {
+      console.log(`[StageEngine] dealId=${deal.id} — LLM já fez a próxima pergunta; omitindo segunda bolha`);
+    } else if (!qAlreadyLastSent) {
       const nome = typeof merged.nome === "string" ? merged.nome.split(" ")[0].trim() : "";
       let resolvedQ = nome ? nextQDeterministico.replace(/\{nome\}/g, nome) : nextQDeterministico.replace(/\{nome\},?\s*/g, "");
       resolvedQ = resolvedQ.replace(/\{nome_persona\}/g, persona.nomeExibicao)
@@ -1410,7 +1773,7 @@ export async function processIncomingMessage(
       && advFlowStepType !== "llm_generated" && advFlowStepType !== "llm_gate") {
     const lastOutMsg = history.filter(m => m.direcao === "out").slice(-1)[0]?.conteudo ?? "";
     const normQ = (s: string) => s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim().slice(0, 70);
-    if (!normQ(lastOutMsg).includes(normQ(nextQDeterministico))) {
+    if (!normQ(lastOutMsg).includes(normQ(nextQDeterministico)) && !respostaJaFazPergunta(resposta, nextQDeterministico)) {
       const nome = typeof merged.nome === "string" ? merged.nome.split(" ")[0].trim() : "";
       let resolvedQ = nome ? nextQDeterministico.replace(/\{nome\}/g, nome) : nextQDeterministico.replace(/\{nome\},?\s*/g, "");
       resolvedQ = resolvedQ
@@ -1457,7 +1820,7 @@ export async function processIncomingMessage(
     const { buildLeadBriefing } = await import("./lead-briefing.js");
     const briefingQualif = await buildLeadBriefing(deal.id, {
       titulo: "🔥 LEAD QUALIFICADO",
-      acao: "Ligar para aquecer o lead e garantir presença na reunião",
+      acao: "Ligar para o lead — o robô avisou que um advogado da equipe vai ligar",
     }).catch(() => "");
     dispararNotificacoes(projetoId, "qualificacao_completa", { ...qualDados, telefone: phone, stage: stageChave, briefing: briefingQualif, dealId: deal.id }).catch(() => {});
     const { transitioned: t1, pendingActions: t1Actions } = await transitionDeal(projetoId, deal.id, "qualificacao_completa", phone, stageChave);
@@ -1465,7 +1828,7 @@ export async function processIncomingMessage(
     // Override iaPersonaChave AFTER transitionDeal — transitionDeal sets it from the stage config,
     // but proximaPersonaChave takes precedence when explicitly configured on the persona.
     const proximaPersonaChaveAssistente = (persona as any).proximaPersonaChave as string | undefined;
-    if (proximaPersonaChaveAssistente) {
+    if (await proximaPersonaAtiva(projetoId, proximaPersonaChaveAssistente)) {
       await (prisma.crmDeal as any).update({
         where: { id: deal.id },
         data: { iaPersonaChave: proximaPersonaChaveAssistente, iaFlowStepChave: null, iaFlowStepData: {}, iaPersonaTrocadaEm: new Date() },
@@ -1479,10 +1842,9 @@ export async function processIncomingMessage(
           const evoSec = await getEvolutionConfig(projetoId);
           const secPersona = await prisma.iaPersona.findUnique({ where: { projetoId_chave: { projetoId, chave: "secretaria" } } });
           if (evoSec && secPersona) {
-            const { getSlotsDisponiveis, buildSlotsInstrucoes } = await import("./secretaria-agenda.js");
+            const { getSlotsDisponiveis, renderHorarios: renderHorariosSec } = await import("./secretaria-agenda.js");
             const { advanceAdvogadoFlow } = await import("./flow-controller.js");
             const slotsDisp = await getSlotsDisponiveis(projetoId);
-            const advNome   = await getPersonaNomeExibicao(projetoId, "advogado");
             const secFlow   = await advanceAdvogadoFlow(
               projetoId,
               { id: deal.id, iaFlowStepChave: null, iaFlowStepData: {}, qualificacao: deal.qualificacao },
@@ -1490,11 +1852,8 @@ export async function processIncomingMessage(
               { personaChave: "secretaria", fase: "secretaria" },
             );
             let secGreeting = secFlow.nextQuestion ?? null;
-            if (secGreeting?.includes("{horarios}")) {
-              const listaSlots = slotsDisp.length > 0
-                ? slotsDisp.map((s, i) => `${i + 1}. ${s.label}`).join("\n")
-                : "Nenhum horário disponível no momento — pergunte ao cliente qual dia e hora seria melhor.";
-              secGreeting = secGreeting.replace("{horarios}", listaSlots);
+            if (secGreeting) {
+              secGreeting = await renderHorariosSec(projetoId, secGreeting, slotsDisp);
             }
             if (secGreeting) {
               const { renderNomePlaceholder } = await import("./gate-evaluator.js");
@@ -1547,6 +1906,11 @@ export async function processIncomingMessage(
   let isDescarte = false;
   // Só aplicar DESCARTE_REGEX quando a persona ativa for "assistente" — evita falsos positivos
   // quando o advogado usa frases similares em contexto de análise jurídica (BUG-018)
+  // O LLM não dispensa por conta própria: sem confirmação, a dispensa vira a pergunta direta.
+  if (personaChave === "assistente" && merged._acao_confirmada !== true && isDispensaPorAdvogado(resposta)) {
+    console.warn(`[StageEngine] dealId=${deal.id} — dispensa por advogado sem confirmação trocada pela pergunta`);
+    resposta = "Só pra eu entender certo: hoje você já tem advogado cuidando desse caso, ou alguma ação trabalhista em andamento contra essa empresa?";
+  }
   if (personaChave === "assistente" && DESCARTE_REGEX.test(resposta) && stageChave !== "descartado") {
     isDescarte = true;
     resposta   = "Aguarda um momento aqui, vou verificar com a equipe e já retorno pra você, tá?";
@@ -1635,6 +1999,8 @@ export async function processIncomingMessage(
         where: { id: deal.id },
         data: { iaStageChave: route.toStage, iaFlowStepChave: null, iaFlowStepData: undefined },
       });
+      const { marcarEntradaEtapa } = await import("./lead-qualificado.js");
+      void marcarEntradaEtapa(deal.id, route.toStage, `ia:triagem:${route.motivo}`);
     }
     console.log(`[SdrTriagem] dealId=${deal.id} → stage "${route.toStage}" (${route.motivo})`);
   }
@@ -1708,6 +2074,10 @@ async function runProativoNextStepLocked(projetoId: string, dealId: string, phon
   if (personaChave !== "advogado") return;
 
   const persona = await prisma.iaPersona.findUnique({ where: { projetoId_chave: { projetoId, chave: personaChave } } });
+  if (persona && !persona.ativo) {
+    console.log(`[Proativo] dealId=${dealId} — persona "${personaChave}" desativada; mensagem proativa cancelada`);
+    return;
+  }
   if (!persona) return;
 
   const evoConfig = await getEvolutionConfig(projetoId);

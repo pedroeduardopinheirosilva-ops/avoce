@@ -440,13 +440,31 @@ describe("processVinculos", () => {
       expect(vinculosResult).toHaveLength(1);
     });
 
-    it("não sobrescreve empresa_recente (v0-derived, guarda falsy mantida)", async () => {
+    it("vinculos[0] corrige empresa_recente divergente (nome transcrito errado — caso Flavio Helton)", async () => {
       const result = await processVinculos({
         projetoId: "proj-flat3",
         merged: {
           _vinculos_ok: true,
           vinculos: [v0],
-          empresa_recente: "JaDefinida", // deve permanecer intacta
+          empresa_recente: "GrafiaErradaDoAudio",
+        },
+        text: null,
+        history: [],
+        maisEmpregosPerguntado: false,
+      });
+
+      expect(result.mergedUpdates.empresa_recente).toBe(v0.empresa);
+      expect(result.mergedUpdates.empresa_principal).toBe(v0.empresa);
+    });
+
+    it("não reescreve campo que já bate com vinculos[0]", async () => {
+      const result = await processVinculos({
+        projetoId: "proj-flat4",
+        merged: {
+          _vinculos_ok: true,
+          vinculos: [v0],
+          empresa_recente: v0.empresa,
+          empresa_principal: v0.empresa,
         },
         text: null,
         history: [],
@@ -454,6 +472,7 @@ describe("processVinculos", () => {
       });
 
       expect(result.mergedUpdates.empresa_recente).toBeUndefined();
+      expect(result.mergedUpdates.empresa_principal).toBeUndefined();
     });
   });
 });

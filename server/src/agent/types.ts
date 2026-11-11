@@ -10,6 +10,9 @@ export interface VinculoEmprego {
   empresa?: string;
   funcao?: string;
   vinculo?: string;
+  /** Trecho trabalhado sem carteira quando houve período misto na mesma empresa (tese de
+   *  reconhecimento de vínculo). Ex.: "os 5 primeiros meses sem registro". */
+  periodo_sem_registro?: string;
   tempo?: string;
   data_saida?: string;
   saida?: string;
@@ -59,6 +62,7 @@ export type DocJsonResult = {
   data_nascimento?: string | null;
   local_nascimento?: string | null;
   naturalidade?: string | null;
+  nacionalidade?: string | null;
   filiacao_pai?: string | null;
   filiacao_mae?: string | null;
   pis?: string | null;

@@ -11,6 +11,7 @@ import { getEvolutionConfig, sendHumanized, limparResposta, sendAudioIfConfigure
 import { buildInstrucaoBase } from "./persona-router.js";
 import { initAdvogadoFlowIfNeeded } from "./flow-controller.js";
 import { saveFlowStepData } from "./deal-repository.js";
+import { marcarEntradaEtapa } from "./lead-qualificado.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -127,6 +128,7 @@ export async function transitionDeal(
       motivo: `IA: ${condicao}`,
     },
   });
+  void marcarEntradaEtapa(dealId, regra.stageDestinoChave, `ia:${condicao}`);
 
   console.log(`[StageEngine] Deal ${dealId}: ${stageAtual} → ${regra.stageDestinoChave} (${condicao})`);
 
@@ -451,6 +453,7 @@ export async function moverDealParaStage(
         data: { dealId, stageAnteriorId: deal.stageId, stageNovoId: stage.id, motivo: `IA: auto → ${chaveDestino}` },
       });
     }
+    void marcarEntradaEtapa(dealId, chaveDestino, "ia:auto");
     console.log(`[StageMove] Deal ${dealId}: → ${chaveDestino}`);
   } catch (err) {
     console.warn(`[StageMove] erro deal ${dealId}:`, err);

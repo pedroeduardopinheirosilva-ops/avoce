@@ -152,6 +152,13 @@ async function callProvider(
       // ~7x mais barato na extração). Ignorado por modelos OpenAI puros que não o reconhecem.
       ...(disableThinking && cfg.provider === "deepseek" ? { thinking: { type: "disabled" } } : {}),
     } as any);
+    // Observabilidade de custo: sem cache de prefixo o hit fica 0 e o input custa ~10x.
+    const _u = res.usage as any;
+    if (cfg.provider === "deepseek" && _u) {
+      const hit = _u.prompt_cache_hit_tokens ?? 0, miss = _u.prompt_cache_miss_tokens ?? 0;
+      const pct = hit + miss > 0 ? Math.round((hit * 100) / (hit + miss)) : 0;
+      console.log(`[LLM/cache] ${cfg.modelo} hit=${hit} miss=${miss} (${pct}% do input veio do cache)`);
+    }
     return { content: res.choices[0]?.message?.content ?? "", tokensIn: res.usage?.prompt_tokens ?? 0, tokensOut: res.usage?.completion_tokens ?? 0 };
   }
 
@@ -185,6 +192,23 @@ async function callProvider(
 
 // ── Public: callLlm ────────────────────────────────────────────────────────────
 
+// ── Bloco volátil "AGORA" — SEMPRE no fim do system prompt ────────────────────
+// Fica aqui (último hop antes do provedor) para garantir que nada volátil entre no
+// prefixo cacheável. Não entra na extração de JSON, que não precisa de data/hora.
+export function buildBlocoAgora(): string {
+  const agora = new Date();
+  const hoje = agora.toLocaleDateString("pt-BR", {
+    day: "2-digit", month: "long", year: "numeric", timeZone: "America/Sao_Paulo",
+  });
+  const horaStr = agora.toLocaleTimeString("pt-BR", {
+    hour: "2-digit", minute: "2-digit", timeZone: "America/Sao_Paulo", hour12: false,
+  });
+  const hora = parseInt(horaStr.split(":")[0], 10);
+  const saudacao = hora >= 5 && hora < 12 ? "bom dia" : hora >= 12 && hora < 18 ? "boa tarde" : "boa noite";
+  return `DATA E HORA ATUAL (Brasília): ${hoje}, ${horaStr}h
+SAUDAÇÃO CORRETA AGORA: "${saudacao}" — use sempre que abrir uma conversa ou for a primeira mensagem do dia.`;
+}
+
 export async function callLlm(opts: {
   projetoId: string;
   dealId?: string;
@@ -194,8 +218,14 @@ export async function callLlm(opts: {
   personaLlmChave?: string | null;
   stageChave?: string;
   maxTokens?: number;
+  // Tarefa de saída curta/estruturada (classificador JSON): sem isso o
+  // raciocínio consome o orçamento de max_tokens e o content volta VAZIO.
+  disableThinking?: boolean;
 }): Promise<LlmCallResult> {
-  const { projetoId, dealId, systemPrompt, messages, personaChave, personaLlmChave, stageChave, maxTokens = 1024 } = opts;
+  const { projetoId, dealId, systemPrompt, messages, personaChave, personaLlmChave, stageChave, maxTokens = 1024, disableThinking = false } = opts;
+  // Data/hora no FIM: mantém o prefixo do system prompt estável, o que deixa o
+  // provedor servir a maior parte dos tokens de entrada do cache.
+  const systemComAgora = systemPrompt + "\n\n" + buildBlocoAgora();
   const providers = await getProviders(projetoId, personaLlmChave);
   let lastErr: unknown;
 
@@ -206,7 +236,7 @@ export async function callLlm(opts: {
 
     while (attempt <= MAX_RETRIES) {
       try {
-        const { content, tokensIn, tokensOut } = await callProvider(cfg, systemPrompt, messages, maxTokens);
+        const { content, tokensIn, tokensOut } = await callProvider(cfg, systemComAgora, messages, maxTokens, false, disableThinking);
         const latencyMs = Date.now() - t0;
         prisma.iaInteracaoLog.create({
           data: { dealId, projetoId, personaChave, stageChave, llmUsado: `${cfg.provider}/${cfg.modelo}`, tokensEntrada: tokensIn, tokensSaida: tokensOut, latenciaMs: latencyMs },

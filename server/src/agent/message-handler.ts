@@ -6,7 +6,7 @@
 import { prisma } from "../db.js";
 import { callLlm } from "./llm.js";
 import { isHumanized } from "./humanizer.js";
-import { sendText, sendTyping, sendWhatsAppAudio } from "../services/evolution.js";
+import { sendText, sendTyping, sendWhatsAppAudio, isTestNumber } from "../services/evolution.js";
 import { textToSpeech } from "../services/elevenlabs.js";
 import { assertSendable, handleBlockedSend, PromptLeakError, type SendableContext } from "./output-guard.js";
 import { buildInstrucaoBase } from "./persona-router.js";
@@ -176,6 +176,12 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
     where: { projetoId_chave: { projetoId, chave: personaChave } },
   });
   if (!persona) return;
+  // Persona desligada em Config IA → a conversa é da equipe. O cron de "mensagem perdida"
+  // passava por aqui e respondia em nome dela mesmo assim (ex.: Daniela desativada falando).
+  if (!persona.ativo) {
+    console.log(`[RespondFromDealState] dealId=${dealId} — persona "${personaChave}" desativada; nada enviado`);
+    return;
+  }
 
   // ── Deterministic flow step re-send ──────────────────────────────────────
   // When the deal is in an active flow step, re-send the step's pergunta directly
@@ -213,6 +219,7 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
               contatoId: contato.id,
               direcao: "out",
               remetente: persona.nomeExibicao,
+              personaChave,
               tipo: "text",
               conteudo: textoLimpo,
             },
@@ -281,7 +288,7 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
     .replace(/\{nome_advogado\}/g, advNomeMH)
     .replace(/\{nome_secretaria\}/g, secNomeMH)
     .replace(/\{nome_assistente\}/g, assistNomeMH);
-  if (!userSystem.includes("DATA E HORA ATUAL")) {
+  if (!userSystem.includes("REGRAS INVIOLÁVEIS DE COMUNICAÇÃO")) {
     userSystem = INSTRUCAO_BASE + "\n\n" + userSystem;
   }
 
@@ -318,6 +325,7 @@ export async function respondFromDealState(projetoId: string, dealId: string, ph
         contatoId: contato.id,
         direcao: "out",
         remetente: persona.nomeExibicao,
+        personaChave,
         tipo: "text",
         conteudo: textoLimpo,
       },
@@ -386,6 +394,12 @@ export async function dispararNotificacoes(
   dados: Record<string, string>
 ): Promise<void> {
   console.log(`[Notificação] evento="${evento}" projetoId=${projetoId}`);
+  // Lead de QA (prefixo 5500990000): o envio ao lead já é no-op, mas o aviso ia para o
+  // grupo real da equipe (teste de 24/10 avisou "lead qualificado" fictício).
+  if (dados.telefone && isTestNumber(dados.telefone)) {
+    console.log(`[Notificação] TEST ${dados.telefone} — evento "${evento}" não enviado`);
+    return;
+  }
   const notifs = await prisma.iaNotificacaoEvento.findMany({
     where: { projetoId, evento, ativo: true },
   });
