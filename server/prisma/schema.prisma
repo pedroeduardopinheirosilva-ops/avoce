@@ -1011,6 +1011,10 @@ model CrmMensagemWhatsapp {
   midiaUrl           String?
   transcricao        String?
   evolutionMessageId String?
+  // Resposta a uma mensagem específica (o "responder" do WhatsApp): id da mensagem
+  // citada no WhatsApp + cópia do texto dela, para mostrar mesmo se a original sumir.
+  citacaoEvolutionId String?
+  citacaoTexto       String?
   lida               Boolean  @default(false)
   enviadaEm          DateTime @default(now())
 

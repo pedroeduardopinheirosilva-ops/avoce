@@ -941,7 +941,7 @@ export const iaRouter = router({
     }),
 
   sendMensagemManual: authProc
-    .input(z.object({ dealId: z.string(), conteudo: z.string() }))
+    .input(z.object({ dealId: z.string(), conteudo: z.string(), respondeAId: z.string().optional() }))
     .mutation(async ({ input, ctx }) => {
       const deal = await prisma.crmDeal.findUnique({
         where: { id: input.dealId },
@@ -952,6 +952,19 @@ export const iaRouter = router({
       assertPodeOperarDeal(ctx, deal);
       if (!deal?.contatoId) throw new Error("Deal sem contato vinculado");
 
+      // "Responder" uma mensagem específica: só vale dentro da mesma conversa.
+      const citada = input.respondeAId
+        ? await prisma.crmMensagemWhatsapp.findUnique({ where: { id: input.respondeAId } })
+        : null;
+      if (input.respondeAId && (!citada || citada.dealId !== deal.id)) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Mensagem citada não pertence a esta conversa" });
+      }
+      const textoCitada = citada
+        ? (citada.conteudo?.trim() || ({ image: "📷 Imagem", audio: "🎤 Áudio", video: "🎥 Vídeo", document: "📎 Arquivo" } as Record<string, string>)[citada.tipo] || "Mensagem").slice(0, 1000)
+        : null;
+      const camposCitacao = citada
+        ? { citacaoEvolutionId: citada.evolutionMessageId ?? null, citacaoTexto: textoCitada }
+        : {};
 
       // Conversa do Instagram Direct / Messenger: responde pela Meta, não pelo Evolution.
       const { canalDoDeal, enviarManualSocial } = await import("../lib/meta-social.js");
@@ -970,6 +983,7 @@ export const iaRouter = router({
           data: {
             dealId: deal.id, contatoId: deal.contatoId, direcao: "out", canal, tipo: "text",
             conteudo: `*${nome}*\n${input.conteudo}`, remetente: nome, evolutionMessageId: mid ?? undefined,
+            ...camposCitacao,
             ...(deal.empresaId ? { empresaId: deal.empresaId } : {}),
           },
         });
@@ -1016,7 +1030,13 @@ export const iaRouter = router({
       if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
 
       const { sendText } = await import("../services/evolution.js");
-      const sendResult = await sendText(evoConfig, phone, textoEnvio);
+      // Sem o id do WhatsApp (mensagem gravada antes do envio confirmar, ou de teste) não dá
+      // para citar no celular do lead: a resposta vai como mensagem comum, mas o painel
+      // continua mostrando a citação.
+      const citacaoEnvio = citada?.evolutionMessageId && citada.evolutionMessageId !== "TEST_SKIP"
+        ? { id: citada.evolutionMessageId, fromMe: citada.direcao === "out", texto: textoCitada ?? "" }
+        : undefined;
+      const sendResult = await sendText(evoConfig, phone, textoEnvio, citacaoEnvio);
       const evolutionMessageId = sendResult?.key?.id ?? null;
 
       return prisma.crmMensagemWhatsapp.create({
@@ -1028,6 +1048,7 @@ export const iaRouter = router({
           conteudo:           textoEnvio,
           remetente:          nomeRemetente,
           evolutionMessageId: evolutionMessageId,
+          ...camposCitacao,
         },
       });
     }),
@@ -1073,8 +1094,37 @@ export const iaRouter = router({
       const sendResult = await sendWhatsAppAudio(evoConfig, phone, input.audioBase64, input.mimeType);
       const evolutionMessageId = sendResult?.key?.id ?? null;
 
-      // Transcribe outgoing audio async (non-blocking)
-      let conteudo = `🎤 Áudio — ${nomeRemetente}`;
+      // Guarda o arquivo para o player do painel — sem isso o áudio do atendente
+      // aparecia só como "🔊 Áudio enviado", sem como ouvir.
+      const { salvarAudioPainel } = await import("../agent/media-processor.js");
+      const midiaUrl = salvarAudioPainel(
+        Buffer.from(input.audioBase64, "base64"),
+        evolutionMessageId && evolutionMessageId !== "TEST_SKIP" ? evolutionMessageId : `manual_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        input.mimeType ?? "audio/ogg",
+      );
+
+      // Grava JÁ (antes da transcrição, que leva segundos): o webhook fromMe deste mesmo
+      // áudio pode chegar nesse meio-tempo e, sem a linha no banco, virava uma segunda
+      // mensagem — ou o create daqui estourava no evolutionMessageId único. Upsert cobre
+      // os dois lados da corrida.
+      const dados = {
+        dealId:    deal.id,
+        contatoId: deal.contatoId,
+        direcao:   "out",
+        tipo:      "audio",
+        conteudo:  `🎤 Áudio — ${nomeRemetente}`,
+        midiaUrl,
+        remetente: nomeRemetente,
+      };
+      let salvo = evolutionMessageId
+        ? await prisma.crmMensagemWhatsapp.upsert({
+            where:  { evolutionMessageId },
+            create: { ...dados, evolutionMessageId },
+            update: { midiaUrl, remetente: nomeRemetente },
+          })
+        : await prisma.crmMensagemWhatsapp.create({ data: dados });
+
+      // Transcrição do áudio enviado (melhoria; nunca impede o registro)
       try {
         const audioApiKey = get("audio_api_key") || get("groq_api_key");
         const audioModel   = get("audio_model") || "whisper-large-v3-turbo";
@@ -1084,23 +1134,14 @@ export const iaRouter = router({
           const audioBuffer = Buffer.from(input.audioBase64, "base64");
           const mimeType    = input.mimeType ?? "audio/ogg";
           const result = await transcribeAudio(audioBuffer, mimeType, audioApiKey, audioModel, audioProvider);
-          if (result.ok && result.text) conteudo = `🎤 ${result.text}`;
+          if (result.ok && result.text) {
+            salvo = await prisma.crmMensagemWhatsapp.update({ where: { id: salvo.id }, data: { conteudo: `🎤 ${result.text}` } });
+          }
         }
       } catch (e: any) {
         console.warn("[sendAudioManual] Transcrição falhou:", e.message);
       }
-
-      return prisma.crmMensagemWhatsapp.create({
-        data: {
-          dealId:             deal.id,
-          contatoId:          deal.contatoId,
-          direcao:            "out",
-          tipo:               "audio",
-          conteudo,
-          remetente:          nomeRemetente,
-          evolutionMessageId: evolutionMessageId,
-        },
-      });
+      return salvo;
     }),
 
   sendArquivoManual: authProc

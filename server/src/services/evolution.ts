@@ -161,10 +161,18 @@ export async function fetchProfilePictureUrl(config: EvolutionConfig, telefone: 
   }
 }
 
+/** Mensagem a citar no envio (o "Responder" do WhatsApp). */
+export interface CitacaoEnvio {
+  id: string;        // evolutionMessageId da mensagem citada
+  fromMe: boolean;   // true se a citada foi enviada por nós
+  texto: string;     // texto da citada (a Evolution usa direto, sem buscar no store)
+}
+
 export async function sendText(
   config: EvolutionConfig,
   to: string,
-  text: string
+  text: string,
+  citacao?: CitacaoEnvio,
 ): Promise<SendTextResult> {
   if (isTestNumber(to)) { console.log(`[Evolution] TEST ${to} — sendText no-op: ${text.slice(0, 60)}`); return TEST_SEND_RESULT; }
   const url = `${config.baseUrl}/message/sendText/${config.instancia}`;
@@ -183,6 +191,16 @@ export async function sendText(
     body: JSON.stringify({
       number,
       text,
+      ...(citacao ? {
+        quoted: {
+          key: {
+            id: citacao.id,
+            fromMe: citacao.fromMe,
+            remoteJid: number.includes("@") ? number : `${number}@s.whatsapp.net`,
+          },
+          message: { conversation: citacao.texto || " " },
+        },
+      } : {}),
     }),
   });
 

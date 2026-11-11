@@ -239,16 +239,43 @@ export function ProximoFollowup({ followup, setFollowup, obrigatorio, sugestao, 
   responsavel: string | undefined;
   setResponsavel: (id: string | null) => void;
 }) {
+  const atalhos = [1, 3, 5, 7, 9];
+  // "Outra data": qualquer dia futuro. Vira D+n (dias a partir de hoje), que é o que os
+  // dois formulários já sabem gravar.
+  const hoje = isoLocal(new Date());
+  const [outraData, setOutraData] = useState(false);
+  const dataOutra = followup != null && followup > 0 && !atalhos.includes(followup)
+    ? isoLocal(new Date(Date.now() + followup * 86400_000))
+    : "";
+  const escolherData = (v: string) => {
+    if (!v) { setFollowup(null); return; }
+    const n = Math.round((Date.parse(`${v}T12:00:00Z`) - Date.parse(`${hoje}T12:00:00Z`)) / 86400_000);
+    setFollowup(n >= 1 ? n : null);
+  };
+  const outraAtiva = outraData || !!dataOutra;
   return (
     <div>
       <p className="text-[11px] text-gray-400 mb-1">{obrigatorio ? "Próximo passo (obrigatório)" : "Próximo follow-up"}</p>
       <div className="flex flex-wrap gap-1">
-        {[1, 3, 5, 7, 9].map((n) => (
-          <button key={n} onClick={() => setFollowup(followup === n ? null : n)} className={chip(followup === n)}>D+{n}</button>
+        {atalhos.map((n) => (
+          <button key={n} onClick={() => { setOutraData(false); setFollowup(followup === n ? null : n); }} className={chip(followup === n)}>D+{n}</button>
         ))}
+        {outraAtiva ? (
+          <input
+            type="date"
+            autoFocus={outraData && !dataOutra}
+            min={isoLocal(new Date(Date.now() + 86400_000))}
+            value={dataOutra}
+            onChange={(e) => escolherData(e.target.value)}
+            className={`${chip(!!dataOutra)} py-0.5`}
+            title="Escolha qualquer data futura"
+          />
+        ) : (
+          <button onClick={() => setOutraData(true)} className={chip(false)} title="Escolher qualquer data futura">📅 outra data</button>
+        )}
         {/* Sempre disponível: o lead que responde horas depois de ganhar um D+n precisa
             sair da lista sem ter que esperar a baixa no painel. */}
-        <button onClick={() => setFollowup(followup === -1 ? null : -1)} className={chip(followup === -1)} title="Tira o lead da lista de follow-ups">
+        <button onClick={() => { setOutraData(false); setFollowup(followup === -1 ? null : -1); }} className={chip(followup === -1)} title="Tira o lead da lista de follow-ups">
           Encerrar follow-up
         </button>
         <span className="text-[11px] text-gray-400 self-center ml-1">

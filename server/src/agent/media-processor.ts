@@ -147,3 +147,28 @@ async function tryExtractDocument(
     return { text: fallbackText ?? fallbackMsg, documentosEnviados: true, docJsonDireto: null };
   }
 }
+
+
+/** Extensão do arquivo de áudio pelo mime (o navegador grava webm no Chrome e mp4 no Safari). */
+export function extensaoAudio(mime: string | undefined | null): string {
+  const m = (mime ?? "").toLowerCase();
+  if (m.includes("ogg") || m.includes("opus")) return "ogg";
+  if (m.includes("webm")) return "webm";
+  if (m.includes("mp4") || m.includes("m4a") || m.includes("aac")) return "m4a";
+  if (m.includes("mpeg") || m.includes("mp3")) return "mp3";
+  if (m.includes("wav")) return "wav";
+  return "ogg";
+}
+
+/** Guarda um áudio para o player do painel; devolve a midiaUrl (/api/audio/...) ou null. */
+export function salvarAudioPainel(buffer: Buffer, id: string, mime: string | undefined | null): string | null {
+  try {
+    mkdirSync(AUDIO_DIR, { recursive: true });
+    const filename = `${id.replace(/[^a-zA-Z0-9_-]/g, "_")}.${extensaoAudio(mime)}`;
+    writeFileSync(join(AUDIO_DIR, filename), buffer);
+    return `/api/audio/${filename}`;
+  } catch (e: any) {
+    console.warn(`[Audio] Falha ao salvar arquivo ${id}: ${e.message}`);
+    return null;
+  }
+}

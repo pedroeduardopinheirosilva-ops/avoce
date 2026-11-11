@@ -31,7 +31,7 @@ import {
   splitState, atualizarMergedFlags, createInitialDeal, adotarDealSemProjeto, dealGanhoDoContato,
   persistMergedUpdates, moveToDescarte, saveParecerValue,
 } from "./deal-repository.js";
-import { type EvolutionWebhookMessage, extractText } from "./webhook-parser.js";
+import { type EvolutionWebhookMessage, extractText, extractCitacao } from "./webhook-parser.js";
 import { normalizeInput } from "./media-processor.js";
 import { processVinculos } from "./vinculos-processor.js";
 import { applyDocJsonToMerged } from "./doc-extractor.js";
@@ -128,7 +128,7 @@ async function saveIncomingMessage(
 ): Promise<"duplicate" | "early_path" | "ok"> {
   try {
     await prisma.crmMensagemWhatsapp.create({
-      data: { dealId: deal.id, contatoId: contato.id, direcao: "in", remetente: msg.key.remoteJid.replace(/@.*/, ""), tipo, conteudo: text ?? "", evolutionMessageId: msg.key.id },
+      data: { dealId: deal.id, contatoId: contato.id, direcao: "in", remetente: msg.key.remoteJid.replace(/@.*/, ""), tipo, conteudo: text ?? "", evolutionMessageId: msg.key.id, ...(extractCitacao(msg) ?? {}) },
     });
     // Toda mensagem recebida é contato — inclusive quando a IA está pausada e quem responde é
     // um atendente pelo celular. Sem isso o deal fica com ultimoContatoEm congelado, afunda na

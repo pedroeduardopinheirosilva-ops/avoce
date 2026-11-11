@@ -254,7 +254,39 @@ type Mensagem = {
   midiaUrl?: string | null;
   evolutionMessageId?: string | null;
   canal?: string;
+  citacaoEvolutionId?: string | null;
+  citacaoTexto?: string | null;
 };
+
+/** Texto de uma mensagem para a citação: sem o "*Nome*" que abre a mensagem do atendente. */
+function textoParaCitacao(m: Pick<Mensagem, "conteudo" | "tipo">): string {
+  const t = (m.conteudo ?? "").replace(/^\*[^*\n]{1,60}\*\n/, "").trim();
+  if (t) return t;
+  return ({ image: "📷 Imagem", audio: "🎤 Áudio", video: "🎥 Vídeo", document: "📎 Arquivo" } as Record<string, string>)[m.tipo] ?? "Mensagem";
+}
+
+/** Bloco da mensagem citada (igual ao "Responder" do WhatsApp). */
+function BlocoCitacao({ autor, texto, isOut, onClick, onClose }: {
+  autor: string; texto: string; isOut: boolean; onClick?: () => void; onClose?: () => void;
+}) {
+  return (
+    <div
+      onClick={onClick}
+      className={`flex items-start gap-2 rounded-lg border-l-4 px-2 py-1 mb-1 text-xs ${onClick ? "cursor-pointer" : ""} ${
+        isOut ? "bg-indigo-500/60 border-indigo-200 text-indigo-50" : "bg-gray-100 border-emerald-500 text-gray-600"
+      }`}
+    >
+      <div className="min-w-0 flex-1">
+        <p className={`font-semibold ${isOut ? "text-indigo-100" : "text-emerald-700"}`}>{autor}</p>
+        <p className="line-clamp-3 whitespace-pre-wrap break-words">{texto}</p>
+      </div>
+      {onClose && (
+        <button type="button" onClick={(e) => { e.stopPropagation(); onClose(); }}
+          title="Cancelar resposta" className="text-gray-400 hover:text-gray-700 text-sm leading-none">✕</button>
+      )}
+    </div>
+  );
+}
 
 type NotifLog = {
   id: string;
@@ -366,8 +398,8 @@ type ConversaBusca = Conversa & {
   match: { tipo: "mensagem" | "contato"; trecho: string; direcao: string; enviadaEm: string | null; total: number };
 };
 
-function MessageBubble({ msg, senderLabel, isOut }: {
-  msg: Mensagem; senderLabel: string | null; isOut: boolean;
+function MessageBubble({ msg, senderLabel, isOut, citacao }: {
+  msg: Mensagem; senderLabel: string | null; isOut: boolean; citacao?: React.ReactNode;
 }) {
   const tipo = msg.tipo;
   const conteudo = msg.conteudo ?? "";
@@ -379,6 +411,7 @@ function MessageBubble({ msg, senderLabel, isOut }: {
     return (
       <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
         {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {citacao}
         {audioSrc ? (
           <audio controls src={audioSrc} className="w-full max-w-[240px] my-1" style={{ height: 32 }} />
         ) : (
@@ -394,6 +427,7 @@ function MessageBubble({ msg, senderLabel, isOut }: {
     return (
       <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
         {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {citacao}
         {src
           ? <img src={src} alt="imagem" className="rounded max-w-full max-h-52 object-contain" />
           : <p className="text-sm">🖼️ {conteudo || "Imagem"}</p>}
@@ -407,6 +441,7 @@ function MessageBubble({ msg, senderLabel, isOut }: {
     return (
       <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
         {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {citacao}
         {src
           ? <a href={src} target="_blank" rel="noopener noreferrer" className="text-sm underline">{icon} {conteudo || "Arquivo"}</a>
           : <p className="text-sm">{icon} {conteudo || "Arquivo"}</p>}
@@ -417,6 +452,7 @@ function MessageBubble({ msg, senderLabel, isOut }: {
   return (
     <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-2xl shadow-sm ${isOut ? "bg-indigo-600 text-white rounded-br-sm" : "bg-white text-gray-800 rounded-bl-sm border"}`}>
       {senderLabel && <p className={`text-xs font-semibold mb-1 ${isOut ? "text-indigo-200" : "text-gray-400"}`}>{senderLabel}</p>}
+        {citacao}
       <div className="text-sm whitespace-pre-wrap" dangerouslySetInnerHTML={{ __html: formatWhatsApp(conteudo, isOut && !!senderLabel) }} />
     </div>
   );
@@ -428,6 +464,8 @@ export default function WhatsappPage() {
   const [dealId, setDealId] = useState<string | null>(searchParams.get("dealId"));
   const [notifDestino, setNotifDestino] = useState<string | null>(null);
   const [manualMsg, setManualMsg] = useState("");
+  const [respondendoA, setRespondendoA] = useState<Mensagem | null>(null);
+  const inputMsgRef = useRef<HTMLInputElement>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [buscaGlobal, setBuscaGlobal] = useState("");
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>("conversas");
@@ -540,7 +578,7 @@ export default function WhatsappPage() {
     onError: (e) => { setMenuApagarId(null); window.alert(e.message); },
   });
   const sendManual = trpc.ia.sendMensagemManual.useMutation({
-    onSuccess: () => { setManualMsg(""); mensagens.refetch(); },
+    onSuccess: () => { setManualMsg(""); setRespondendoA(null); mensagens.refetch(); },
     onError: (err) => alert("Erro ao enviar: " + err.message),
   });
 
@@ -613,7 +651,23 @@ export default function WhatsappPage() {
   function handleSend(e: React.FormEvent) {
     e.preventDefault();
     if (!dealId || !manualMsg.trim()) return;
-    sendManual.mutate({ dealId, conteudo: manualMsg.trim() });
+    sendManual.mutate({ dealId, conteudo: manualMsg.trim(), ...(respondendoA ? { respondeAId: respondendoA.id } : {}) });
+  }
+
+  // Trocar de conversa descarta a resposta em andamento.
+  useEffect(() => { setRespondendoA(null); }, [dealId]);
+
+  function autorDaMensagem(m: Mensagem): string {
+    if (m.direcao === "out") return m.remetente ?? (m.personaChave ? nomePersona(m.personaChave) : null) ?? "Você";
+    return dealAtual?.contato?.nome ?? "Contato";
+  }
+
+  function irParaMensagem(evolutionId: string) {
+    const el = document.getElementById(`msg-${evolutionId}`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("ring-2", "ring-yellow-300", "rounded-2xl");
+    setTimeout(() => el.classList.remove("ring-2", "ring-yellow-300", "rounded-2xl"), 1500);
   }
 
   async function toggleRecording() {
@@ -1161,12 +1215,34 @@ export default function WhatsappPage() {
               } else {
                 senderLabel = dealAtual?.contato?.nome ?? null;
               }
+              const lista = mensagens.data as Mensagem[] | undefined;
+              const original = msg.citacaoEvolutionId
+                ? lista?.find((m) => m.evolutionMessageId === msg.citacaoEvolutionId)
+                : undefined;
+              const temCitacao = !!(msg.citacaoEvolutionId || msg.citacaoTexto);
               return (
                 <div key={msg.id} className={`group flex ${isOut ? "justify-end" : "justify-start"}`}>
-                  <div className="relative">
-                    <MessageBubble msg={msg} senderLabel={senderLabel} isOut={isOut} />
+                  <div className="relative" id={msg.evolutionMessageId ? `msg-${msg.evolutionMessageId}` : undefined}>
+                    <MessageBubble msg={msg} senderLabel={senderLabel} isOut={isOut}
+                      citacao={temCitacao ? (
+                        <BlocoCitacao
+                          isOut={isOut}
+                          autor={original ? autorDaMensagem(original) : "Mensagem citada"}
+                          texto={original ? textoParaCitacao(original) : (msg.citacaoTexto ?? "…")}
+                          onClick={original && msg.citacaoEvolutionId ? () => irParaMensagem(msg.citacaoEvolutionId!) : undefined}
+                        />
+                      ) : undefined}
+                    />
                     <div className={`flex items-center gap-2 mt-1 ${isOut ? "justify-end" : ""}`}>
                       <p className={`text-xs ${isOut ? "text-indigo-400" : "text-gray-400"}`}>{formatDataHoraCompleta(msg.enviadaEm)}</p>
+                      {!dealAtual.iaAtiva && (
+                        <button
+                          type="button"
+                          title="Responder esta mensagem"
+                          onClick={() => { setRespondendoA(msg); inputMsgRef.current?.focus(); }}
+                          className="text-xs text-gray-400 hover:text-indigo-600 hover:underline"
+                        >↩ Responder</button>
+                      )}
                       <button
                         type="button"
                         title="Apagar mensagem"
@@ -1202,7 +1278,19 @@ export default function WhatsappPage() {
           </div>
 
           {!dealAtual.iaAtiva ? (
-            <form onSubmit={handleSend} className="bg-white border-t px-4 py-3 flex gap-2 items-center">
+            <div className="bg-white border-t">
+            {respondendoA && (
+              <div className="px-4 pt-2">
+                <BlocoCitacao
+                  isOut={false}
+                  autor={`Respondendo a ${autorDaMensagem(respondendoA)}`}
+                  texto={textoParaCitacao(respondendoA)}
+                  onClick={respondendoA.evolutionMessageId ? () => irParaMensagem(respondendoA.evolutionMessageId!) : undefined}
+                  onClose={() => setRespondendoA(null)}
+                />
+              </div>
+            )}
+            <form onSubmit={handleSend} className="px-4 py-3 flex gap-2 items-center">
               <input ref={fileInputRef} type="file" className="hidden"
                 accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt"
                 onChange={handleFileSelect} />
@@ -1217,7 +1305,8 @@ export default function WhatsappPage() {
               >
                 {isSendingFile ? "⏳" : "📎"}
               </button>}
-              <input value={manualMsg} onChange={(e) => setManualMsg(e.target.value)}
+              <input ref={inputMsgRef} value={manualMsg} onChange={(e) => setManualMsg(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Escape" && respondendoA) { e.preventDefault(); setRespondendoA(null); } }}
                 placeholder={canalAtual === "whatsapp" ? "Mensagem como humano..." : `Responder no ${canalAtual === "instagram" ? "Direct" : "Messenger"} (até 24h após a última mensagem do lead)`}
                 className="flex-1 border rounded-full px-4 py-2 text-sm outline-none focus:ring-2 focus:ring-indigo-300" />
               {canalAtual === "whatsapp" && <button
@@ -1240,6 +1329,7 @@ export default function WhatsappPage() {
                 {sendManual.isLoading ? "..." : "Enviar"}
               </button>
             </form>
+            </div>
           ) : (
             <div className="bg-green-50 border-t border-green-100 px-4 py-2 text-xs text-center text-green-700">
               IA respondendo automaticamente · Clique em "Assumir Conversa" para intervir

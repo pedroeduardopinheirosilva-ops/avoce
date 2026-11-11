@@ -26,6 +26,7 @@ import { processarConclusao as processarAssinaturaConcluida } from "./modules/as
 import jwt                  from "jsonwebtoken";
 import { randomBytes }      from "node:crypto";
 import bcrypt               from "bcryptjs";
+import { extractCitacao }   from "./agent/webhook-parser.js";
 
 const PORT = parseInt(process.env.PORT ?? "8470");
 
@@ -232,7 +233,8 @@ app.get("/api/audio/:filename", async (req, reply) => {
   const safe = filename.replace(/[^a-zA-Z0-9_.-]/g, "_");
   const filePath = join(AUDIO_DIR_SERVE, safe);
   if (!existsSync(filePath)) return reply.status(404).send({ error: "Não encontrado" });
-  reply.type(safe.endsWith(".mp3") ? "audio/mpeg" : "audio/ogg");
+  const AUDIO_MIME: Record<string, string> = { mp3: "audio/mpeg", ogg: "audio/ogg", webm: "audio/webm", m4a: "audio/mp4", mp4: "audio/mp4", wav: "audio/wav" };
+  reply.type(AUDIO_MIME[safe.split(".").pop()?.toLowerCase() ?? ""] ?? "audio/ogg");
   return reply.send(createReadStream(filePath));
 });
 
@@ -1631,6 +1633,7 @@ async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
         midiaUrl,
         remetente,
         evolutionMessageId: msgId ?? null,
+        ...(extractCitacao(msg) ?? {}),
       },
     });
     // Resposta dada pelo atendente no próprio celular também é contato: mantém o deal no topo
