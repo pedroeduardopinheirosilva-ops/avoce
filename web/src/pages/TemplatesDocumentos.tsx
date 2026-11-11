@@ -10,6 +10,15 @@ const TIPOS = [
   { value: "OUTRO",      label: "Outro" },
 ] as const;
 
+// Blocos condicionais: o trecho só entra no documento quando o campo da proposta
+// estiver preenchido. Evita cláusula opcional virando buraco nas outras propostas.
+const CONDICIONAIS = [
+  { v: "honorariosExito", label: "só se houver êxito",        exemplo: "Parágrafo único. Será devido à CONTRATADA o percentual de {{honorariosExito}} sobre o proveito econômico obtido." },
+  { v: "administrador",   label: "só se houver representante", exemplo: "neste ato representada por {{administrador}}, {{qualificacaoAdministrador}}," },
+  { v: "diaVencimento",   label: "só se houver vencimento",    exemplo: "com vencimento no dia {{diaVencimento}} de cada mês," },
+  { v: "servico",         label: "só se houver serviço",       exemplo: "referente a {{servico}}." },
+];
+
 const VARIAVEIS = [
   // Escritório
   { v: "{{emitente}}",        desc: "Nome do escritório" },
@@ -50,6 +59,8 @@ const VARIAVEIS = [
   { v: "{{dataAtual}}",       desc: "Data atual" },
   { v: "{{validadeAte}}",     desc: "Validade da proposta (data formatada)" },
   { v: "{{servico}}",         desc: "Descrição do serviço (campo 'Descrição para NFS-e')" },
+  { v: "{{honorariosExito}}",     desc: "Honorários de êxito com % (ex: 20% ou 12,5%) — vazio se a proposta não tiver êxito" },
+  { v: "{{honorariosExitoPerc}}", desc: "Honorários de êxito só o número (ex: 20 ou 12,5)" },
 ];
 
 // Templates padrão — definidos localmente para não depender de fetch
@@ -82,6 +93,7 @@ function emptyForm(emitenteId = ""): TemplateForm {
 export default function TemplatesDocumentos() {
   const utils = trpc.useUtils();
   const editorRef = useRef<RichEditorHandle>(null);
+
   const [searchParams] = useSearchParams();
 
   const { data: empresas } = trpc.empresa.listar.useQuery();
@@ -111,6 +123,25 @@ export default function TemplatesDocumentos() {
   const [saving, setSaving] = useState(false);
   const [uploadingTimbrado, setUploadingTimbrado] = useState(false);
 
+  // Espelha a guarda do servidor (checarTemplate) para avisar enquanto se edita
+  const alertaModelo = (() => {
+    if (!form) return null;
+    const html   = form.textoHtml ?? "";
+    const texto  = html.replace(/<[^>]*>/g, " ");
+    const usadas = new Set([...html.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]));
+    const temParte = ["tomador", "cpfCnpj", "qualificacaoPJ", "qualificacaoPF",
+                      "administrador", "qualificacaoAdministrador", "enderecoTomador"]
+                      .some(v => usadas.has(v));
+    const cnpjEmit = (empresas?.find(e => e.id === form.emitenteId)?.cnpj ?? "").replace(/\D/g, "");
+    const alheios  = [...new Set((texto.match(/\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g) ?? [])
+      .map(v => v.replace(/\D/g, ""))
+      .filter(d => d.length === 14 && d !== cnpjEmit))];
+    const itens: string[] = [];
+    if (!temParte) itens.push("nenhuma variável do cliente no texto ({{tomador}}, {{cpfCnpj}}, {{enderecoTomador}}...)");
+    if (alheios.length) itens.push(`CNPJ de terceiro escrito no texto: ${alheios.join(", ")}`);
+    return itens.length ? itens : null;
+  })();
+
   function openNew() {
     const emitenteId = filterEmitenteId || empresas?.[0]?.id || "";
     setForm(emptyForm(emitenteId));
@@ -129,6 +160,10 @@ export default function TemplatesDocumentos() {
 
   function inserirVariavel(v: string) {
     editorRef.current?.insertText(v);
+  }
+
+  function inserirCondicional(v: string, exemplo: string) {
+    editorRef.current?.insertText(`{{#${v}}}${exemplo}{{/${v}}}`);
   }
 
   async function uploadTimbrado(file: File) {
@@ -168,16 +203,41 @@ export default function TemplatesDocumentos() {
     if (!form) return;
     setSaving(true);
     try {
-      if (form.id) {
-        await atualizar.mutateAsync({ id: form.id, titulo: form.titulo, textoHtml: form.textoHtml, tipo: form.tipo, ativo: form.ativo });
-      } else {
-        await criar.mutateAsync({ emitenteId: form.emitenteId, tipo: form.tipo, titulo: form.titulo, textoHtml: form.textoHtml });
-      }
+      await gravar(false);
       setForm(null);
     } catch (e: any) {
-      alert(e.message || "Erro ao salvar template");
+      const msg = String(e?.message ?? "");
+      // Guarda anti-contaminação do servidor: confirma antes de salvar um
+      // texto que não tem variável do cliente (vira contrato de cliente único)
+      if (msg.startsWith("TEMPLATE_SUSPEITO:")) {
+        const detalhe = msg.replace("TEMPLATE_SUSPEITO:", "").split(". Se for mesmo")[0].trim();
+        const ok = confirm(
+          `Atenção — este texto não parece um modelo:\n\n${detalhe}\n\n` +
+          "Se salvar assim, TODA proposta que usar este template vai gerar documento " +
+          "com esses dados fixos, e não com os do cliente.\n\nSalvar mesmo assim?",
+        );
+        if (ok) {
+          try {
+            await gravar(true);
+            setForm(null);
+          } catch (e2: any) {
+            alert(e2.message || "Erro ao salvar template");
+          }
+        }
+      } else {
+        alert(msg || "Erro ao salvar template");
+      }
     }
     setSaving(false);
+  }
+
+  async function gravar(forcar: boolean) {
+    if (!form) return;
+    if (form.id) {
+      await atualizar.mutateAsync({ id: form.id, titulo: form.titulo, textoHtml: form.textoHtml, tipo: form.tipo, ativo: form.ativo, forcar });
+    } else {
+      await criar.mutateAsync({ emitenteId: form.emitenteId, tipo: form.tipo, titulo: form.titulo, textoHtml: form.textoHtml, forcar });
+    }
   }
 
   async function remover(id: string, titulo: string) {
@@ -358,6 +418,45 @@ export default function TemplatesDocumentos() {
                 </div>
                 <p className="text-xs text-gray-400 mt-1">Clique em uma variável para inserir na posição do cursor.</p>
               </div>
+
+              {/* Blocos condicionais */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">Inserir cláusula opcional</label>
+                <div className="flex flex-wrap gap-1.5">
+                  {CONDICIONAIS.map(({ v, label, exemplo }) => (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => inserirCondicional(v, exemplo)}
+                      title={`Insere {{#${v}}}...{{/${v}}} — o trecho só entra no documento quando o campo estiver preenchido na proposta`}
+                      className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-700 hover:bg-emerald-100 rounded px-2 py-1 font-mono transition-colors"
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-gray-400 mt-1">
+                  Tudo que estiver entre <code className="font-mono">{"{{#campo}}"}</code> e <code className="font-mono">{"{{/campo}}"}</code> só
+                  aparece quando aquele campo estiver preenchido na proposta — nas demais, a cláusula some inteira, sem deixar espaço em branco.
+                  Use <code className="font-mono">{"{{^campo}}"}</code> para o texto que deve sair só quando o campo estiver <strong>vazio</strong>.
+                </p>
+              </div>
+
+              {/* Aviso: texto não parece um modelo */}
+              {alertaModelo && (
+                <div className="border border-amber-300 bg-amber-50 rounded-xl p-3">
+                  <p className="text-sm font-semibold text-amber-800">⚠️ Isto não parece um modelo</p>
+                  <ul className="mt-1 list-disc list-inside text-xs text-amber-800 space-y-0.5">
+                    {alertaModelo.map(a => <li key={a}>{a}</li>)}
+                  </ul>
+                  <p className="text-xs text-amber-700 mt-2">
+                    Template é modelo: os dados da parte têm que vir de variáveis. Se você colar um
+                    contrato já preenchido aqui, <strong>toda</strong> proposta que usar este template vai
+                    gerar documento com os dados desse cliente. Para ajustar o texto de um cliente só,
+                    gere o documento e use <strong>Editar</strong> no menu ⋮ da proposta.
+                  </p>
+                </div>
+              )}
 
               {/* Editor */}
               <div>

@@ -4,6 +4,7 @@ import { prisma }          from "../db.js";
 import { criarPix, sicoobPixConfigurado }    from "./sicoob-pix.js";
 import { criarBoleto, sicoobBoletoConfigurado } from "./sicoob-boleto.js";
 import { certPathForEmpresa }                from "../upload.js";
+import { calcularRetencoes }                 from "./nfse.js";
 import { enviarEmailCobranca }               from "./email-cobranca.js";
 import { fieldDecrypt }                      from "./field-crypto.js";
 import type { Prisma }                       from "@prisma/client";
@@ -32,12 +33,28 @@ export async function gerarCobrancaParaContrato(
   const comPix     = metodoCobr === "PIX_BOLETO" || metodoCobr === "PIX";
   const comBoleto  = metodoCobr === "PIX_BOLETO" || metodoCobr === "BOLETO";
 
+  // Havendo retenção, quem paga o tributo é o tomador: a NFS-e continua sendo
+  // emitida pelo valor cheio (ValorServicos) e a cobrança sai pelo líquido —
+  // mesmo valor que aparece como "Valor Líquido" no DANFSE.
+  const { total: retido, liquido: valorCobranca } = calcularRetencoes(contrato.valor, {
+    aliquotaIss: contrato.emitente.aliquotaIss,
+    issRetido:   contrato.issRetido || contrato.tomador.issRetido,
+    retirIr:     contrato.retirIr,
+    retirCsll:   contrato.retirCsll,
+    retirPis:    contrato.retirPis,
+    retirCofins: contrato.retirCofins,
+  });
+
+  if (retido > 0) {
+    console.log(`[Cobrança] Contrato ${contrato.id}: retenção de ${(retido / 100).toFixed(2)} — cobrando líquido ${(valorCobranca / 100).toFixed(2)} sobre bruto ${(contrato.valor / 100).toFixed(2)}`);
+  }
+
   const cobranca = await prisma.cobranca.create({
     data: {
       contratoId:  contrato.id,
       emitenteId:  contrato.emitenteId,
       competencia,
-      valor:       contrato.valor,
+      valor:       valorCobranca,
       vencimento,
     },
   });
@@ -67,14 +84,14 @@ export async function gerarCobrancaParaContrato(
       const dtVenc      = new Date(vencimento + "T12:00:00Z");
       const TRINTA_DIAS = 30 * 24 * 60 * 60;
       const expiracao   = Math.max(TRINTA_DIAS, Math.floor((dtVenc.getTime() - Date.now()) / 1000) + TRINTA_DIAS);
-      pixData = await criarPix(pCfg, { valor: contrato.valor, descricao: descPix, referencia: cobranca.id, expiracao });
+      pixData = await criarPix(pCfg, { valor: valorCobranca, descricao: descPix, referencia: cobranca.id, expiracao });
     } catch (e) { console.error(`[Cobrança] PIX falhou contrato ${contrato.id}:`, e); }
   }
 
   if (comBoleto && sicoobBoletoConfigurado(bCfg)) {
     try {
       boletoData = await criarBoleto(bCfg, {
-        valor:           contrato.valor,
+        valor:           valorCobranca,
         dataVencimento:  vencimento,
         seuNumero:       cobranca.id.slice(0, 15),
         instrucoes:      [`Ref: ${competencia} — ${contrato.nomeServico || contrato.emitente.nome}`],

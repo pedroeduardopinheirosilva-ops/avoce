@@ -9,6 +9,7 @@ import { resolve }                  from "node:path";
 import { request as httpsRequest }  from "node:https";
 import forge                        from "node-forge";
 import { SignedXml }                from "xml-crypto";
+import { emitirDps, proximoNDps, cancelarNfseDps, canalEmissao, canalDaNota, semConvenioNacional } from "./nfse-dps.js";
 
 // Legacy export kept for any direct imports
 export const WSDL = "https://ba-vitoriadaconquista-pm-nfs-backend.cloud.el.com.br/producao/NfseWSService";
@@ -40,12 +41,13 @@ export interface EmpresaConfig {
   codigoNbs?:              string;   // ex: "113019000" CodigoNbs sem máscara
   simplesNacional:         string;   // "1"=Simples, "2"=Não Simples
   regimeTributacao?:       string;   // ABRASF: RegimeEspecialTributacao / SPED: regEspTrib
-  nfseProvider?:           "el_vdc" | "issnet_df";
+  nfseProvider?:           "el_vdc" | "issnet_df" | "sefin_nacional";
   codigoMunicipioEmitente?: string;  // from EmpresaEmitente.codigoMunicipio
   codigoCnae?:             string;   // CNAE
   tpAmb?:                  "1" | "2"; // SPED: 1=producao (default), 2=homologacao
   pTotTribSN?:             string;   // SPED: Simples Nacional total tax %, ex: "11.60"
   regApTribSN?:            string;   // SPED: regime apuração Simples: "1" (default)
+  nfseToken?:              string;   // E&L DPS: token de integração (portal → Configurações → Integração)
 }
 
 function providerUrl(cfg: EmpresaConfig): string {
@@ -80,11 +82,15 @@ export interface TomadorNfse {
 }
 
 export interface NfseEmitida {
-  numero:      string;
-  codigoVerif: string;
-  dataEmissao: string;
-  linkNfse?:   string;
-  xmlRetorno:  string;
+  numero:       string;
+  codigoVerif:  string;
+  dataEmissao:  string;
+  linkNfse?:    string;
+  xmlRetorno:   string;
+  nDps?:        number;   // E&L DPS
+  idDps?:       string;
+  chaveAcesso?: string;
+  pendente?:    boolean;  // DPS recebida e ainda em processamento no Ambiente Nacional
 }
 
 export interface NfseStatus {
@@ -101,7 +107,7 @@ export interface NfseStatus {
 interface CertData { privateKeyPem: string; certBase64: string; certPem: string; }
 const _certCache = new Map<string, CertData>();
 
-function getCert(cfg: EmpresaConfig): CertData {
+export function getCert(cfg: EmpresaConfig): CertData {
   const cached = _certCache.get(cfg.certPath);
   if (cached) return cached;
 
@@ -138,7 +144,7 @@ export function invalidarCacheCert(certPath: string) {
 
 // ── XMLDSig ───────────────────────────────────────────────────────────────────
 
-function assinarXml(xml: string, refId: string, cfg: EmpresaConfig, sigParent?: string): string {
+export function assinarXml(xml: string, refId: string, cfg: EmpresaConfig, sigParent?: string): string {
   const { privateKeyPem, certBase64 } = getCert(cfg);
 
   const sig = new SignedXml({
@@ -233,7 +239,7 @@ const CABECALHO_XML = `<?xml version="1.0" encoding="UTF-8"?><cabecalho versao="
 const CABECALHO_DF  = `<cabecalho versao="1.00" xmlns="http://www.abrasf.org.br/nfse.xsd"><versaoDados>2.04</versaoDados></cabecalho>`;
 const DF_NS         = "http://nfse.abrasf.org.br";
 
-function escXml(s: string): string {
+export function escXml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
@@ -352,6 +358,43 @@ const ALIQ_CSLL   = 0.010;  // 1,0%
 const ALIQ_PIS    = 0.0065; // 0,65%
 const ALIQ_COFINS = 0.030;  // 3,0%
 
+export type Retencoes = {
+  iss: number; ir: number; csll: number; pis: number; cofins: number;
+  total: number; liquido: number;
+};
+
+/**
+ * Retenções e valor líquido de um faturamento, em centavos.
+ *
+ * Espelha exatamente o cálculo do RPS (reais com 2 casas, arredondado por
+ * tributo) para que o líquido bata com o "Valor Líquido" do DANFSE — é esse
+ * valor que o tomador efetivamente paga quando há retenção.
+ */
+export function calcularRetencoes(
+  valorCentavos: number,
+  opts: {
+    aliquotaIss: number;
+    issRetido?:  boolean;
+    retirIr?:     boolean;
+    retirCsll?:   boolean;
+    retirPis?:    boolean;
+    retirCofins?: boolean;
+  },
+): Retencoes {
+  const base = valorCentavos / 100;
+  const ret  = (aplica: boolean | undefined, aliq: number) =>
+    aplica ? Math.round(Number((base * aliq).toFixed(2)) * 100) : 0;
+
+  const iss    = ret(opts.issRetido,   opts.aliquotaIss);
+  const ir     = ret(opts.retirIr,     ALIQ_IR);
+  const csll   = ret(opts.retirCsll,   ALIQ_CSLL);
+  const pis    = ret(opts.retirPis,    ALIQ_PIS);
+  const cofins = ret(opts.retirCofins, ALIQ_COFINS);
+  const total  = iss + ir + csll + pis + cofins;
+
+  return { iss, ir, csll, pis, cofins, total, liquido: valorCentavos - total };
+}
+
 export async function emitirNfse(
   empresaId: string,
   cfg: EmpresaConfig,
@@ -367,123 +410,54 @@ export async function emitirNfse(
     retirCsll?:       boolean;
     retirPis?:        boolean;
     retirCofins?:     boolean;
+    nDps?:            number;   // reenvio de uma DPS já numerada (mesmo idDPS)
   }
 ): Promise<NfseEmitida> {
   if (!cfg.inscricaoMunicipal) throw new Error("[NFS-e] Inscrição Municipal não configurada");
 
-  if (cfg.nfseProvider === "issnet_df") {
+  const nacional = canalEmissao(cfg) === "sefin";
+  if (cfg.nfseProvider === "issnet_df" && !nacional) {
     return emitirNfse_DF(empresaId, cfg, params);
   }
 
-  // ── ABRASF 2.04 (el_vdc e outros) ────────────────────────────────────────
-  const rpsNum       = nextRps(empresaId);
-  const agora        = new Date();
-  const agoraBrt     = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
-  const dataEmissao  = agoraBrt.toISOString().slice(0, 10);
-  const competencia  = (params.competencia ?? agoraBrt.toISOString().slice(0, 7)) + "-01";
-  const valorStr     = (params.valor / 100).toFixed(2);
-  const aliquota     = cfg.aliquotaIss;
-  const valorIss     = ((params.valor / 100) * aliquota).toFixed(2);
-  const issRetido    = params.issRetido ? "1" : "2";
-  const refId        = `Rps${rpsNum}`;
-  const itemLS       = params.itemListaServico || cfg.itemListaServico;
-  const municipio    = providerMunicipio(cfg);
-  const serie        = providerSerie(cfg);
-  const url          = providerUrl(cfg);
+  // ── DPS no leiaute nacional: E&L (Vitória da Conquista, cujo ABRASF só aceita
+  // consultas desde 01/10/2026 — E999) ou Emissor Nacional (Simples, desde 01/11/2026)
+  const nDps = params.nDps ?? await proximoNDps();
+  let r: Awaited<ReturnType<typeof emitirDps>>;
+  try {
+    r = await emitirDps(cfg, { ...params, nDps });
+  } catch (err) {
+    // Município ainda fora do convênio do Emissor Nacional: segue pelo ISSNet (DF)
+    if (cfg.nfseProvider === "issnet_df" && semConvenioNacional(err)) return emitirNfse_DF(empresaId, cfg, params);
+    throw err;
+  }
+  return {
+    numero:      r.numero ?? "",
+    codigoVerif: r.chaveAcesso ?? "",
+    dataEmissao: r.dataEmissao ?? new Date().toISOString().slice(0, 10),
+    linkNfse:    r.linkNfse,
+    xmlRetorno:  r.xmlNfse ?? "",
+    nDps,
+    idDps:       r.idDps,
+    chaveAcesso: r.chaveAcesso,
+    pendente:    r.processando,
+  };
+}
 
-  const baseRetencao = params.valor / 100;
-  const valorIr     = (params.retirIr     ? baseRetencao * ALIQ_IR     : 0).toFixed(2);
-  const valorCsll   = (params.retirCsll   ? baseRetencao * ALIQ_CSLL   : 0).toFixed(2);
-  const valorPis    = (params.retirPis    ? baseRetencao * ALIQ_PIS    : 0).toFixed(2);
-  const valorCofins = (params.retirCofins ? baseRetencao * ALIQ_COFINS : 0).toFixed(2);
-
-  const cpfCnpjTomador = params.tomador.cpfCnpj.replace(/\D/g, "");
-  const isCnpj         = cpfCnpjTomador.length === 14;
-  const tagCpfCnpj     = isCnpj
-    ? `<Cnpj>${cpfCnpjTomador}</Cnpj>`
-    : `<Cpf>${cpfCnpjTomador}</Cpf>`;
-
-  const cnpjLimpo = cfg.cnpj.replace(/\D/g, "");
-
-  const rpsXml = `<?xml version="1.0" encoding="UTF-8"?>
-<GerarNfseEnvio xmlns="http://www.abrasf.org.br/nfse.xsd">
-  <Rps>
-    <InfDeclaracaoPrestacaoServico Id="${refId}">
-      <Rps>
-        <IdentificacaoRps>
-          <Numero>${rpsNum}</Numero>
-          <Serie>${serie}</Serie>
-          <Tipo>1</Tipo>
-        </IdentificacaoRps>
-        <DataEmissao>${dataEmissao}</DataEmissao>
-        <Status>1</Status>
-      </Rps>
-      <Competencia>${competencia}</Competencia>
-      <Servico>
-        <Valores>
-          <ValorServicos>${valorStr}</ValorServicos>
-          <ValorDeducoes>0.00</ValorDeducoes>
-          <ValorPis>${valorPis}</ValorPis>
-          <ValorCofins>${valorCofins}</ValorCofins>
-          <ValorInss>0.00</ValorInss>
-          <ValorIr>${valorIr}</ValorIr>
-          <ValorCsll>${valorCsll}</ValorCsll>
-          <OutrasRetencoes>0.00</OutrasRetencoes>
-          <ValorIss>${valorIss}</ValorIss>
-          <Aliquota>${(aliquota * 100).toFixed(4)}</Aliquota>
-          <DescontoIncondicionado>0.00</DescontoIncondicionado>
-          <DescontoCondicionado>0.00</DescontoCondicionado>
-        </Valores>
-        <IssRetido>${issRetido}</IssRetido>
-        <ItemListaServico>${itemLS}</ItemListaServico>
-        ${cfg.codTributacao ? `<CodigoTributacaoMunicipio>${cfg.codTributacao}</CodigoTributacaoMunicipio>` : ""}
-        ${cfg.codigoServicoNacional ? `<CodigoServicoNacional>${cfg.codigoServicoNacional.replace(/\D/g, "")}</CodigoServicoNacional>` : ""}
-        ${(params.codigoNbs ?? cfg.codigoNbs) ? `<CodigoNbs>${(params.codigoNbs ?? cfg.codigoNbs)!.replace(/\D/g, "")}</CodigoNbs>` : ""}
-        ${cfg.codigoCnae ? `<CodigoCnae>${cfg.codigoCnae.replace(/\D/g, "")}</CodigoCnae>` : ""}
-        <Discriminacao>${params.discriminacao.slice(0, 2000)}</Discriminacao>
-        <CodigoMunicipio>${municipio}</CodigoMunicipio>
-        <ExigibilidadeISS>1</ExigibilidadeISS>
-        <MunicipioIncidencia>${municipio}</MunicipioIncidencia>
-      </Servico>
-      <Prestador>
-        <CpfCnpj><Cnpj>${cnpjLimpo}</Cnpj></CpfCnpj>
-        <InscricaoMunicipal>${cfg.inscricaoMunicipal}</InscricaoMunicipal>
-      </Prestador>
-      <TomadorServico>
-        <IdentificacaoTomador>
-          <CpfCnpj>${tagCpfCnpj}</CpfCnpj>
-          ${params.tomador.inscMunicipal ? `<InscricaoMunicipal>${params.tomador.inscMunicipal}</InscricaoMunicipal>` : ""}
-        </IdentificacaoTomador>
-        <RazaoSocial>${params.tomador.nome}</RazaoSocial>
-        <Endereco>
-          <Endereco>${params.tomador.endereco}</Endereco>
-          <Numero>${params.tomador.numero ?? "S/N"}</Numero>
-          <Bairro>${params.tomador.bairro}</Bairro>
-          <CodigoMunicipio>${params.tomador.codigoMunicipio}</CodigoMunicipio>
-          <Uf>${params.tomador.uf}</Uf>
-          <Cep>${params.tomador.cep.replace(/\D/g, "")}</Cep>
-        </Endereco>
-        ${params.tomador.email ? `<Contato><Email>${params.tomador.email}</Email></Contato>` : ""}
-      </TomadorServico>
-      ${cfg.regimeTributacao ? `<RegimeEspecialTributacao>${cfg.regimeTributacao}</RegimeEspecialTributacao>` : ""}
-      <OptanteSimplesNacional>${cfg.simplesNacional === "1" ? "1" : "2"}</OptanteSimplesNacional>
-      <IncentivoFiscal>2</IncentivoFiscal>
-    </InfDeclaracaoPrestacaoServico>
-  </Rps>
-</GerarNfseEnvio>`;
-
-  const signedXml  = assinarXml(rpsXml, refId, cfg);
-  const soapResp   = await chamaSoap("GerarNfse", signedXml, url, cfg);
-  const retornoXml = extrairRetorno(soapResp);
-  verificaErro(retornoXml);
-
-  const numero      = extrairTag(retornoXml, "Numero");
-  const codigoVerif = extrairTag(retornoXml, "CodigoVerificacao");
-  const dataEmit    = extrairTag(retornoXml, "DataEmissaoNfse") || dataEmissao;
-  const linkNfse    = extrairTag(retornoXml, "LinkNfse") || undefined;
-
-  console.log(`[NFS-e] Emitida nº ${numero} empresa=${empresaId}`);
-  return { numero, codigoVerif, dataEmissao: dataEmit, linkNfse, xmlRetorno: retornoXml };
+/** Campos da NotaFiscal após a emissão. DPS ainda em processamento continua PENDENTE
+ *  (o cron reconciliarDpsPendentes conclui) — PENDENTE já bloqueia reemissão na competência. */
+export function dadosNotaEmitida(r: NfseEmitida) {
+  const dps = { nDps: r.nDps, idDps: r.idDps, chaveAcesso: r.chaveAcesso };
+  if (r.pendente) return { status: "PENDENTE", ...dps };
+  return {
+    status:      "EMITIDA",
+    numero:      r.numero,
+    codigoVerif: r.codigoVerif,
+    xmlRetorno:  r.xmlRetorno,
+    linkNfse:    r.linkNfse,
+    emitidoEm:   new Date(),
+    ...dps,
+  };
 }
 
 // ── Emitir NFS-e ABRASF 2.04 — ISSNet/DF ────────────────────────────────────
@@ -601,7 +575,16 @@ function assinarCancelDf(xmlStr: string, refId: string, cfg: EmpresaConfig): str
   return xmlStr.replace(`${infClose}</Pedido>`, `${infClose}${sigElement}</Pedido>`);
 }
 
-export async function cancelarNfse(cfg: EmpresaConfig, numeroNfse: string): Promise<void> {
+export async function cancelarNfse(
+  cfg: EmpresaConfig, numeroNfse: string, chaveAcesso?: string | null, xmlRetorno?: string | null,
+): Promise<void> {
+  // NFS-e emitida por DPS: cancela pelo evento nacional, no canal que a gerou
+  // (o ABRASF da E&L não cancela mais)
+  if (chaveAcesso) {
+    await cancelarNfseDps(cfg, chaveAcesso, canalDaNota(xmlRetorno));
+    return;
+  }
+
   const refId     = `Can${numeroNfse}`;
   const cnpjLimpo = cfg.cnpj.replace(/\D/g, "");
   const municipio = providerMunicipio(cfg);

@@ -12,10 +12,12 @@ import { renderTemplate }              from "./template.js";
 import { gerarCartaCobrancaHtml }      from "./cobranca-html.js";
 import { gerarBoletoHtml }             from "./boleto-html.js";
 import { htmlToPdf }                   from "./pdf.js";
-import { LOGOS_DIR }                   from "../upload.js";
+import { LOGOS_DIR, certPathForEmpresa } from "../upload.js";
 import type { SmtpConfig }             from "./email.js";
 import { sendMailAndSave }             from "./email.js";
 import { fieldDecrypt }                from "./field-crypto.js";
+import { obterDanfsePdf }              from "./danfse.js";
+import type { EmpresaConfig }          from "./nfse.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -566,7 +568,7 @@ function corpoEmail(params: {
                     <a href="${params.nfseLinkNfse}"
                        style="display:inline-block;background:#4f46e5;color:#fff;text-decoration:none;
                               font-size:11px;font-weight:bold;padding:7px 12px;border-radius:6px;">
-                      🏛️ Baixar NFS-e no portal da Prefeitura →
+                      🏛️ Consultar NFS-e →
                     </a>
                   </td>` : ""}
                   ${params.nfseTemXml ? `
@@ -636,6 +638,50 @@ function corpoEmail(params: {
 </body></html>`;
 }
 
+// ── Helpers compartilhados (cobrança e NFS-e) ────────────────────────────────
+
+type EmitenteEmail = {
+  id: string; cnpj: string; certPass: string | null; codigoMunicipio: string | null;
+  nfseProvider: string | null; nfseTpAmb: string | null; inscricaoMunicipal: string;
+  smtpHost: string | null; smtpPort: number | null; smtpUser: string | null; smtpPass: string | null; smtpFrom: string | null;
+};
+
+/** Usa emailsCobranca do contrato se configurados; senão o e-mail principal do tomador. */
+function destinatariosDoContrato(contrato: { emailsCobranca?: string[] | null; tomador: { email: string | null } }): string[] {
+  const emailsContrato = contrato.emailsCobranca ?? [];
+  return emailsContrato.length > 0
+    ? [...new Set(emailsContrato)]
+    : (contrato.tomador.email ? [contrato.tomador.email] : []);
+}
+
+function smtpDoEmitente(emp: EmitenteEmail): SmtpConfig {
+  // Montar o campo "from" corretamente: se smtpFrom não contém "@", é um nome
+  // de exibição e precisa ser combinado com o smtpUser
+  const fromEmail = emp.smtpUser!;
+  const fromName  = emp.smtpFrom && !emp.smtpFrom.includes("@") ? emp.smtpFrom : null;
+  return {
+    host:   emp.smtpHost!,
+    port:   emp.smtpPort ?? 587,
+    secure: emp.smtpPort === 465,   // SSL apenas se porta for explicitamente 465
+    user:   fromEmail,
+    pass:   fieldDecrypt(emp.smtpPass),
+    from:   fromName ? `"${fromName}" <${fromEmail}>` : (emp.smtpFrom ?? fromEmail),
+  };
+}
+
+/** Configuração mínima para usar o A1 do emitente (DANFSe no ADN / portal E&L). */
+function cfgCertificado(emp: EmitenteEmail): EmpresaConfig {
+  return {
+    cnpj: emp.cnpj, inscricaoMunicipal: emp.inscricaoMunicipal,
+    certPath: certPathForEmpresa(emp.id),
+    certPass: fieldDecrypt(emp.certPass) || process.env[`CERT_PASS_${emp.id}`] || process.env.CERT_PASS_DEFAULT || "",
+    aliquotaIss: 0, itemListaServico: "", codTributacao: "", simplesNacional: "",
+    nfseProvider: (emp.nfseProvider as EmpresaConfig["nfseProvider"]) ?? undefined,
+    codigoMunicipioEmitente: emp.codigoMunicipio ?? undefined,
+    tpAmb: (emp.nfseTpAmb as EmpresaConfig["tpAmb"]) ?? undefined,
+  };
+}
+
 // ── Função principal ──────────────────────────────────────────────────────────
 
 export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
@@ -648,38 +694,37 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
     return;
   }
 
+  // Helper: registra o resultado do envio na própria cobrança (monitor de saúde)
+  const marcar = (patch: {
+    emailStatus: string; emailErro?: string | null; emailEnviadoEm?: Date | null;
+    emailDestinatarios?: string[];
+  }) =>
+    prisma.cobranca.update({
+      where: { id: cobrancaId },
+      data: {
+        ...patch,
+        emailTentativas:   { increment: 1 },
+        emailUltTentativa: new Date(),
+      },
+    }).catch((e) => console.error(`[Email-Cob] Falha ao registrar status ${cobrancaId}:`, e));
+
   // ── SMTP ──
   const emp = cobranca.emitente;
   if (!emp.smtpHost || !emp.smtpUser) {
     console.log(`[Email-Cob] SMTP não configurado para empresa ${emp.nome} — e-mail não enviado`);
+    await marcar({ emailStatus: "FALHA", emailErro: "SMTP não configurado para a empresa" });
     return;
   }
 
-  // Usa emailsCobranca do contrato se configurados; senão cai no email principal do tomador
-  const emailsContrato: string[] = (cobranca.contrato as any).emailsCobranca ?? [];
-  const destinatarios: string[] = emailsContrato.length > 0
-    ? [...new Set(emailsContrato)]
-    : (cobranca.contrato.tomador.email ? [cobranca.contrato.tomador.email] : []);
+  const destinatarios = destinatariosDoContrato(cobranca.contrato);
 
   if (!destinatarios.length) {
     console.log(`[Email-Cob] Cobrança ${cobrancaId}: sem e-mails cadastrados — não enviado`);
+    await marcar({ emailStatus: "FALHA", emailErro: "Nenhum e-mail cadastrado para o tomador/contrato" });
     return;
   }
 
-  // Montar o campo "from" corretamente: se smtpFrom não contém "@", é um nome
-  // de exibição e precisa ser combinado com o smtpUser
-  const fromEmail = emp.smtpUser;
-  const fromName  = emp.smtpFrom && !emp.smtpFrom.includes("@") ? emp.smtpFrom : null;
-  const fromField = fromName ? `"${fromName}" <${fromEmail}>` : (emp.smtpFrom ?? fromEmail);
-
-  const smtp: SmtpConfig = {
-    host:   emp.smtpHost,
-    port:   emp.smtpPort ?? 587,
-    secure: emp.smtpPort === 465,   // SSL apenas se porta for explicitamente 465
-    user:   emp.smtpUser,
-    pass:   fieldDecrypt(emp.smtpPass),
-    from:   fromField,
-  };
+  const smtp = smtpDoEmitente(emp);
 
   // ── Variáveis de template ──
   const vars = {
@@ -706,13 +751,16 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
   const sicoobLogo   = loadSicoobLogo();
 
   // ── QR code para a carta de cobrança (URL de autenticidade NFS-e) ──
+  // NFS-e por DPS (leiaute nacional): consulta pública nacional pela chave; a
+  // autenticação da E&L por código de verificação só vale para as notas ABRASF.
+  const nfseDps  = !!notaFiscal?.chaveAcesso;
+  const nfseLink = (nfseDps || !notaFiscal?.codigoVerif
+    ? notaFiscal?.linkNfse
+    : urlAutenticidadeNfse(emp.cnpj, notaFiscal.codigoVerif)) ?? undefined;
+  const nfseCodigoVerif = nfseDps ? undefined : notaFiscal?.codigoVerif ?? undefined;
   let nfseQrcodeBase64: string | undefined;
-  if (notaFiscal?.codigoVerif) {
-    const nfseUrlAuth = urlAutenticidadeNfse(emp.cnpj, notaFiscal.codigoVerif);
-    try { nfseQrcodeBase64 = await QRCode.toDataURL(nfseUrlAuth, { width: 80, margin: 1 }); }
-    catch { /* ignora */ }
-  } else if (notaFiscal?.linkNfse) {
-    try { nfseQrcodeBase64 = await QRCode.toDataURL(notaFiscal.linkNfse, { width: 80, margin: 1 }); }
+  if (nfseLink) {
+    try { nfseQrcodeBase64 = await QRCode.toDataURL(nfseLink, { width: 80, margin: 1 }); }
     catch { /* ignora */ }
   }
 
@@ -759,8 +807,8 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
       nfse: notaFiscal ? {
         numero:        notaFiscal.numero!,
         emitidoEm:     notaFiscal.emitidoEm,
-        codigoVerif:   notaFiscal.codigoVerif,
-        linkNfse:      notaFiscal.linkNfse,
+        codigoVerif:   nfseCodigoVerif,
+        linkNfse:      nfseLink,
         qrcodeBase64:  nfseQrcodeBase64,
       } : undefined,
     });
@@ -888,7 +936,10 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
 
   // ── Gerar PDF da NFS-e ──
   let nfsePdf: Buffer | undefined;
-  if (notaFiscal) {
+  if (notaFiscal?.chaveAcesso) {
+    try { nfsePdf = await obterDanfsePdf(cfgCertificado(emp), notaFiscal.chaveAcesso); }
+    catch (err) { console.error(`[Email-Cob] Falha ao obter DANFSe ${notaFiscal.chaveAcesso}:`, err); }
+  } else if (notaFiscal) {
     try {
       const nfseUrlAuth = notaFiscal.codigoVerif
         ? urlAutenticidadeNfse(emp.cnpj, notaFiscal.codigoVerif)
@@ -974,8 +1025,8 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
     valor:                cobranca.valor,
     nomeServico:          cobranca.contrato.nomeServico ?? undefined,
     nfseNumero:           notaFiscal?.numero            ?? undefined,
-    nfseLinkNfse:         (notaFiscal?.codigoVerif ? urlAutenticidadeNfse(emp.cnpj, notaFiscal.codigoVerif) : notaFiscal?.linkNfse) ?? undefined,
-    nfseCodigoVerif:      notaFiscal?.codigoVerif       ?? undefined,
+    nfseLinkNfse:         nfseLink,
+    nfseCodigoVerif:      nfseCodigoVerif,
     nfseQrcodeHasCid:     !!nfseQrcodeBuffer,
     nfseTemXml:           !!(notaFiscal?.xmlRetorno),
     pixBrcode:            cobranca.pixBrcode            ?? undefined,
@@ -997,7 +1048,135 @@ export async function enviarEmailCobranca(cobrancaId: string): Promise<void> {
       attachments,
     });
     console.log(`[Email-Cob] Cobrança ${cobrancaId} enviada para ${destinatarios.join(", ")}${bccEmail ? ` (bcc: ${bccEmail})` : ""} (msgId=${info.messageId})`);
+    await marcar({
+      emailStatus:       "ENVIADO",
+      emailErro:         null,
+      emailEnviadoEm:    new Date(),
+      emailDestinatarios: destinatarios,
+    });
+    if (notaFiscal && (nfsePdf || notaFiscal.xmlRetorno)) {
+      await prisma.notaFiscal.update({ where: { id: notaFiscal.id }, data: { emailEnviadoEm: new Date() } })
+        .catch((e) => console.error(`[Email-Cob] Falha ao marcar NFS-e ${notaFiscal.id} como enviada:`, e));
+    }
   } catch (err) {
     console.error(`[Email-Cob] Falha ao enviar cobrança ${cobrancaId}:`, err);
+    await marcar({
+      emailStatus:       "FALHA",
+      emailErro:         (err instanceof Error ? err.message : String(err)).slice(0, 500),
+      emailDestinatarios: destinatarios,
+    });
   }
+}
+
+// ── NFS-e avulsa (sem cobrança no mesmo e-mail) ──────────────────────────────
+
+function corpoEmailNfse(p: {
+  tomadorNome: string; emitenteNome: string; nomeServico?: string | null; competencia: string;
+  numero: string; valor: number; chaveAcesso?: string | null; linkNfse?: string | null; semPdf?: boolean;
+  emitenteEmail?: string | null; emitenteTelefone?: string | null; cobrancaJaEnviada: boolean;
+}): string {
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<div style="font-family:Arial,sans-serif;font-size:14px;color:#333;max-width:600px">
+<p>Prezado(a) <strong>${esc(p.tomadorNome)}</strong>,</p>
+<p>Segue em anexo a Nota Fiscal de Serviços Eletrônica referente a <strong>${esc(p.nomeServico || "honorários advocatícios")}</strong>, competência <strong>${esc(p.competencia)}</strong>, emitida por ${esc(p.emitenteNome)}.</p>
+<table style="border-collapse:collapse;margin:16px 0;font-size:13px">
+<tr><td style="padding:4px 16px 4px 0;color:#666">NFS-e nº</td><td><strong>${esc(p.numero)}</strong></td></tr>
+<tr><td style="padding:4px 16px 4px 0;color:#666">Valor</td><td><strong>${fmtValor(p.valor)}</strong></td></tr>
+${p.chaveAcesso ? `<tr><td style="padding:4px 16px 4px 0;color:#666">Chave de acesso</td><td style="font-family:monospace;font-size:12px">${esc(p.chaveAcesso)}</td></tr>` : ""}
+</table>
+${p.semPdf
+  ? `<p>Em anexo: arquivo XML da nota. O DANFSe (PDF) pode ser visualizado e baixado na <a href="${p.linkNfse || `https://www.nfse.gov.br/ConsultaPublica/?tpc=1&chave=${p.chaveAcesso ?? ""}`}">consulta pública da NFS-e</a>, informando a chave de acesso acima.</p>`
+  : `<p>Em anexo: DANFSe (PDF) e o arquivo XML da nota.${p.linkNfse ? ` A autenticidade pode ser conferida em <a href="${p.linkNfse}">consulta pública da NFS-e</a>.` : ""}</p>`}
+${p.cobrancaJaEnviada ? `<p>O boleto desta competência foi enviado anteriormente, em mensagem separada.</p>` : ""}
+<p>Atenciosamente,<br><strong>${esc(p.emitenteNome)}</strong><br>${esc(p.emitenteEmail ?? "")}${p.emitenteTelefone ? ` · ${esc(p.emitenteTelefone)}` : ""}</p>
+</div>`;
+}
+
+/** Envia ao tomador a NFS-e (DANFSe PDF + XML), sem cobrança. Marca emailEnviadoEm. */
+export async function enviarEmailNfse(notaId: string, opts: { permitirSemPdf?: boolean } = {}): Promise<void> {
+  const nota = await prisma.notaFiscal.findUnique({
+    where:   { id: notaId },
+    include: { emitente: true, contrato: { include: { tomador: true } } },
+  });
+  if (!nota || nota.status !== "EMITIDA" || !nota.numero) return;
+  const emp = nota.emitente;
+  if (!emp.smtpHost || !emp.smtpUser) {
+    console.log(`[Email-NFSe] SMTP não configurado para ${emp.nome} — NFS-e ${nota.numero} não enviada`);
+    return;
+  }
+  const destinatarios = destinatariosDoContrato(nota.contrato);
+  if (!destinatarios.length) {
+    console.log(`[Email-NFSe] NFS-e ${nota.numero}: sem e-mails cadastrados — não enviada`);
+    return;
+  }
+
+  const attachments: { filename: string; contentType: string; content: Buffer }[] = [];
+  if (nota.chaveAcesso) {
+    try {
+      attachments.push({
+        filename: `NFS-e_${nota.numero}.pdf`, contentType: "application/pdf",
+        content:  await obterDanfsePdf(cfgCertificado(emp), nota.chaveAcesso),
+      });
+    } catch (err) {
+      console.error(`[Email-NFSe] Falha ao obter DANFSe da NFS-e ${nota.numero}:`, err);
+    }
+  }
+  if (nota.xmlRetorno) {
+    attachments.push({ filename: `NFS-e_${nota.numero}.xml`, contentType: "application/xml", content: Buffer.from(nota.xmlRetorno) });
+  }
+  const semPdf = !attachments.some(a => a.contentType === "application/pdf");
+  // permitirSemPdf: envio manual com o ADN fora do ar (XML + link da consulta pública)
+  if (semPdf && !(opts.permitirSemPdf && nota.xmlRetorno && nota.chaveAcesso)) {
+    console.error(`[Email-NFSe] NFS-e ${nota.numero}: DANFSe indisponível — não enviada (o cron tenta de novo)`);
+    return;
+  }
+
+  const cobranca = await prisma.cobranca.findFirst({
+    where: { contratoId: nota.contratoId, competencia: nota.competencia, emailStatus: "ENVIADO" },
+  });
+  const emitenteNome = emp.nomeFantasia || emp.nome;
+  const smtp = smtpDoEmitente(emp);
+  try {
+    const info = await sendMailAndSave(smtp, {
+      from:    smtp.from,
+      to:      destinatarios.join(", "),
+      subject: `NFS-e nº ${nota.numero} — ${emitenteNome} — ${nota.competencia}`,
+      html:    corpoEmailNfse({
+        tomadorNome: nota.contrato.tomador.nome, emitenteNome, nomeServico: nota.contrato.nomeServico,
+        competencia: nota.competencia, numero: nota.numero, valor: nota.valor,
+        chaveAcesso: nota.chaveAcesso, linkNfse: nota.linkNfse,
+        emitenteEmail: emp.email, emitenteTelefone: emp.telefone, cobrancaJaEnviada: !!cobranca,
+        semPdf,
+      }),
+      attachments,
+    });
+    await prisma.notaFiscal.update({ where: { id: nota.id }, data: { emailEnviadoEm: new Date() } });
+    console.log(`[Email-NFSe] NFS-e ${nota.numero} enviada para ${destinatarios.join(", ")} (msgId=${info.messageId})`);
+  } catch (err) {
+    console.error(`[Email-NFSe] Falha ao enviar NFS-e ${nota.numero}:`, err);
+  }
+}
+
+/**
+ * Entrega a NFS-e ao tomador sem duplicar com o e-mail de cobrança:
+ * - se a cobrança da competência ainda vai sair (existe e não foi enviada, ou o
+ *   contrato gera cobrança automática e ela ainda não existe), a NFS-e segue
+ *   anexada nela;
+ * - se a cobrança já saiu (sem a nota) ou o contrato não gera cobrança, envia avulsa.
+ */
+export async function enviarNfseSeNecessario(notaId: string): Promise<void> {
+  const nota = await prisma.notaFiscal.findUnique({ where: { id: notaId }, include: { contrato: true } });
+  if (!nota || nota.status !== "EMITIDA" || nota.emailEnviadoEm) return;
+
+  const cobranca = await prisma.cobranca.findFirst({
+    where: { contratoId: nota.contratoId, competencia: nota.competencia },
+    orderBy: { criadoEm: "desc" },
+  });
+  const c = nota.contrato as any;
+  const geraCobranca = c.gerarCobrancaAuto !== false && c.metodoCobr !== "NENHUM" && c.metodoCobr !== "ALVARA";
+
+  // emailStatus nulo = cobrança anterior ao monitor de envio; trata como já enviada
+  if (cobranca?.emailStatus && cobranca.emailStatus !== "ENVIADO") return;   // vai junto da cobrança
+  if (!cobranca && geraCobranca) return;                         // cobrança ainda será gerada
+  await enviarEmailNfse(notaId);
 }

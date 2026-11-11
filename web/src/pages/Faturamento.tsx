@@ -66,15 +66,29 @@ export default function Faturamento() {
 
   const faturarLote = trpc.nota.faturarLote.useMutation();
 
-  // Contrato faturado = tem cobrança neste mês
+  const { data: notasMes, refetch: refetchNotas } = trpc.nota.listar.useQuery(
+    { competencia, pageSize: 500 },
+    { enabled: !!competencia }
+  );
+
   const cobPorContrato = new Set<string>(
     (cobrancasMes?.cobrancas ?? [])
       .filter(c => c.contrato?.id)
       .map(c => c.contrato!.id)
   );
 
-  const pendentes   = (contratos ?? []).filter((c) => !cobPorContrato.has(c.id));
-  const jaFaturados = (contratos ?? []).filter((c) =>  cobPorContrato.has(c.id));
+  // Nota que falhou (ERRO) não conta: o contrato volta para pendente só da NFS-e.
+  // faturarLote pula a cobrança quando ela já existe, então o boleto não duplica.
+  const notaOkPorContrato = new Set<string>(
+    (notasMes?.notas ?? [])
+      .filter(n => n.status === "EMITIDA" || n.status === "PENDENTE")
+      .map(n => n.contratoId)
+  );
+  const faltaNota = (c: any) => c.nfseAoFaturar !== false && !notaOkPorContrato.has(c.id);
+
+  // Contrato faturado = tem cobrança neste mês e, se emite NFS-e, nota emitida
+  const pendentes   = (contratos ?? []).filter((c) => !cobPorContrato.has(c.id) || faltaNota(c));
+  const jaFaturados = (contratos ?? []).filter((c) =>  cobPorContrato.has(c.id) && !faltaNota(c));
 
   function toggleTodos() {
     if (selecionados.size === pendentes.length) setSelecionados(new Set());
@@ -100,6 +114,7 @@ export default function Faturamento() {
       utils.nota.listar.invalidate();
       utils.cobranca.listar.invalidate();
       refetchCobrancas();
+      refetchNotas();
     } finally {
       setProcessando(false);
     }
@@ -278,6 +293,9 @@ export default function Faturamento() {
                     <span className="text-gray-400 text-xs">←</span>
                     <span className="text-xs text-gray-500 truncate">{c.emitente.nome}</span>
                     <ModoBadge c={c} />
+                    {cobPorContrato.has(c.id) && (
+                      <span className="text-xs bg-amber-50 text-amber-700 border border-amber-200 px-2 py-0.5 rounded-full font-medium">Só NFS-e · cobrança já gerada</span>
+                    )}
                   </div>
                   <p className="text-xs text-gray-400 truncate mt-0.5">{c.descricaoServico?.slice(0, 80)}</p>
                 </div>

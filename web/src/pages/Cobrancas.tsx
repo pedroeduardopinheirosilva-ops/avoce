@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { trpc } from "../lib/trpc";
 
 interface AlterarValorState {
@@ -28,7 +28,39 @@ const BOL_LABEL: Record<string, string> = { AGUARDANDO: "Boleto Aguard.", PAGO: 
 const BOL_COLOR: Record<string, string> = { AGUARDANDO: "bg-blue-100 text-blue-700", PAGO: "bg-green-100 text-green-800", VENCIDO: "bg-orange-100 text-orange-700", CANCELADO: "bg-gray-100 text-gray-500" };
 const EFF_COLOR: Record<string, string> = { PAGO: "bg-green-100 text-green-800", VENCIDO: "bg-orange-100 text-orange-700", CANCELADO: "bg-gray-100 text-gray-500", PENDENTE: "bg-yellow-100 text-yellow-800" };
 
-type Tab = "cobrancas" | "relatorio";
+// ── Classificação por status efetivo (mesma regra do relatório) ──────────────
+type StatusEfetivo = "PAGO" | "PENDENTE" | "VENCIDO" | "CANCELADO";
+type StatusFiltro = "TODOS" | StatusEfetivo;
+
+function statusEfetivo(c: any): StatusEfetivo {
+  if (c.boletoStatus === "PAGO" || c.pixStatus === "PAGO" || c.baixaManualStatus === "PAGO") return "PAGO";
+  if (c.boletoStatus === "CANCELADO") return "CANCELADO";
+  const hoje = new Date().toISOString().slice(0, 10);
+  if (c.vencimento && c.vencimento < hoje) return "VENCIDO";
+  return "PENDENTE";
+}
+function valorEfetivoPago(c: any): number {
+  if (c.boletoStatus === "PAGO") return c.boletoValorPago ?? c.valor;
+  if (c.baixaManualStatus === "PAGO") return c.baixaManualValorPago ?? c.valor;
+  return c.valor; // PIX pago = valor cheio
+}
+
+const STATUS_TABS: { key: StatusFiltro; label: string }[] = [
+  { key: "TODOS",     label: "Todos" },
+  { key: "PAGO",      label: "Pagos" },
+  { key: "PENDENTE",  label: "Pendentes" },
+  { key: "VENCIDO",   label: "Vencidos" },
+  { key: "CANCELADO", label: "Cancelados" },
+];
+const STATUS_CHIP_ATIVO: Record<StatusFiltro, string> = {
+  TODOS:     "bg-gray-800 text-white",
+  PAGO:      "bg-green-600 text-white",
+  PENDENTE:  "bg-yellow-500 text-white",
+  VENCIDO:   "bg-orange-600 text-white",
+  CANCELADO: "bg-gray-500 text-white",
+};
+
+type Tab = "cobrancas" | "relatorio" | "saude";
 
 export default function Cobrancas() {
   const utils = trpc.useUtils();
@@ -60,7 +92,28 @@ export default function Cobrancas() {
   const [rfDataFim, setRfDataFim] = useState("");
   const [relFiltros, setRelFiltros] = useState<{ emitenteId?: string; competencia?: string; dataInicio?: string; dataFim?: string }>({});
 
-  const { data, isLoading } = trpc.cobranca.listar.useQuery({ pageSize: 100 });
+  const [saudeExpand, setSaudeExpand] = useState<string | null>(null);
+
+  // Filtros da aba Cobranças (client-side sobre a lista carregada)
+  const [fBusca, setFBusca]             = useState("");
+  const [fCompetencia, setFCompetencia] = useState("");
+  const [fCliente, setFCliente]         = useState("");
+  const [fEmitente, setFEmitente]       = useState("");
+  const [fStatus, setFStatus]           = useState<StatusFiltro>("TODOS");
+  const [ordenar, setOrdenar]           = useState<"venc_desc" | "venc_asc" | "valor_desc" | "cliente">("venc_desc");
+
+  const { data, isLoading } = trpc.cobranca.listar.useQuery({ pageSize: 1000 });
+  const saudeQ = trpc.cobranca.saudeEmails.useQuery(undefined, { enabled: tab === "saude" });
+  const falhasQ = trpc.cobranca.falhasEmail.useQuery(
+    { competencia: saudeExpand ?? undefined },
+    { enabled: tab === "saude" && !!saudeExpand },
+  );
+  const reenviarFalhas = trpc.cobranca.reenviarFalhas.useMutation({
+    onSuccess: (r) => {
+      alert(`${r.total} e-mail(s) sendo reenviados em segundo plano. Atualize em alguns minutos para ver o resultado.`);
+      setTimeout(() => { utils.cobranca.saudeEmails.invalidate(); utils.cobranca.falhasEmail.invalidate(); }, 8000);
+    },
+  });
   const { data: relData, isLoading: relLoading } = trpc.cobranca.relatorio.useQuery(relFiltros);
 
   const excluir       = trpc.cobranca.excluir.useMutation({ onSuccess: () => { utils.cobranca.listar.invalidate(); utils.cobranca.relatorio.invalidate(); } });
@@ -117,6 +170,82 @@ export default function Cobrancas() {
     { id: logCobrancaId! },
     { enabled: !!logCobrancaId }
   );
+
+  // ── Dados derivados dos filtros (client-side) ──────────────────────────────
+  const lista = data?.cobrancas ?? [];
+  const comStatus = useMemo(
+    () => lista.map(c => ({ ...c, _status: statusEfetivo(c) })),
+    [lista],
+  );
+
+  const competencias = useMemo(() => {
+    const s = new Set<string>();
+    comStatus.forEach(c => c.competencia && s.add(c.competencia));
+    return [...s].sort((a, b) => {
+      const [ma, ya] = a.split("/").map(Number);
+      const [mb, yb] = b.split("/").map(Number);
+      return (yb - ya) || (mb - ma);
+    });
+  }, [comStatus]);
+
+  const clientes = useMemo(() => {
+    const s = new Set<string>();
+    comStatus.forEach(c => c.contrato?.tomador?.nome && s.add(c.contrato.tomador.nome));
+    return [...s].sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [comStatus]);
+
+  const emitentes = useMemo(() => {
+    const s = new Set<string>();
+    comStatus.forEach(c => c.emitente?.nome && s.add(c.emitente.nome));
+    return [...s].sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [comStatus]);
+
+  // Aplica todos os filtros EXCETO status — base para contar os chips ao vivo
+  const semStatus = useMemo(() => comStatus.filter(c => {
+    if (fCompetencia && c.competencia !== fCompetencia) return false;
+    if (fCliente && c.contrato?.tomador?.nome !== fCliente) return false;
+    if (fEmitente && c.emitente?.nome !== fEmitente) return false;
+    if (fBusca.trim()) {
+      const q = fBusca.trim().toLowerCase();
+      const hay = `${c.contrato?.tomador?.nome ?? ""} ${c.emitente?.nome ?? ""} ${c.contrato?.nomeServico ?? ""} ${c.competencia ?? ""}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  }), [comStatus, fCompetencia, fCliente, fEmitente, fBusca]);
+
+  const counts = useMemo(() => {
+    const c: Record<StatusFiltro, number> = { TODOS: semStatus.length, PAGO: 0, PENDENTE: 0, VENCIDO: 0, CANCELADO: 0 };
+    semStatus.forEach(x => { c[x._status] += 1; });
+    return c;
+  }, [semStatus]);
+
+  const filtradas = useMemo(() => {
+    const arr = fStatus === "TODOS" ? semStatus : semStatus.filter(c => c._status === fStatus);
+    return [...arr].sort((a, b) => {
+      if (ordenar === "venc_desc")  return (b.vencimento ?? "").localeCompare(a.vencimento ?? "");
+      if (ordenar === "venc_asc")   return (a.vencimento ?? "").localeCompare(b.vencimento ?? "");
+      if (ordenar === "valor_desc") return b.valor - a.valor;
+      return (a.contrato?.tomador?.nome ?? "").localeCompare(b.contrato?.tomador?.nome ?? "", "pt-BR");
+    });
+  }, [semStatus, fStatus, ordenar]);
+
+  const resumo = useMemo(() => {
+    let totalGeral = 0, totalPago = 0, totalAberto = 0, qtdVencido = 0;
+    filtradas.forEach(c => {
+      totalGeral += c.valor;
+      if (c._status === "PAGO") totalPago += valorEfetivoPago(c);
+      else if (c._status === "PENDENTE" || c._status === "VENCIDO") {
+        totalAberto += c.valor;
+        if (c._status === "VENCIDO") qtdVencido += 1;
+      }
+    });
+    return { totalGeral, totalPago, totalAberto, qtdVencido, qtd: filtradas.length };
+  }, [filtradas]);
+
+  const filtrosAtivos = !!(fBusca || fCompetencia || fCliente || fEmitente || fStatus !== "TODOS");
+  function limparFiltros() {
+    setFBusca(""); setFCompetencia(""); setFCliente(""); setFEmitente(""); setFStatus("TODOS");
+  }
 
   function abrirBaixaModal(cobrancaId: string, valorCobranca: number) {
     setBmForma("PIX");
@@ -184,6 +313,7 @@ export default function Cobrancas() {
   const TABS: { key: Tab; label: string }[] = [
     { key: "cobrancas", label: "Cobranças" },
     { key: "relatorio", label: "Relatório" },
+    { key: "saude",     label: "📧 Saúde dos E-mails" },
   ];
 
   return (
@@ -203,26 +333,114 @@ export default function Cobrancas() {
       {/* ── Tab: Cobranças ── */}
       {tab === "cobrancas" && (
         <>
-          <div className="flex justify-end mb-4">
-            <button
-              onClick={() => consultarStatus.mutate({})}
-              disabled={consultarStatus.isPending}
-              className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg disabled:opacity-50"
-            >
-              {consultarStatus.isPending ? "Consultando..." : "🔄 Atualizar Status Sicoob"}
-            </button>
+          {/* Toolbar: filtros + ação */}
+          <div className="bg-white border border-gray-200 rounded-xl p-4 mb-4 space-y-3">
+            <div className="flex flex-wrap gap-3 items-end">
+              <div className="flex-1 min-w-[180px]">
+                <label className="block text-xs font-medium text-gray-600 mb-1">Buscar</label>
+                <input
+                  type="text" value={fBusca} onChange={e => setFBusca(e.target.value)}
+                  placeholder="Cliente, emitente, serviço..."
+                  className="w-full border rounded-lg px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Mês (competência)</label>
+                <select value={fCompetencia} onChange={e => setFCompetencia(e.target.value)}
+                  className="border rounded-lg px-3 py-2 text-sm w-40">
+                  <option value="">Todos os meses</option>
+                  {competencias.map(comp => <option key={comp} value={comp}>{comp}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Cliente</label>
+                <select value={fCliente} onChange={e => setFCliente(e.target.value)}
+                  className="border rounded-lg px-3 py-2 text-sm max-w-[220px]">
+                  <option value="">Todos os clientes</option>
+                  {clientes.map(nome => <option key={nome} value={nome}>{nome}</option>)}
+                </select>
+              </div>
+              {emitentes.length > 1 && (
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Emitente</label>
+                  <select value={fEmitente} onChange={e => setFEmitente(e.target.value)}
+                    className="border rounded-lg px-3 py-2 text-sm max-w-[200px]">
+                    <option value="">Todos</option>
+                    {emitentes.map(nome => <option key={nome} value={nome}>{nome}</option>)}
+                  </select>
+                </div>
+              )}
+              <div>
+                <label className="block text-xs font-medium text-gray-600 mb-1">Ordenar por</label>
+                <select value={ordenar} onChange={e => setOrdenar(e.target.value as typeof ordenar)}
+                  className="border rounded-lg px-3 py-2 text-sm">
+                  <option value="venc_desc">Vencimento ↓</option>
+                  <option value="venc_asc">Vencimento ↑</option>
+                  <option value="valor_desc">Maior valor</option>
+                  <option value="cliente">Cliente (A-Z)</option>
+                </select>
+              </div>
+              <button
+                onClick={() => consultarStatus.mutate({})}
+                disabled={consultarStatus.isPending}
+                className="text-sm bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg disabled:opacity-50 ml-auto"
+              >
+                {consultarStatus.isPending ? "Consultando..." : "🔄 Atualizar Status Sicoob"}
+              </button>
+            </div>
+
+            {/* Chips de classificação por status (com contagem ao vivo) */}
+            <div className="flex flex-wrap gap-2 items-center">
+              {STATUS_TABS.map(t => (
+                <button key={t.key} onClick={() => setFStatus(t.key)}
+                  className={`text-xs px-3 py-1.5 rounded-full transition-colors ${fStatus === t.key ? STATUS_CHIP_ATIVO[t.key] : "bg-gray-100 text-gray-600 hover:bg-gray-200"}`}>
+                  {t.label} <span className="opacity-70">({counts[t.key]})</span>
+                </button>
+              ))}
+              {filtrosAtivos && (
+                <button onClick={limparFiltros}
+                  className="text-xs px-3 py-1.5 rounded-full bg-red-50 text-red-600 hover:bg-red-100 ml-1">
+                  ✕ Limpar filtros
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* Resumo do conjunto filtrado */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="bg-white border border-gray-200 rounded-xl px-4 py-3">
+              <p className="text-xs text-gray-500">Exibindo</p>
+              <p className="text-lg font-bold text-gray-900">{resumo.qtd} <span className="text-xs font-normal text-gray-400">de {comStatus.length}</span></p>
+            </div>
+            <div className="bg-white border border-gray-200 rounded-xl px-4 py-3">
+              <p className="text-xs text-gray-500">Valor total</p>
+              <p className="text-lg font-bold text-gray-900">{fmt(resumo.totalGeral)}</p>
+            </div>
+            <div className="bg-white border border-green-200 rounded-xl px-4 py-3">
+              <p className="text-xs text-gray-500">Recebido</p>
+              <p className="text-lg font-bold text-green-700">{fmt(resumo.totalPago)}</p>
+            </div>
+            <div className="bg-white border border-orange-200 rounded-xl px-4 py-3">
+              <p className="text-xs text-gray-500">Em aberto</p>
+              <p className="text-lg font-bold text-orange-700">{fmt(resumo.totalAberto)}</p>
+              {resumo.qtdVencido > 0 && <p className="text-xs text-orange-500 mt-0.5">{resumo.qtdVencido} vencido(s)</p>}
+            </div>
+          </div>
+
           {isLoading ? (
             <div className="text-gray-500 text-sm">Carregando...</div>
           ) : (
             <div className="space-y-3">
-              {data?.cobrancas.map(c => (
+              {filtradas.map(c => (
                 <div key={c.id} className="bg-white border border-gray-200 rounded-xl p-4 md:p-5 flex flex-col sm:flex-row sm:items-start gap-3">
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <p className="font-semibold text-gray-900">{c.emitente.nome}</p>
                       <span className="text-gray-400">→</span>
                       <p className="text-gray-700">{c.contrato.tomador.nome}</p>
+                      <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${EFF_COLOR[(c as any)._status] ?? "bg-gray-100 text-gray-600"}`}>
+                        {(c as any)._status}
+                      </span>
                       {/* PIX badge */}
                       {c.pixTxid && (
                         <span className={`text-xs px-2 py-0.5 rounded-full ${PIX_COLOR[c.pixStatus] ?? "bg-gray-100 text-gray-600"}`}>
@@ -346,8 +564,12 @@ export default function Cobrancas() {
                   </div>
                 </div>
               ))}
-              {!data?.cobrancas.length && (
-                <p className="text-gray-500 text-sm">Nenhuma cobrança gerada. Use o botão "Cobrança" em um contrato.</p>
+              {!filtradas.length && (
+                <p className="text-gray-500 text-sm">
+                  {comStatus.length === 0
+                    ? 'Nenhuma cobrança gerada. Use o botão "Cobrança" em um contrato.'
+                    : "Nenhuma cobrança corresponde aos filtros selecionados."}
+                </p>
               )}
             </div>
           )}
@@ -479,6 +701,97 @@ export default function Cobrancas() {
               </div>
             </>
           ) : null}
+        </div>
+      )}
+
+      {/* ── Tab: Saúde dos E-mails ── */}
+      {tab === "saude" && (
+        <div className="space-y-4">
+          <p className="text-sm text-gray-500">
+            Acompanhe, mês a mês, se todos os clientes receberam a Nota de Honorários + boleto por e-mail.
+            E-mails que falharem são reenviados automaticamente pelo sistema a cada 30 min (até 6 tentativas);
+            você também pode reenviar manualmente abaixo.
+          </p>
+
+          {saudeQ.isLoading ? (
+            <div className="text-gray-500 text-sm">Carregando...</div>
+          ) : !saudeQ.data?.length ? (
+            <div className="text-gray-400 text-sm py-8 text-center">Nenhuma cobrança registrada ainda.</div>
+          ) : (
+            <div className="space-y-3">
+              {saudeQ.data.map(m => {
+                const tudoOk = m.falhas === 0 && m.pendentes === 0;
+                const aberto = saudeExpand === m.competencia;
+                return (
+                  <div key={m.competencia} className="bg-white border border-gray-200 rounded-xl overflow-hidden">
+                    <div className="p-4 md:p-5 flex flex-col sm:flex-row sm:items-center gap-3">
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        <span className={`text-2xl ${tudoOk ? "" : "animate-pulse"}`}>{tudoOk ? "✅" : "⚠️"}</span>
+                        <div>
+                          <p className="font-semibold text-gray-900">Competência {m.competencia}</p>
+                          <p className="text-xs text-gray-500">
+                            {m.enviados}/{m.total} enviados
+                            {m.ultimoEnvio ? ` · último envio ${new Date(m.ultimoEnvio).toLocaleString("pt-BR")}` : ""}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700">{m.enviados} enviados</span>
+                        {m.falhas > 0 &&    <span className="text-xs px-2 py-0.5 rounded-full bg-red-100 text-red-700">{m.falhas} falha(s)</span>}
+                        {m.pendentes > 0 && <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700">{m.pendentes} pendente(s)</span>}
+                        {!tudoOk && (
+                          <>
+                            <button
+                              onClick={() => setSaudeExpand(aberto ? null : m.competencia)}
+                              className="text-xs px-3 py-1.5 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200">
+                              {aberto ? "Ocultar" : "Ver detalhes"}
+                            </button>
+                            <button
+                              onClick={() => { if (confirm(`Reenviar ${m.falhas + m.pendentes} e-mail(s) da competência ${m.competencia}? As notas e boletos já emitidos serão reaproveitados (nada é reemitido).`)) reenviarFalhas.mutate({ competencia: m.competencia }); }}
+                              disabled={reenviarFalhas.isPending}
+                              className="text-xs px-3 py-1.5 rounded-lg bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50">
+                              {reenviarFalhas.isPending ? "Reenviando..." : "↻ Reenviar falhas"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+
+                    {aberto && (
+                      <div className="border-t border-gray-100 bg-gray-50 px-4 py-3">
+                        {falhasQ.isLoading ? (
+                          <div className="text-gray-500 text-sm py-2">Carregando...</div>
+                        ) : !falhasQ.data?.length ? (
+                          <div className="text-gray-400 text-sm py-2">Nenhuma falha nesta competência.</div>
+                        ) : (
+                          <div className="space-y-2">
+                            {falhasQ.data.map(f => (
+                              <div key={f.id} className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3 text-sm bg-white border border-gray-200 rounded-lg px-3 py-2">
+                                <div className="flex-1 min-w-0">
+                                  <span className="font-medium text-gray-800">{f.contrato.tomador.nome}</span>
+                                  <span className="text-gray-400 text-xs ml-2">{f.contrato.tomador.email || "sem e-mail"}</span>
+                                </div>
+                                <span className={`text-xs px-2 py-0.5 rounded-full ${f.emailStatus === "FALHA" ? "bg-red-100 text-red-700" : "bg-yellow-100 text-yellow-700"}`}>
+                                  {f.emailStatus} ({f.emailTentativas}x)
+                                </span>
+                                <span className="text-xs text-gray-500 truncate max-w-[280px]" title={f.emailErro || ""}>{f.emailErro || "—"}</span>
+                                <button
+                                  onClick={() => reenviarEmail.mutate({ id: f.id })}
+                                  disabled={reenviarEmail.isPending}
+                                  className="text-xs px-2 py-1 rounded bg-brand-600 text-white hover:bg-brand-700 disabled:opacity-50">
+                                  ↻ Reenviar
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

@@ -7,6 +7,7 @@ import type { SicoobPixConfig }    from "../lib/sicoob-pix.js";
 import { criarBoleto, consultarBoleto, baixarBoleto, sicoobBoletoConfigurado } from "../lib/sicoob-boleto.js";
 import type { SicoobBoletoConfig } from "../lib/sicoob-boleto.js";
 import { renderTemplate }          from "../lib/template.js";
+import { calcularRetencoes }     from "../lib/nfse.js";
 import { certPathForEmpresa }      from "../upload.js";
 import { enviarEmailCobranca }     from "../lib/email-cobranca.js";
 import { fieldDecrypt }           from "../lib/field-crypto.js";
@@ -122,7 +123,17 @@ export const cobrancaRouter = router({
       }
 
       const [mm, yyyy] = input.competencia.split("/");
-      const valorBRL = contrato.valor;
+
+      // Com retenção na fonte o tomador recolhe o tributo: a NFS-e sai pelo
+      // bruto e a cobrança pelo líquido (o "Valor Líquido" do DANFSE).
+      const valorBRL = calcularRetencoes(contrato.valor, {
+        aliquotaIss: contrato.emitente.aliquotaIss,
+        issRetido:   contrato.issRetido || contrato.tomador.issRetido,
+        retirIr:     contrato.retirIr,
+        retirCsll:   contrato.retirCsll,
+        retirPis:    contrato.retirPis,
+        retirCofins: contrato.retirCofins,
+      }).liquido;
 
       // Renderizar templates com variáveis
       const templateVars = {
@@ -259,6 +270,96 @@ export const cobrancaRouter = router({
       return { ok: true };
     }),
 
+  // ── Monitor de saúde dos e-mails de cobrança ──────────────────────────────
+  // Agrega por competência (mês) quantos e-mails foram ENVIADOS / FALHARAM /
+  // ainda estão PENDENTES, para o usuário saber, todo mês, se todos os clientes
+  // receberam a nota + boleto.
+  saudeEmails: authProc
+    .query(async ({ ctx }) => {
+      const where = whereEmitenteFilter(ctx);
+
+      const grupos = await prisma.cobranca.groupBy({
+        by: ["competencia", "emailStatus"],
+        where,
+        _count: { _all: true },
+      });
+
+      type Linha = {
+        competencia: string; total: number; enviados: number;
+        falhas: number; pendentes: number; ultimoEnvio: Date | null;
+      };
+      const mapa = new Map<string, Linha>();
+      for (const g of grupos) {
+        const l = mapa.get(g.competencia) ?? {
+          competencia: g.competencia, total: 0, enviados: 0, falhas: 0, pendentes: 0, ultimoEnvio: null,
+        };
+        const n = g._count._all;
+        l.total += n;
+        if      (g.emailStatus === "ENVIADO") l.enviados  += n;
+        else if (g.emailStatus === "FALHA")   l.falhas    += n;
+        else                                  l.pendentes += n;
+        mapa.set(g.competencia, l);
+      }
+
+      const ultimos = await prisma.cobranca.groupBy({
+        by: ["competencia"],
+        where,
+        _max: { emailEnviadoEm: true },
+      });
+      for (const u of ultimos) {
+        const l = mapa.get(u.competencia);
+        if (l) l.ultimoEnvio = u._max.emailEnviadoEm ?? null;
+      }
+
+      return [...mapa.values()].sort((a, b) => {
+        const [ma, ya] = a.competencia.split("/").map(Number);
+        const [mb, yb] = b.competencia.split("/").map(Number);
+        return (yb - ya) || (mb - ma);
+      });
+    }),
+
+  // ── Detalhe das cobranças com e-mail em falha/pendente ─────────────────────
+  falhasEmail: authProc
+    .input(z.object({ competencia: z.string().optional() }).optional())
+    .query(async ({ input, ctx }) => {
+      const where = {
+        ...whereEmitenteFilter(ctx),
+        emailStatus: { in: ["FALHA", "PENDENTE"] },
+        ...(input?.competencia ? { competencia: input.competencia } : {}),
+      };
+      return prisma.cobranca.findMany({
+        where,
+        orderBy: { criadoEm: "desc" },
+        take: 500,
+        select: {
+          id: true, competencia: true, vencimento: true, valor: true,
+          emailStatus: true, emailErro: true, emailTentativas: true, emailUltTentativa: true,
+          contrato: { select: { nomeServico: true, tomador: { select: { nome: true, email: true } } } },
+        },
+      });
+    }),
+
+  // ── Reenviar todas as cobranças com e-mail falho/pendente de uma competência ─
+  reenviarFalhas: authProc
+    .input(z.object({ competencia: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const where = {
+        ...whereEmitenteFilter(ctx),
+        competencia: input.competencia,
+        emailStatus: { in: ["FALHA", "PENDENTE"] },
+      };
+      const cobs = await prisma.cobranca.findMany({ where, select: { id: true } });
+      // Dispara em segundo plano para não travar a resposta; espaça os envios.
+      (async () => {
+        for (const c of cobs) {
+          await enviarEmailCobranca(c.id).catch(err =>
+            console.error(`[Email-Cob] reenviarFalhas ${c.id}:`, err));
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      })();
+      return { ok: true, total: cobs.length };
+    }),
+
   // ── Consultar status na API Sicoob ────────────────────────────────────────
   // Atualiza pixStatus e boletoStatus de uma ou todas as cobranças pendentes
   consultarStatus: authProc
@@ -273,7 +374,9 @@ export const cobrancaRouter = router({
             ...emitenteFilter,
             OR: [
               { pixStatus: "PENDENTE", pixTxid: { not: null } },
-              { boletoStatus: "AGUARDANDO", boletoNossoNumero: { not: null } },
+              // AGUARDANDO e VENCIDO: um boleto vencido ainda pode ser liquidado
+              // (Sicoob recebe até 30 dias após venc.), então continua sendo reconsultado.
+              { boletoStatus: { in: ["AGUARDANDO", "VENCIDO"] }, boletoNossoNumero: { not: null } },
             ],
           };
 
@@ -292,8 +395,8 @@ export const cobrancaRouter = router({
             update["pixStatus"] = pix.status;
           }
 
-          // Verificar boleto
-          if (c.boletoNossoNumero && c.boletoStatus === "AGUARDANDO") {
+          // Verificar boleto (AGUARDANDO ou VENCIDO — vencido ainda pode liquidar)
+          if (c.boletoNossoNumero && (c.boletoStatus === "AGUARDANDO" || c.boletoStatus === "VENCIDO")) {
             const boleto = await consultarBoleto(cBoleto, c.boletoNossoNumero);
             const situacao = boleto.situacao?.toUpperCase() ?? "";
 
@@ -573,6 +676,16 @@ export const cobrancaRouter = router({
     .mutation(async ({ input, ctx }) => {
       const c = await prisma.cobranca.findUniqueOrThrow({ where: { id: input.id }, include: { emitente: true } });
       assertEmitenteAccess(ctx, c.emitenteId);
+
+      // NUNCA excluir uma cobrança já paga — perderíamos o registro do pagamento e
+      // o boleto (Liquidado no Sicoob) viraria órfão invisível no Avoce. Foi assim
+      // que a Prime (nn 148, pago) sumiu do Avoce ao apagarem a "duplicata".
+      if (c.boletoStatus === "PAGO" || c.pixStatus === "PAGO" || c.baixaManualStatus === "PAGO") {
+        throw new Error(
+          "Cobrança já paga — não pode ser excluída (evita perder o registro do pagamento). " +
+          "Se for duplicata, cancele/baixe o boleto correto direto no Sicoob.",
+        );
+      }
 
       // Cancelar (baixar) o boleto no Sicoob ANTES de excluir. Caso contrário, o
       // boleto continua ativo no banco sem registro no Avoce — vira boleto órfão

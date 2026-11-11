@@ -65,7 +65,13 @@ async function reconcileAll(): Promise<void> {
 
     for (const account of accounts) {
       try {
-        await reconciliationService.reconcileAccount(emitente.id, account.id);
+        const r = await reconciliationService.reconcileAccount(emitente.id, account.id);
+        if (r.matched > 0) {
+          console.log(
+            `[banking-cron] Reconciled ${r.matched}/${r.examined} statements for ${emitente.id}/${account.id}`,
+            r.byReason
+          );
+        }
       } catch (err) {
         console.error(`[banking-cron] Reconciliation error for ${emitente.id}/${account.id}:`, err);
       }

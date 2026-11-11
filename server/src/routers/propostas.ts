@@ -7,6 +7,7 @@ import { htmlToPdf }         from "../lib/pdf.js";
 import { existsSync, readFileSync } from "node:fs";
 import { readFile }          from "node:fs/promises";
 import { sendText }          from "../services/evolution.js";
+import { getEvolutionConfigForEmitente } from "../services/evolution-empresa.js";
 import { fieldDecrypt }      from "../lib/field-crypto.js";
 import { sendMailAndSave, type SmtpConfig } from "../lib/email.js";
 
@@ -49,6 +50,149 @@ export async function autoConverterEmContrato(propostaId: string): Promise<void>
   });
 
   console.log(`[Proposta] ${propostaId} convertida automaticamente em contrato ${contrato.id}`);
+}
+
+// ── Preparação comum ao envio (e-mail e WhatsApp) ───────────────────────────
+// Gera o PDF da proposta, os documentos (contrato + procuração), carrega os PDFs
+// e cria os envelopes no PAKT (um por documento; exige e-mail do tomador, que é
+// o signatário). Persiste paktSignUrl/paktDocumentId. Extraído do enviarEmail
+// para o WhatsApp mandar exatamente o mesmo que o e-mail manda.
+type EnvioAtt = { filename: string; content: Buffer; contentType: "application/pdf"; docId?: string; titulo?: string };
+type EnvioPaktDoc = { filename: string; titulo: string; signUrl: string; documentId: string };
+
+async function prepararEnvioProposta(p: any): Promise<{
+  propostaPdf?: Buffer; docAttachments: EnvioAtt[]; paktDocs: EnvioPaktDoc[];
+  baseUrl: string; paktBaseUrl: string; emitenteNome: string;
+}> {
+  const baseUrl     = process.env.APP_BASE_URL ?? "https://avoce.com.br";
+  const paktApiKey  = process.env.PAKT_API_KEY;
+  const paktBaseUrl = process.env.PAKT_BASE_URL ?? "https://pakt.capium.com.br";
+  const emitenteNome = p.emitente.nomeFantasia || p.emitente.nome;
+
+  // ── 1. Gerar PDF da proposta ───────────────────────────────────────────────
+  let propostaPdf: Buffer | undefined;
+  try {
+    const pageHtml = propostaHtmlPage(p.titulo, p.textoHtml, {
+      id: p.emitente.id, nome: p.emitente.nome, nomeFantasia: p.emitente.nomeFantasia,
+      cnpj: p.emitente.cnpj, logoSrc: logoPathToBase64(p.emitente.logoPath),
+      cidade: p.emitente.cidade, uf: p.emitente.uf,
+      endereco: p.emitente.endereco, numero: p.emitente.numero,
+      complemento: p.emitente.complemento, bairro: p.emitente.bairro,
+      cep: p.emitente.cep, telefone: p.emitente.telefone, email: p.emitente.email,
+    }, p.validadeAte, { nome: p.tomador.nome });
+    propostaPdf = await htmlToPdf(pageHtml);
+  } catch (e) {
+    console.error("[Proposta] Falha ao gerar PDF da proposta:", e);
+  }
+
+  // ── 2. Gerar documentos (contrato + procuração) ────────────────────────────
+  // Importação dinâmica para evitar dependência circular com templateDocumentos.ts
+  try {
+    const { gerarDocumentosProposta } = await import("./templateDocumentos.js");
+    await gerarDocumentosProposta(p.id);
+  } catch (e) {
+    console.error("[Proposta] Falha ao gerar documentos:", e);
+  }
+
+  // ── 3. Carregar PDFs dos documentos gerados ────────────────────────────────
+  const docAttachments: EnvioAtt[] = [];
+
+  try {
+    const docs = await (prisma as any).documentoGerado.findMany({
+      where:   { propostaId: p.id },
+      orderBy: [{ tipo: "asc" }, { criadoEm: "asc" }], // CONTRATO antes PROCURACAO
+    });
+    console.log(`[Proposta] ${docs.length} documento(s) gerado(s) para proposta ${p.id}`);
+    for (const doc of docs) {
+      if (!doc.pdfPath) { console.warn(`[Proposta] Doc ${doc.id} sem pdfPath`); continue; }
+      if (!existsSync(doc.pdfPath)) { console.warn(`[Proposta] PDF não encontrado: ${doc.pdfPath}`); continue; }
+      const buf      = await readFile(doc.pdfPath);
+      const tipoLabel = doc.tipo === "CONTRATO" ? "Contrato" : doc.tipo === "PROCURACAO" ? "Procuracao" : doc.tipo;
+      docAttachments.push({
+        filename:    `${tipoLabel}-${doc.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`,
+        content:     buf,
+        contentType: "application/pdf",
+        docId:       doc.id,
+        titulo:      doc.titulo,
+      });
+    }
+  } catch (e) {
+    console.error("[Proposta] Erro ao carregar documentos gerados:", e);
+  }
+
+  // ── 4. PAKT: criar um documento por template (contrato + procuração) ────────
+  // Cada doc recebe seu próprio link de assinatura → cliente assina sucessivamente
+  const paktDocs: EnvioPaktDoc[] = [];
+
+  // Docs a enviar ao PAKT: todos os gerados, ou proposta como fallback
+  const docsParaPakt = docAttachments.length > 0 ? docAttachments : (propostaPdf
+    ? [{ filename: `${p.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`,
+         content: propostaPdf, contentType: "application/pdf" as const,
+         titulo: p.titulo }]
+    : []);
+
+  if (paktApiKey && docsParaPakt.length > 0 && p.tomador.email) {
+    for (const att of docsParaPakt) {
+      try {
+        const form = new FormData();
+        form.append(
+          "file",
+          new Blob([att.content as unknown as BlobPart], { type: "application/pdf" }),
+          att.filename,
+        );
+        // Prazo de assinatura = validade da proposta, mas NUNCA uma data no
+        // passado: proposta vencida gerava envelope já expirado, e o cliente
+        // abria o link e via "Este documento expirou"
+        const validadeFutura = p.validadeAte && p.validadeAte.getTime() > Date.now()
+          ? p.validadeAte
+          : null;
+        if (p.validadeAte && !validadeFutura) {
+          console.warn(`[Proposta] validade ${p.validadeAte.toISOString()} já venceu — enviando ao PAKT sem prazo de expiração`);
+        }
+
+        form.append("metadata", JSON.stringify({
+          nome:      att.titulo ?? att.filename.replace(/\.pdf$/i, ""),
+          mensagem:  `Documento de ${emitenteNome} para assinatura digital. Por favor, leia e assine.`,
+          expiresAt: validadeFutura ? validadeFutura.toISOString() : undefined,
+          signers:   [{ nome: p.tomador.nome, email: p.tomador.email, countryCode: "BR" }],
+        }));
+
+        const createRes = await fetch(`${paktBaseUrl}/api/v1/documents`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${paktApiKey}` },
+          body: form,
+        });
+
+        if (createRes.ok) {
+          const doc = await createRes.json() as { id: string; signers: Array<{ signUrl: string }> };
+          const signUrl = doc.signers[0]?.signUrl;
+          if (signUrl) {
+            paktDocs.push({ filename: att.filename, titulo: att.titulo ?? att.filename, signUrl, documentId: doc.id });
+            await fetch(`${paktBaseUrl}/api/v1/documents/${doc.id}/send`, {
+              method: "POST", headers: { Authorization: `Bearer ${paktApiKey}` },
+            });
+            console.log(`[Proposta] PAKT doc criado: ${doc.id} (${att.filename}) | signUrl: ${signUrl}`);
+          }
+        } else {
+          console.error(`[Proposta] PAKT erro para ${att.filename}:`, createRes.status, await createRes.text());
+        }
+      } catch (e) {
+        console.error(`[Proposta] Falha PAKT para ${att.filename}:`, e);
+      }
+    }
+
+    // Persistir: primeiro signUrl + todos os IDs como JSON
+    if (paktDocs.length > 0) {
+      await prisma.proposta.update({
+        where: { id: p.id },
+        data: {
+          paktSignUrl:    paktDocs[0].signUrl,
+          paktDocumentId: JSON.stringify(paktDocs.map(d => d.documentId)),
+        } as any,
+      });
+    }
+  }
+  return { propostaPdf, docAttachments, paktDocs, baseUrl, paktBaseUrl, emitenteNome };
 }
 
 // ── E-mail de confirmação de aceite com todos os documentos ─────────────────
@@ -404,6 +548,8 @@ export const propostaRouter = router({
     .input(z.object({
       status:     z.string().optional(),
       emitenteId: z.string().optional(),
+      // "PENDENTE" = só o que o agente gerou e ainda espera conferência humana
+      revisao:    z.enum(["PENDENTE", "LIBERADA"]).optional(),
       page:       z.number().int().default(1),
       pageSize:   z.number().int().default(20),
     }))
@@ -413,7 +559,8 @@ export const propostaRouter = router({
         ...emitenteFilter,
         ...(input.status     ? { status: input.status }         : {}),
         ...(input.emitenteId ? { emitenteId: input.emitenteId } : {}),
-      };
+        ...(input.revisao    ? { revisaoStatus: input.revisao } : {}),
+      } as any;
       const [propostas, total] = await Promise.all([
         prisma.proposta.findMany({
           where,
@@ -469,7 +616,7 @@ export const propostaRouter = router({
       contratoIssRetido:         z.boolean().optional().nullable(),
       contratoDescricao:         z.string().optional().nullable(),
       templatesGerar:            z.array(z.string()).optional().nullable(),
-      honorariosExitoPerc:       z.number().int().min(1).max(100).optional().nullable(),
+      honorariosExitoPerc:       z.number().min(0.01).max(100).optional().nullable(),
     }))
     .mutation(async ({ input, ctx }) => {
       assertEmitenteAccess(ctx, input.emitenteId);
@@ -519,7 +666,7 @@ export const propostaRouter = router({
       contratoIssRetido:         z.boolean().optional().nullable(),
       contratoDescricao:         z.string().optional().nullable(),
       templatesGerar:            z.array(z.string()).optional().nullable(),
-      honorariosExitoPerc:       z.number().int().min(1).max(100).optional().nullable(),
+      honorariosExitoPerc:       z.number().min(0.01).max(100).optional().nullable(),
     }))
     .mutation(async ({ input, ctx }) => {
       const { id, validadeAte, templatesGerar, ...rest } = input;
@@ -557,126 +704,8 @@ export const propostaRouter = router({
       if (!p.emitente.smtpHost || !p.emitente.smtpUser)
         throw new Error("SMTP não configurado para esta empresa");
 
-      const baseUrl     = process.env.APP_BASE_URL ?? "https://avoce.com.br";
-      const paktApiKey  = process.env.PAKT_API_KEY;
-      const paktBaseUrl = process.env.PAKT_BASE_URL ?? "https://pakt.capium.com.br";
-      const emitenteNome = p.emitente.nomeFantasia || p.emitente.nome;
-
-      // ── 1. Gerar PDF da proposta ───────────────────────────────────────────────
-      let propostaPdf: Buffer | undefined;
-      try {
-        const pageHtml = propostaHtmlPage(p.titulo, p.textoHtml, {
-          id: p.emitente.id, nome: p.emitente.nome, nomeFantasia: p.emitente.nomeFantasia,
-          cnpj: p.emitente.cnpj, logoSrc: logoPathToBase64(p.emitente.logoPath),
-          cidade: p.emitente.cidade, uf: p.emitente.uf,
-          endereco: p.emitente.endereco, numero: p.emitente.numero,
-          complemento: p.emitente.complemento, bairro: p.emitente.bairro,
-          cep: p.emitente.cep, telefone: p.emitente.telefone, email: p.emitente.email,
-        }, p.validadeAte, { nome: p.tomador.nome });
-        propostaPdf = await htmlToPdf(pageHtml);
-      } catch (e) {
-        console.error("[Proposta] Falha ao gerar PDF da proposta:", e);
-      }
-
-      // ── 2. Gerar documentos (contrato + procuração) ────────────────────────────
-      // Importação dinâmica para evitar dependência circular com templateDocumentos.ts
-      try {
-        const { gerarDocumentosProposta } = await import("./templateDocumentos.js");
-        await gerarDocumentosProposta(p.id);
-      } catch (e) {
-        console.error("[Proposta] Falha ao gerar documentos:", e);
-      }
-
-      // ── 3. Carregar PDFs dos documentos gerados ────────────────────────────────
-      type Att = { filename: string; content: Buffer; contentType: "application/pdf"; docId?: string; titulo?: string };
-      const docAttachments: Att[] = [];
-
-      try {
-        const docs = await (prisma as any).documentoGerado.findMany({
-          where:   { propostaId: p.id },
-          orderBy: [{ tipo: "asc" }, { criadoEm: "asc" }], // CONTRATO antes PROCURACAO
-        });
-        console.log(`[Proposta] ${docs.length} documento(s) gerado(s) para proposta ${p.id}`);
-        for (const doc of docs) {
-          if (!doc.pdfPath) { console.warn(`[Proposta] Doc ${doc.id} sem pdfPath`); continue; }
-          if (!existsSync(doc.pdfPath)) { console.warn(`[Proposta] PDF não encontrado: ${doc.pdfPath}`); continue; }
-          const buf      = await readFile(doc.pdfPath);
-          const tipoLabel = doc.tipo === "CONTRATO" ? "Contrato" : doc.tipo === "PROCURACAO" ? "Procuracao" : doc.tipo;
-          docAttachments.push({
-            filename:    `${tipoLabel}-${doc.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`,
-            content:     buf,
-            contentType: "application/pdf",
-            docId:       doc.id,
-            titulo:      doc.titulo,
-          });
-        }
-      } catch (e) {
-        console.error("[Proposta] Erro ao carregar documentos gerados:", e);
-      }
-
-      // ── 4. PAKT: criar um documento por template (contrato + procuração) ────────
-      // Cada doc recebe seu próprio link de assinatura → cliente assina sucessivamente
-      type PaktDoc = { filename: string; titulo: string; signUrl: string; documentId: string };
-      const paktDocs: PaktDoc[] = [];
-
-      // Docs a enviar ao PAKT: todos os gerados, ou proposta como fallback
-      const docsParaPakt = docAttachments.length > 0 ? docAttachments : (propostaPdf
-        ? [{ filename: `${p.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`,
-             content: propostaPdf, contentType: "application/pdf" as const,
-             titulo: p.titulo }]
-        : []);
-
-      if (paktApiKey && docsParaPakt.length > 0 && p.tomador.email) {
-        for (const att of docsParaPakt) {
-          try {
-            const form = new FormData();
-            form.append(
-              "file",
-              new Blob([att.content as unknown as BlobPart], { type: "application/pdf" }),
-              att.filename,
-            );
-            form.append("metadata", JSON.stringify({
-              nome:      att.titulo ?? att.filename.replace(/\.pdf$/i, ""),
-              mensagem:  `Documento de ${emitenteNome} para assinatura digital. Por favor, leia e assine.`,
-              expiresAt: p.validadeAte ? p.validadeAte.toISOString() : undefined,
-              signers:   [{ nome: p.tomador.nome, email: p.tomador.email, countryCode: "BR" }],
-            }));
-
-            const createRes = await fetch(`${paktBaseUrl}/api/v1/documents`, {
-              method: "POST",
-              headers: { Authorization: `Bearer ${paktApiKey}` },
-              body: form,
-            });
-
-            if (createRes.ok) {
-              const doc = await createRes.json() as { id: string; signers: Array<{ signUrl: string }> };
-              const signUrl = doc.signers[0]?.signUrl;
-              if (signUrl) {
-                paktDocs.push({ filename: att.filename, titulo: att.titulo ?? att.filename, signUrl, documentId: doc.id });
-                await fetch(`${paktBaseUrl}/api/v1/documents/${doc.id}/send`, {
-                  method: "POST", headers: { Authorization: `Bearer ${paktApiKey}` },
-                });
-                console.log(`[Proposta] PAKT doc criado: ${doc.id} (${att.filename}) | signUrl: ${signUrl}`);
-              }
-            } else {
-              console.error(`[Proposta] PAKT erro para ${att.filename}:`, createRes.status, await createRes.text());
-            }
-          } catch (e) {
-            console.error(`[Proposta] Falha PAKT para ${att.filename}:`, e);
-          }
-        }
-
-        // Persistir: primeiro signUrl + todos os IDs como JSON
-        if (paktDocs.length > 0) {
-          await prisma.proposta.update({
-            where: { id: p.id },
-            data: {
-              paktSignUrl:    paktDocs[0].signUrl,
-              paktDocumentId: JSON.stringify(paktDocs.map(d => d.documentId)),
-            } as any,
-          });
-        }
-      }
+      const { propostaPdf, docAttachments, paktDocs, baseUrl, emitenteNome } =
+        await prepararEnvioProposta(p);
 
       // ── 5. Montar e enviar e-mail ──────────────────────────────────────────────
       const usandoPakt    = paktDocs.length > 0;
@@ -706,7 +735,7 @@ export const propostaRouter = router({
       ].filter(Boolean).join(" — ");
 
       // Todos os PDFs como anexo (proposta + docs gerados)
-      const allAttachments: Att[] = [
+      const allAttachments: EnvioAtt[] = [
         ...(propostaPdf ? [{ filename: `Proposta-${p.titulo.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "-")}.pdf`, content: propostaPdf, contentType: "application/pdf" as const }] : []),
         ...docAttachments,
       ];
@@ -803,7 +832,13 @@ export const propostaRouter = router({
 
       await prisma.proposta.update({
         where: { id: p.id },
-        data:  { status: "ENVIADA" },
+        data:  {
+          status: "ENVIADA",
+          // Mandar por e-mail É liberar: sem isto o card ficaria "em revisão" para sempre
+          ...((p as any).revisaoStatus === "PENDENTE"
+            ? { revisaoStatus: "LIBERADA", revisadoEm: new Date() }
+            : {}),
+        } as any,
       });
 
       return { ok: true, usandoPakt, docsGerados: docAttachments.length, paktDocs: paktDocs.length };
@@ -814,40 +849,83 @@ export const propostaRouter = router({
     .mutation(async ({ input, ctx }) => {
       const p = await prisma.proposta.findUniqueOrThrow({
         where: { id: input.id },
-        include: { tomador: true },
+        include: { emitente: true, tomador: true },
       }) as any;
       assertEmitenteAccess(ctx, p.emitenteId);
 
       const telefone: string | null = p.tomador.telefone ?? null;
       if (!telefone) throw new Error("Tomador não possui telefone cadastrado");
 
+      // Mesmo preparo do e-mail: gera documentos e envelopes PAKT (quando o
+      // tomador tem e-mail, exigido pelo PAKT como signatário). Sem e-mail o
+      // link enviado é o da página de aceite da proposta.
+      const { paktDocs } = await prepararEnvioProposta(p);
+
       const phone = telefone.replace(/\D/g, "");
       const to = phone.startsWith("55") ? phone : `55${phone}`;
 
-      // Busca config Evolution do primeiro projeto ativo com WhatsApp configurado
-      const projeto = await (prisma as any).iaProjeto.findFirst({ where: { ativo: true } });
-      if (!projeto) throw new Error("Nenhum projeto de IA configurado");
-
-      const configs = await (prisma as any).iaProjetoConfig.findMany({
-        where: { projetoId: projeto.id, categoria: "whatsapp" },
-      });
-      const get = (k: string) => (configs as any[]).find(c => c.chave === k)?.valor ?? "";
-      const evoUrl = get("evolution_api_url");
-      const evoKey = get("evolution_api_key");
-      const evoInst = get("evolution_instancia");
-      if (!evoUrl || !evoKey || !evoInst)
-        throw new Error("Evolution API não configurada no projeto de IA");
+      // Instância do WhatsApp POR ESCRITÓRIO: PSA → Judite (psa-docs), RAP →
+      // Isabella (avoce). Vem de Configuracao.whatsapp_evolution_<empresaId>
+      // (fallback: projeto de IA do escritório). Antes saía tudo pela RAP.
+      const evo = await getEvolutionConfigForEmitente(p.emitente);
+      if (!evo) throw new Error(`WhatsApp (Evolution) não configurado para o escritório ${p.emitente.nome} — cadastre Configuracao.whatsapp_evolution_${p.emitente.empresaId ?? "<empresaId>"}`);
 
       const appUrl = process.env.APP_BASE_URL ?? "https://avoce.com.br";
-      const link = p.paktSignUrl || `${appUrl}/api/proposta/${p.tokenAceite}`;
       const nome = (p.tomador.nome as string).split(" ")[0];
+      const emitenteNome = p.emitente.nomeFantasia || p.emitente.nome;
 
-      const texto = p.paktSignUrl
-        ? `Olá, ${nome}! Segue o link para assinar o contrato e a procuração:\n\n${link}\n\nQualquer dúvida é só falar. 👍`
-        : `Olá, ${nome}! Segue o link da sua proposta para aprovação:\n\n${link}\n\nQualquer dúvida é só falar. 👍`;
+      // Links: um por documento PAKT (criados agora ou já existentes), senão o aceite
+      let links: string[] = paktDocs.map(d => `${d.titulo}:\n${d.signUrl}`);
+      if (links.length === 0 && p.paktSignUrl) links = [p.paktSignUrl];
+      const texto = links.length > 0
+        ? `Olá, ${nome}! Segue${links.length > 1 ? "m os links" : " o link"} para assinar ${links.length > 1 ? "os documentos" : "o documento"} de ${emitenteNome}:\n\n${links.join("\n\n")}\n\nQualquer dúvida é só falar. 👍`
+        : `Olá, ${nome}! Segue o link da sua proposta "${p.titulo}" de ${emitenteNome} para aprovação:\n\n${appUrl}/api/proposta/${p.tokenAceite}\n\nQualquer dúvida é só falar. 👍`;
 
-      await sendText({ baseUrl: evoUrl, apiKey: evoKey, instancia: evoInst }, to, texto);
-      return { ok: true };
+      await sendText(evo, to, texto);
+      console.log(`[Proposta] WhatsApp via instância ${evo.instancia} (escritório ${p.emitente.nome})`);
+      console.log(`[Proposta] WhatsApp enviado para ${to}: ${links.length} link(s) PAKT`);
+
+      if (p.status === "RASCUNHO" || p.revisaoStatus === "PENDENTE") {
+        await prisma.proposta.update({
+          where: { id: p.id },
+          data: {
+            ...(p.status === "RASCUNHO" ? { status: "ENVIADA" } : {}),
+            ...(p.revisaoStatus === "PENDENTE" ? { revisaoStatus: "LIBERADA", revisadoEm: new Date() } : {}),
+          } as any,
+        });
+      }
+      return { ok: true, usandoPakt: links.length > 0, paktDocs: paktDocs.length };
+    }),
+
+  // Quantas propostas do agente estão paradas esperando revisão (badge do menu)
+  pendentesDeRevisao: authProc
+    .query(async ({ ctx }) => {
+      return prisma.proposta.count({
+        where: { ...whereEmitenteFilter(ctx), revisaoStatus: "PENDENTE" } as any,
+      });
+    }),
+
+  // Revisão aprovada: converte em contrato, cria os envelopes no PAKT e manda os
+  // links ao cliente pela mesma instância de WhatsApp que fez a coleta.
+  liberarParaAssinatura: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const p = await prisma.proposta.findUniqueOrThrow({
+        where:  { id: input.id },
+        select: { emitenteId: true, revisaoStatus: true } as any,
+      }) as any;
+      assertEmitenteAccess(ctx, p.emitenteId);
+      if (p.revisaoStatus === "LIBERADA") throw new Error("Esta proposta já foi liberada para assinatura");
+
+      const { enviarPropostaParaAssinatura } = await import("../agent/proposal-engine.js");
+      const revisor = ctx.userId
+        ? await prisma.usuario.findUnique({ where: { id: ctx.userId }, select: { nome: true, email: true } })
+        : null;
+      const revisadoPor = revisor?.nome || revisor?.email || ctx.userId;
+      const r = await enviarPropostaParaAssinatura(input.id, { revisadoPor });
+
+      const docs = await (prisma as any).documentoGerado.count({ where: { propostaId: input.id } });
+      return { ok: true, enviado: r.enviado, paktDocs: r.paktDocs, docs };
     }),
 
   converterEmContrato: authProc

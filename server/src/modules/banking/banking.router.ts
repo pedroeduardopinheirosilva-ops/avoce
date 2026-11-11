@@ -172,7 +172,7 @@ const statementsRouter = router({
       endDate:                z.string().datetime().optional(),
       reconciliationStatus:   z.string().optional(),
       skip:                   z.number().int().min(0).default(0),
-      take:                   z.number().int().min(1).max(200).default(50),
+      take:                   z.number().int().min(1).max(2000).default(50),
     }))
     .query(({ input, ctx }) => {
       assertEmitenteAccess(ctx, input.emitenteId);
@@ -293,6 +293,32 @@ const reconciliationRouter = router({
       return reconciliationService.unmatch(input.emitenteId, input.statementId);
     }),
 
+  ignore: authProc
+    .input(z.object({ emitenteId: z.string(), statementId: z.string() }))
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.ignore(
+        input.emitenteId,
+        input.statementId,
+        (ctx as { userId?: string }).userId
+      );
+    }),
+
+  applyAllSuggestions: authProc
+    .input(z.object({
+      emitenteId:    z.string(),
+      bankAccountId: z.string(),
+      minConfidence: z.number().min(0.5).max(1).default(0.9),
+    }))
+    .mutation(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.applyAllSuggestions(
+        input.emitenteId,
+        input.bankAccountId,
+        input.minConfidence
+      );
+    }),
+
   suggestions: authProc
     .input(z.object({ emitenteId: z.string(), bankAccountId: z.string() }))
     .query(({ input, ctx }) => {
@@ -305,6 +331,17 @@ const reconciliationRouter = router({
     .query(({ input, ctx }) => {
       assertEmitenteAccess(ctx, input.emitenteId);
       return reconciliationService.getUnmatched(input.emitenteId, input.bankAccountId);
+    }),
+
+  matched: authProc
+    .input(z.object({
+      emitenteId:    z.string(),
+      bankAccountId: z.string().optional(),
+      take:          z.number().int().min(1).max(500).default(100),
+    }))
+    .query(({ input, ctx }) => {
+      assertEmitenteAccess(ctx, input.emitenteId);
+      return reconciliationService.getMatched(input.emitenteId, input.bankAccountId, input.take);
     }),
 
   stats: authProc

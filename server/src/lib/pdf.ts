@@ -2,6 +2,8 @@
 // Geração de PDF a partir de HTML usando Puppeteer (Chromium headless)
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { existsSync } from "node:fs";
+
 let puppeteerMod: typeof import("puppeteer") | null = null;
 
 async function getPuppeteer() {
@@ -11,11 +13,22 @@ async function getPuppeteer() {
   return puppeteerMod;
 }
 
+function resolveChrome(): string | undefined {
+  const candidates = [
+    process.env["PUPPETEER_EXECUTABLE_PATH"],
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+  ];
+  for (const p of candidates) {
+    if (p && existsSync(p)) return p;
+  }
+  return undefined; // deixa o puppeteer resolver o Chrome do cache do próprio usuário
+}
+
 export async function htmlToPdf(html: string): Promise<Buffer> {
   const pup = await getPuppeteer();
-  const executablePath =
-    process.env["PUPPETEER_EXECUTABLE_PATH"] ||
-    "/root/.cache/puppeteer/chrome/linux-146.0.7680.153/chrome-linux64/chrome";
+  const executablePath = resolveChrome();
   const browser = await pup.launch({
     headless: true,
     executablePath,

@@ -219,12 +219,31 @@ export async function consultarBoleto(cfg: SicoobBoletoConfig, nossoNumero: numb
   const res = result["resultado"];
   const b = (Array.isArray(res) ? res[0] : res) as Record<string, unknown>;
 
+  // A API v3 não traz dataPagamento/valorPago como campos diretos: a liquidação
+  // vem no listaHistorico (tipoHistorico "6", ex.: "LIQUIDAÇÃO - VIA
+  // COMPENSAÇÃO - R$3.242,00" com dataHistorico = data do pagamento).
+  let dataPagamento = (b["dataPagamento"] as string) ?? undefined;
+  let valorPago     = (b["valorPago"]     as number) ?? undefined;
+  const hist = b["listaHistorico"];
+  if (!dataPagamento && Array.isArray(hist)) {
+    const liq = [...hist].reverse().find(
+      (h) => String((h as Record<string, unknown>)?.["tipoHistorico"]) === "6"
+    ) as Record<string, unknown> | undefined;
+    if (liq) {
+      dataPagamento = (liq["dataHistorico"] as string) ?? undefined;
+      if (valorPago == null) {
+        const m = String(liq["descricaoHistorico"] ?? "").match(/R\$\s*([\d.]+,\d{2})/);
+        if (m) valorPago = Number(m[1].replace(/\./g, "").replace(",", "."));
+      }
+    }
+  }
+
   return {
     situacao:       (b["situacaoBoleto"] as string) ?? "DESCONHECIDO",
     dataVencimento: (b["dataVencimento"] as string) ?? "",
     valor:          (b["valor"]          as number) ?? 0,
-    valorPago:      (b["valorPago"]      as number) ?? undefined,
-    dataPagamento:  (b["dataPagamento"]  as string) ?? undefined,
+    valorPago,
+    dataPagamento,
     nossoNumero:    (b["nossoNumero"]    as number) ?? nossoNumero,
     linhaDigitavel: (b["linhaDigitavel"] as string) ?? "",
     codigoBarras:   (b["codigoBarras"]   as string) ?? "",

@@ -2,7 +2,7 @@ import { z }                from "zod";
 import { TRPCError }        from "@trpc/server";
 import { router, authProc } from "./trpc.js";
 import { prisma }           from "../db.js";
-import { whereEmpresa }     from "./tenant-utils.js";
+import { whereEmpresa, canOperate } from "./tenant-utils.js";
 
 const ESTADOS_CIVIS = ["solteiro", "casada", "divorciado", "viuvo", "uniao_estavel"] as const;
 
@@ -135,9 +135,7 @@ export const tomadorRouter = router({
         where: { id: input.id },
         include: { administradores: { orderBy: { criadoEm: "asc" } } },
       });
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        if (tomador.empresaId !== ctx.empresaId) throw new Error("Tomador não pertence à sua empresa");
-      }
+      if (!canOperate(ctx, tomador.empresaId)) throw new Error("Tomador não pertence à sua empresa");
       return tomador;
     }),
 
@@ -167,10 +165,8 @@ export const tomadorRouter = router({
     .input(tomadorInput.partial().extend({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       const { id, dataNascimento, dataConstituicao, empresaId: inputEmpresaId, ...rest } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const tomador = await prisma.tomador.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!tomador || tomador.empresaId !== ctx.empresaId) throw new Error("Tomador não pertence à sua empresa");
-      }
+      const tomador = await prisma.tomador.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!tomador || !canOperate(ctx, tomador.empresaId)) throw new Error("Tomador não pertence à sua empresa");
       // Só toca em empresaId quando enviado e resolúvel para uma Empresa válida.
       let empresaUpdate: { empresaId?: string } = {};
       if (inputEmpresaId) {
@@ -192,10 +188,8 @@ export const tomadorRouter = router({
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       const { id } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const tomador = await prisma.tomador.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!tomador || tomador.empresaId !== ctx.empresaId) throw new Error("Tomador não pertence à sua empresa");
-      }
+      const tomador = await prisma.tomador.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!tomador || !canOperate(ctx, tomador.empresaId)) throw new Error("Tomador não pertence à sua empresa");
       return prisma.tomador.delete({ where: { id: input.id } });
     }),
 
@@ -214,10 +208,8 @@ export const tomadorRouter = router({
     .input(adminInput.partial().extend({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       const { id, dataNascimento, ...rest } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const adm = await (prisma as any).administrador.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!adm || adm.empresaId !== ctx.empresaId) throw new Error("Administrador não pertence à sua empresa");
-      }
+      const adm = await (prisma as any).administrador.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!adm || !canOperate(ctx, adm.empresaId)) throw new Error("Administrador não pertence à sua empresa");
       return (prisma as any).administrador.update({
         where: { id },
         data: {
@@ -231,10 +223,8 @@ export const tomadorRouter = router({
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       const { id } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const adm = await (prisma as any).administrador.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!adm || adm.empresaId !== ctx.empresaId) throw new Error("Administrador não pertence à sua empresa");
-      }
+      const adm = await (prisma as any).administrador.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!adm || !canOperate(ctx, adm.empresaId)) throw new Error("Administrador não pertence à sua empresa");
       return (prisma as any).administrador.delete({ where: { id: input.id } });
     }),
 });

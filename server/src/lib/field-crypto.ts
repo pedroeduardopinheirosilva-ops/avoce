@@ -27,6 +27,12 @@ export function fieldEncrypt(plaintext: string): string {
   return `${PREFIX}${iv.toString("hex")}:${authTag.toString("hex")}:${enc.toString("hex")}`;
 }
 
+// Idempotent: se o valor já vem criptografado (ex.: frontend devolve o valor
+// "enc:..." carregado do banco ao salvar o formulário), não criptografa de novo.
+export function fieldEncryptIfPlain(value: string): string {
+  return value.startsWith(PREFIX) ? value : fieldEncrypt(value);
+}
+
 export function fieldDecrypt(value: string | null | undefined): string {
   if (!value) return "";
   if (!value.startsWith(PREFIX)) return value; // plaintext legacy value

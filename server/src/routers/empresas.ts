@@ -6,7 +6,7 @@ import nodemailer                   from "nodemailer";
 import { existsSync, readFileSync } from "node:fs";
 import { certPathForEmpresa }       from "../upload.js";
 import { extrairMetaCert }          from "../lib/nfse.js";
-import { fieldEncrypt, fieldDecrypt } from "../lib/field-crypto.js";
+import { fieldEncrypt, fieldEncryptIfPlain, fieldDecrypt } from "../lib/field-crypto.js";
 
 export const empresaRouter = router({
   listar: authProc.query(async ({ ctx }) => {
@@ -50,7 +50,7 @@ export const empresaRouter = router({
       codigoServicoNacional:    z.string().optional().nullable(),
       codigoNbs:                z.string().optional().nullable(),
       regimeTributacao:         z.string().optional().nullable(),
-      nfseProvider:             z.enum(["el_vdc", "issnet_df"]).optional().nullable(),
+      nfseProvider:             z.enum(["el_vdc", "issnet_df", "sefin_nacional"]).optional().nullable(),
       codigoCnae:               z.string().optional().nullable(),
       smtpHost:           z.string().optional().nullable(),
       smtpPort:           z.number().int().optional().nullable(),
@@ -61,8 +61,8 @@ export const empresaRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       const data: any = { ...input, empresaId: ctx.empresaId ?? undefined };
-      if (data.smtpPass) data.smtpPass = fieldEncrypt(data.smtpPass);
-      if (data.certPass) data.certPass = fieldEncrypt(data.certPass);
+      if (data.smtpPass) data.smtpPass = fieldEncryptIfPlain(data.smtpPass);
+      if (data.certPass) data.certPass = fieldEncryptIfPlain(data.certPass);
       return prisma.empresaEmitente.create({ data });
     }),
 
@@ -90,7 +90,7 @@ export const empresaRouter = router({
       codigoServicoNacional:    z.string().optional().nullable(),
       codigoNbs:                z.string().optional().nullable(),
       regimeTributacao:         z.string().optional().nullable(),
-      nfseProvider:             z.enum(["el_vdc", "issnet_df"]).optional().nullable(),
+      nfseProvider:             z.enum(["el_vdc", "issnet_df", "sefin_nacional"]).optional().nullable(),
       codigoCnae:               z.string().optional().nullable(),
       ativo:              z.boolean().optional(),
       smtpHost:           z.string().optional().nullable(),
@@ -100,6 +100,7 @@ export const empresaRouter = router({
       smtpPass:           z.string().optional().nullable(),
       smtpFrom:           z.string().optional().nullable(),
       certPass:           z.string().optional().nullable(),
+      nfseToken:          z.string().optional().nullable(),   // E&L DPS: token de integração
       // Sicoob PIX
       pixClientId:        z.string().optional().nullable(),
       pixChave:           z.string().optional().nullable(),
@@ -129,8 +130,9 @@ export const empresaRouter = router({
     .mutation(async ({ input, ctx }) => {
       const { id, ...data }: any = input;
       assertEmitenteAccess(ctx, id);
-      if (data.smtpPass) data.smtpPass = fieldEncrypt(data.smtpPass);
-      if (data.certPass) data.certPass = fieldEncrypt(data.certPass);
+      if (data.smtpPass) data.smtpPass = fieldEncryptIfPlain(data.smtpPass);
+      if (data.certPass) data.certPass = fieldEncryptIfPlain(data.certPass);
+      if (data.nfseToken) data.nfseToken = fieldEncryptIfPlain(data.nfseToken);
       return prisma.empresaEmitente.update({ where: { id }, data });
     }),
 

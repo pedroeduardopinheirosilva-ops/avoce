@@ -27,6 +27,70 @@ import PizZip               from "pizzip";
 
 export const TIPOS_TEMPLATE = ["PROPOSTA", "CONTRATO", "PROCURACAO", "OUTRO"] as const;
 
+// ── Guarda anti-contaminação de template ──────────────────────────────────────
+// Um template é um MODELO: os dados da parte contrária têm que vir de {{variáveis}}.
+// Colar um contrato já preenchido aqui faz todos os clientes seguintes receberem
+// o nome/CNPJ do cliente antigo — sem erro nenhum no log. Ver checarTemplate().
+
+const VARS_DA_PARTE = [
+  "tomador", "cpfCnpj", "qualificacaoPJ", "qualificacaoPF",
+  "administrador", "qualificacaoAdministrador", "enderecoTomador",
+] as const;
+
+const RE_CNPJ = /\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}-?\d{2}\b/g;
+
+export function checarTemplate(
+  textoHtml: string,
+  emitenteCnpj?: string | null,
+): { alertas: string[] } {
+  const soDigitos = (v: string) => v.replace(/\D/g, "");
+  const texto     = textoHtml.replace(/<[^>]*>/g, " ");
+  const usadas    = new Set(
+    [...textoHtml.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]),
+  );
+
+  const alertas: string[] = [];
+
+  if (!VARS_DA_PARTE.some(v => usadas.has(v))) {
+    alertas.push(
+      "o texto não usa nenhuma variável do cliente ({{tomador}}, {{cpfCnpj}}, " +
+      "{{enderecoTomador}}, {{qualificacaoPJ}}...) — do jeito que está, todo " +
+      "documento gerado sairá com os dados de quem estiver escrito no texto",
+    );
+  }
+
+  const cnpjEmitente = soDigitos(emitenteCnpj ?? "");
+  const cnpjsAlheios = [...new Set(
+    (texto.match(RE_CNPJ) ?? [])
+      .map(soDigitos)
+      .filter(d => d.length === 14 && d !== cnpjEmitente),
+  )];
+  if (cnpjsAlheios.length > 0) {
+    alertas.push(
+      `há CNPJ de terceiro escrito no texto (${cnpjsAlheios.map(fmtCnpjDoc).join(", ")}) — ` +
+      "num modelo o CNPJ do cliente deve ser {{cpfCnpj}}",
+    );
+  }
+
+  return { alertas };
+}
+
+function normalizarTexto(v: string): string {
+  return v
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+function erroTemplateContaminado(alertas: string[]): Error {
+  return new Error(
+    "TEMPLATE_SUSPEITO: " + alertas.join("; ") +
+    ". Se for mesmo um documento de cliente único, salve marcando a confirmação.",
+  );
+}
+
 // ── HTML wrapper para documentos gerados ─────────────────────────────────────
 
 function fmtCnpjDoc(v: string): string {
@@ -34,6 +98,11 @@ function fmtCnpjDoc(v: string): string {
   if (d.length === 14) return `${d.slice(0,2)}.${d.slice(2,5)}.${d.slice(5,8)}/${d.slice(8,12)}-${d.slice(12)}`;
   if (d.length === 11) return `${d.slice(0,3)}.${d.slice(3,6)}.${d.slice(6,9)}-${d.slice(9)}`;
   return v;
+}
+
+// Percentual aceita fração (12,5%) — separador decimal em pt-BR, sem zero à toa
+function fmtPercDoc(v: number): string {
+  return v.toLocaleString("pt-BR", { maximumFractionDigits: 2 });
 }
 
 function fmtValorDoc(c: number): string {
@@ -178,8 +247,8 @@ export function buildVars(
     valor:             contrato?.valorEstimado ? fmtValorDoc(contrato.valorEstimado) : "",
     diaVencimento:     contrato?.contratoDiaVencimento ? String(contrato.contratoDiaVencimento) : "",
     metodoPagamento:   metodosLabel[contrato?.contratoMetodoCobr ?? ""] ?? "",
-    honorariosExitoPerc: contrato?.honorariosExitoPerc != null ? String(contrato.honorariosExitoPerc) : "",
-    honorariosExito:     contrato?.honorariosExitoPerc != null ? `${contrato.honorariosExitoPerc}%` : "",
+    honorariosExitoPerc: contrato?.honorariosExitoPerc != null ? fmtPercDoc(contrato.honorariosExitoPerc) : "",
+    honorariosExito:     contrato?.honorariosExitoPerc != null ? `${fmtPercDoc(contrato.honorariosExitoPerc)}%` : "",
     servico:           contrato?.contratoDescricao ?? "",
     validadeAte:       contrato?.validadeAte
       ? new Date(contrato.validadeAte).toLocaleDateString("pt-BR")
@@ -214,10 +283,45 @@ export function buildVars(
   };
 }
 
+// Blocos condicionais: {{#var}}...{{/var}} sai só se a variável estiver preenchida,
+// {{^var}}...{{/var}} só se estiver vazia. Sem isso, cláusula opcional (êxito, parcelas,
+// representante legal) vira buraco no texto de toda proposta que não usa aquele campo.
+const MARCA_VAZIO = "\u0000";
+
+function renderSecoes(html: string, vars: Record<string, string>): string {
+  const RE_SECAO = /\{\{([#^])(\w+)\}\}([\s\S]*?)\{\{\/\2\}\}/;
+
+  // Marcador sozinho num parágrafo (jeito natural de escrever no editor) é
+  // desembrulhado antes, senão sobra <p></p> vazio quando o bloco é mantido
+  let out = html.replace(
+    /<(p|h[1-6])\b[^>]*>\s*(?:&nbsp;|\s)*(\{\{[#^/]\w+\}\})(?:&nbsp;|\s)*\s*<\/\1>/g,
+    (_m, _tag, marcador) => marcador,
+  );
+
+  // Resolve de fora pra dentro (a referência \2 casa o fechamento do mesmo nome),
+  // o que permite bloco aninhado
+  for (let i = 0; i < 50; i++) {
+    const m = RE_SECAO.exec(out);
+    if (!m) break;
+    const [inteiro, tipo, nome, conteudo] = m;
+    const preenchida = String(vars[nome] ?? "").trim() !== "";
+    const manter     = tipo === "#" ? preenchida : !preenchida;
+    // replacer como função: conteúdo com "$&"/"R$" não pode ser interpretado
+    out = out.replace(inteiro, () => (manter ? conteudo : MARCA_VAZIO));
+  }
+
+  // Bloco descartado que ocupava um parágrafo/título inteiro leva a tag junto,
+  // senão sobra <p></p> abrindo um vão no documento
+  return out
+    .replace(new RegExp(`<(p|h[1-6]|li)\\b[^>]*>\\s*(?:&nbsp;|\\s)*${MARCA_VAZIO}(?:&nbsp;|\\s)*\\s*<\\/\\1>`, "g"), "")
+    .replace(new RegExp(MARCA_VAZIO, "g"), "");
+}
+
 export function renderTemplateDoc(html: string, vars: Record<string, string>): string {
+  const comSecoes = renderSecoes(html, vars);
   return Object.entries(vars).reduce(
     (acc, [k, v]) => acc.replace(new RegExp(`\\{\\{${k}\\}\\}`, "gi"), v),
-    html,
+    comSecoes,
   );
 }
 
@@ -402,8 +506,21 @@ export async function gerarDocumentosProposta(propostaId: string): Promise<void>
   }
   console.log(`[Doc] whereTemplates=${JSON.stringify(whereTemplates)}`);
 
-  const templates = await (prisma as any).templateDocumento.findMany({ where: whereTemplates });
+  let templates = await (prisma as any).templateDocumento.findMany({ where: whereTemplates });
   console.log(`[Doc] ${templates.length} template(s) encontrado(s): ${templates.map((t: any) => t.tipo + "/" + t.id).join(", ")}`);
+
+  // Sem seleção explícita na proposta, o filtro pega TODOS os modelos ativos do
+  // emitente — inclusive documento de cliente único salvo como template, que sairia
+  // com os dados daquele cliente. Nesse caso, gerar só o que é modelo de verdade.
+  if (!templateIds || templateIds.length === 0) {
+    const seguros = templates.filter(
+      (t: any) => checarTemplate(t.textoHtml, proposta.emitente?.cnpj).alertas.length === 0,
+    );
+    for (const t of templates.filter((x: any) => !seguros.includes(x))) {
+      console.warn(`[Doc] Template ${t.id} ("${t.titulo}") ignorado: não é modelo (sem variável do cliente / CNPJ de terceiro no texto)`);
+    }
+    templates = seguros;
+  }
 
   if (templates.length === 0) { console.warn("[Doc] Nenhum template encontrado, saindo"); return; }
 
@@ -503,9 +620,19 @@ export const templateDocumentoRouter = router({
       tipo:       z.enum(TIPOS_TEMPLATE),
       titulo:     z.string().min(3),
       textoHtml:  z.string().min(10),
+      forcar:     z.boolean().optional(),
     }))
     .mutation(async ({ input }) => {
-      return (prisma as any).templateDocumento.create({ data: input });
+      const { forcar, ...data } = input;
+      if (!forcar) {
+        const emitente = await (prisma as any).empresaEmitente.findUnique({
+          where:  { id: data.emitenteId },
+          select: { cnpj: true },
+        });
+        const { alertas } = checarTemplate(data.textoHtml, emitente?.cnpj);
+        if (alertas.length > 0) throw erroTemplateContaminado(alertas);
+      }
+      return (prisma as any).templateDocumento.create({ data });
     }),
 
   atualizar: authProc
@@ -515,9 +642,18 @@ export const templateDocumentoRouter = router({
       textoHtml: z.string().min(10).optional(),
       tipo:      z.enum(TIPOS_TEMPLATE).optional(),
       ativo:     z.boolean().optional(),
+      forcar:    z.boolean().optional(),
     }))
     .mutation(async ({ input }) => {
-      const { id, ...data } = input;
+      const { id, forcar, ...data } = input;
+      if (data.textoHtml && !forcar) {
+        const atual = await (prisma as any).templateDocumento.findUnique({
+          where:   { id },
+          include: { emitente: { select: { cnpj: true } } },
+        });
+        const { alertas } = checarTemplate(data.textoHtml, atual?.emitente?.cnpj);
+        if (alertas.length > 0) throw erroTemplateContaminado(alertas);
+      }
       return (prisma as any).templateDocumento.update({ where: { id }, data });
     }),
 
@@ -531,13 +667,31 @@ export const templateDocumentoRouter = router({
   listarDocumentosProposta: authProc
     .input(z.object({ propostaId: z.string() }))
     .query(async ({ input }) => {
-      return (prisma as any).documentoGerado.findMany({
+      const docs = await (prisma as any).documentoGerado.findMany({
         where: { propostaId: input.propostaId },
         orderBy: { criadoEm: "asc" },
         select: {
           id: true, tipo: true, titulo: true,
-          pdfPath: true, docxPath: true, htmlEditado: true, criadoEm: true,
+          pdfPath: true, docxPath: true, htmlEditado: true, criadoEm: true, atualizadoEm: true,
         },
+      });
+
+      // Alerta: documento gerado que não menciona o cliente da proposta quase
+      // sempre veio de template contaminado (texto de outro cliente colado no modelo)
+      const proposta = await (prisma as any).proposta.findUnique({
+        where:  { id: input.propostaId },
+        select: { tomador: { select: { nome: true } } },
+      });
+      const nomeCliente = normalizarTexto(proposta?.tomador?.nome ?? "");
+
+      return docs.map((d: any) => {
+        const html = String(d.htmlEditado ?? "").trim();
+        return {
+          ...d,
+          // Documento antigo sem htmlEditado não dá para conferir — não alarma à toa
+          semDadosDoCliente: !!nomeCliente && html.length > 0 &&
+            !normalizarTexto(html.replace(/<[^>]*>/g, " ")).includes(nomeCliente),
+        };
       });
     }),
 
@@ -620,7 +774,7 @@ export const templateDocumentoRouter = router({
 
 <p><strong>CONTRATADO:</strong> <strong>{{emitente}}</strong>, inscrito no CNPJ sob o nº <strong>{{cnpj}}</strong>, com endereço em {{endereco}}.</p>
 
-<p><strong>CONTRATANTE:</strong> <strong>{{tomador}}</strong>, inscrito no CPF/CNPJ nº <strong>{{cpfCnpj}}</strong>, com endereço em {{enderecoTomador}}, e-mail: {{emailTomador}}.</p>
+<p><strong>CONTRATANTE:</strong> <strong>{{tomador}}</strong>, inscrito no CPF/CNPJ nº <strong>{{cpfCnpj}}</strong>, com endereço em {{enderecoTomador}}, telefone {{telefoneTomador}}, e-mail: {{emailTomador}}.</p>
 
 <h3>CLÁUSULA 1ª — DO OBJETO</h3>
 
@@ -673,7 +827,7 @@ export const templateDocumentoRouter = router({
     titulo: "Procuração Ad Judicia",
     textoHtml: `<h2 style="text-align:center">PROCURAÇÃO AD JUDICIA ET EXTRA</h2>
 
-<p><strong>OUTORGANTE:</strong> <strong>{{tomador}}</strong>, inscrito(a) no CPF/CNPJ nº <strong>{{cpfCnpj}}</strong>, com endereço em {{enderecoTomador}}, e-mail: {{emailTomador}}.</p>
+<p><strong>OUTORGANTE:</strong> <strong>{{tomador}}</strong>, inscrito(a) no CPF/CNPJ nº <strong>{{cpfCnpj}}</strong>, com endereço em {{enderecoTomador}}, telefone {{telefoneTomador}}, e-mail: {{emailTomador}}.</p>
 
 <p><strong>OUTORGADO:</strong> Os advogados do escritório <strong>{{emitente}}</strong>, inscrito no CNPJ sob o nº <strong>{{cnpj}}</strong>, com endereço em {{endereco}}, e respectivos substabelecidos.</p>
 

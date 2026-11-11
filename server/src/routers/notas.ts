@@ -2,7 +2,9 @@ import { z }                from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma }           from "../db.js";
 import { whereEmitenteFilter, assertEmitenteAccess } from "./tenant-utils.js";
-import { emitirNfse, cancelarNfse, consultarNfse, providerMunicipio, type EmpresaConfig } from "../lib/nfse.js";
+import { emitirNfse, cancelarNfse, consultarNfse, dadosNotaEmitida, providerMunicipio, type EmpresaConfig } from "../lib/nfse.js";
+import { consultarNfseChave, canalDaNota } from "../lib/nfse-dps.js";
+import { enviarNfseSeNecessario } from "../lib/email-cobranca.js";
 import { certPathForEmpresa } from "../upload.js";
 import { renderTemplate }   from "../lib/template.js";
 import { gerarCobrancaParaContrato } from "../lib/gerar-cobranca.js";
@@ -27,6 +29,7 @@ async function getCfg(emitenteId: string): Promise<EmpresaConfig> {
     codigoMunicipioEmitente: emp.codigoMunicipio ?? undefined,
     codigoCnae:              (emp as any).codigoCnae ?? undefined,
     tpAmb:                   ((emp as any).nfseTpAmb as "1" | "2" | null) ?? undefined,
+    nfseToken:               fieldDecrypt(emp.nfseToken) || undefined,
   };
 }
 
@@ -146,15 +149,9 @@ export const notaRouter = router({
 
         const notaAtualizada = await prisma.notaFiscal.update({
           where: { id: nota.id },
-          data: {
-            status:      "EMITIDA",
-            numero:      result.numero,
-            codigoVerif: result.codigoVerif,
-            xmlRetorno:  result.xmlRetorno,
-            linkNfse:    result.linkNfse,
-            emitidoEm:   new Date(),
-          },
+          data:  dadosNotaEmitida(result),
         });
+        enviarNfseSeNecessario(nota.id).catch((e) => console.error(`[NFS-e] E-mail da nota ${nota.id}:`, e));
 
         return notaAtualizada;
       } catch (err) {
@@ -219,6 +216,7 @@ export const notaRouter = router({
         let nfseNumero: string | undefined;
         let erroNfse:   string | undefined;
         let erroCob:    string | undefined;
+        let notaEmitidaId: string | undefined;
 
         // ── NFS-e ──────────────────────────────────────────────────────────────
         if (nfseAoFaturar) {
@@ -269,11 +267,11 @@ export const notaRouter = router({
               });
               await prisma.notaFiscal.update({
                 where: { id: nota.id },
-                data:  { status: "EMITIDA", numero: result.numero, codigoVerif: result.codigoVerif,
-                         xmlRetorno: result.xmlRetorno, linkNfse: result.linkNfse, emitidoEm: new Date() },
+                data:  dadosNotaEmitida(result),
               });
               nfseStatus = "EMITIDA";
-              nfseNumero = result.numero;
+              nfseNumero = result.pendente ? `DPS ${result.nDps} em processamento` : result.numero;
+              if (!result.pendente) notaEmitidaId = nota.id;
             } catch (err) {
               const msg = (err instanceof Error ? err.message : String(err)).slice(0, 500);
               await prisma.notaFiscal.update({ where: { id: nota.id }, data: { status: "ERRO", erroMsg: msg } });
@@ -302,6 +300,11 @@ export const notaRouter = router({
           }
         }
 
+        // Depois da cobrança: se ela já tinha saído (sem a nota), a NFS-e vai avulsa
+        if (notaEmitidaId) {
+          enviarNfseSeNecessario(notaEmitidaId).catch((e) => console.error(`[NFS-e] E-mail da nota ${notaEmitidaId}:`, e));
+        }
+
         resultados.push({
           contratoId: contrato.id,
           tomador:    contrato.tomador.nome,
@@ -319,14 +322,14 @@ export const notaRouter = router({
     .mutation(async ({ input, ctx }) => {
       const nota = await prisma.notaFiscal.findUniqueOrThrow({
         where: { id: input.id },
-        select: { emitenteId: true, status: true, numero: true, contratoId: true, competencia: true },
+        select: { emitenteId: true, status: true, numero: true, chaveAcesso: true, xmlRetorno: true, contratoId: true, competencia: true },
       });
       assertEmitenteAccess(ctx, nota.emitenteId);
       if (nota.status !== "EMITIDA") throw new Error("Apenas notas emitidas podem ser canceladas");
       if (!nota.numero) throw new Error("Nota sem número");
 
       const cfg = await getCfg(nota.emitenteId);
-      await cancelarNfse(cfg, nota.numero);
+      await cancelarNfse(cfg, nota.numero, nota.chaveAcesso, nota.xmlRetorno);
 
       await prisma.notaFiscal.update({
         where: { id: input.id },
@@ -353,12 +356,14 @@ export const notaRouter = router({
     .query(async ({ input, ctx }) => {
       const nota = await prisma.notaFiscal.findUniqueOrThrow({
         where: { id: input.id },
-        select: { emitenteId: true, numero: true },
+        select: { emitenteId: true, numero: true, chaveAcesso: true, xmlRetorno: true },
       });
       assertEmitenteAccess(ctx, nota.emitenteId);
       if (!nota.numero) throw new Error("Nota sem número emitido");
       const cfg = await getCfg(nota.emitenteId);
-      return consultarNfse(cfg, nota.numero);
+      return nota.chaveAcesso
+        ? consultarNfseChave(cfg, nota.chaveAcesso, canalDaNota(nota.xmlRetorno))
+        : consultarNfse(cfg, nota.numero);
     }),
 
   // Verifica todas as notas EMITIDAS no E&L e marca como CANCELADA as que foram canceladas na prefeitura.
@@ -366,7 +371,8 @@ export const notaRouter = router({
   sincronizarCanceladas: authProc.mutation(async ({ ctx }) => {
     const emitenteFilter = whereEmitenteFilter(ctx);
     const notas = await prisma.notaFiscal.findMany({
-      where:   { status: "EMITIDA", numero: { not: null }, ...emitenteFilter },
+      // Só notas ABRASF: a heurística de consultarNfse marcaria nota DPS (nº nacional) como cancelada
+      where:   { status: "EMITIDA", numero: { not: null }, chaveAcesso: null, ...emitenteFilter },
       include: { emitente: true },
     });
 

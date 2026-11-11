@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { trpc } from "../lib/trpc";
 import RichEditor from "../components/RichEditor";
+import OnlyOfficeEditor from "../components/OnlyOfficeEditor";
 import type { RichEditorHandle } from "../components/RichEditor";
 
 const VARIAVEIS_PROPOSTA = [
@@ -19,6 +20,18 @@ const VARIAVEIS_PROPOSTA = [
   { v: "{{validadeAte}}",      desc: "Validade da proposta" },
   { v: "{{servico}}",          desc: "Descrição do serviço" },
 ];
+
+// A declaração de hipossuficiência é cadastrada como tipo OUTRO — sem olhar o
+// título, ela apareceria no menu como um "Doc" qualquer no meio da revisão.
+const TIPO_DOC_LABEL = (tipo: string, titulo = "") =>
+  tipo === "CONTRATO"   ? "Contrato" :
+  tipo === "PROCURACAO" ? "Procuração" :
+  /declara/i.test(titulo) ? "Declaração" : "Doc";
+
+const TIPO_DOC_COR = (tipo: string) =>
+  tipo === "CONTRATO"   ? "bg-blue-100 text-blue-700" :
+  tipo === "PROCURACAO" ? "bg-purple-100 text-purple-700" :
+  "bg-gray-100 text-gray-700";
 
 // Componente que carrega e exibe os documentos gerados de uma proposta
 function DocsBotoes({ propostaId, onGerar, onEdit }: {
@@ -58,21 +71,24 @@ function DocsBotoes({ propostaId, onGerar, onEdit }: {
     );
   }
 
-  const tipoLabel = (tipo: string) =>
-    tipo === "CONTRATO" ? "Contrato" : tipo === "PROCURACAO" ? "Procuração" : "Doc";
-
-  const tipoCor = (tipo: string) =>
-    tipo === "CONTRATO"   ? "bg-blue-100 text-blue-700" :
-    tipo === "PROCURACAO" ? "bg-purple-100 text-purple-700" :
-    "bg-gray-100 text-gray-700";
+  const tipoLabel = TIPO_DOC_LABEL;
+  const tipoCor   = TIPO_DOC_COR;
 
   return (
     <>
       {(docs as any[]).map((doc: any) => (
-        <div key={doc.id} className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50">
+        <div key={doc.id} className={`flex items-center gap-2 px-3 py-2 hover:bg-gray-50 ${doc.semDadosDoCliente ? "bg-amber-50" : ""}`}>
           <span className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] font-semibold ${tipoCor(doc.tipo)}`}>
-            {tipoLabel(doc.tipo)}
+            {tipoLabel(doc.tipo, doc.titulo)}
           </span>
+          {doc.semDadosDoCliente && (
+            <span
+              className="shrink-0 text-amber-600 cursor-help"
+              title="Este documento não menciona o cliente da proposta — provavelmente o template tem texto de outro cliente. Confira antes de enviar."
+            >
+              ⚠️
+            </span>
+          )}
           <span className="flex-1 text-xs text-gray-600 truncate min-w-0" title={doc.titulo}>
             {doc.titulo}
           </span>
@@ -114,6 +130,140 @@ function DocsBotoes({ propostaId, onGerar, onEdit }: {
         🔄 Regenerar documentos
       </button>
     </>
+  );
+}
+
+// Painel de revisão: os documentos que a IA gerou (contrato, procuração,
+// declaração) antes de qualquer coisa sair para o cliente. O PDF é buscado com
+// o token e exibido por blob — o endpoint exige Authorization, então <iframe
+// src="/api/..."> mostraria só um 401.
+function RevisaoDocs({ propostaId, onEdit, onAbrirOO, onRegerar, regerando }: {
+  propostaId: string;
+  onEdit: (doc: any) => void;
+  onAbrirOO: (doc: any) => void;
+  onRegerar: () => void;
+  regerando: boolean;
+}) {
+  const { data: docs, isLoading } = trpc.templateDocumento.listarDocumentosProposta.useQuery({ propostaId });
+  const [selId, setSelId] = useState<string | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [erroPreview, setErroPreview] = useState<string | null>(null);
+
+  const selecionado = (docs as any[] | undefined)?.find(d => d.id === selId) ?? (docs as any[] | undefined)?.[0] ?? null;
+
+  useEffect(() => {
+    if (!selecionado) return;
+    let revogar: string | null = null;
+    let cancelado = false;
+    setErroPreview(null);
+    (async () => {
+      const token = localStorage.getItem("avoce_token");
+      const res = await fetch(`/api/documento-gerado/${selecionado.id}/pdf`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) { if (!cancelado) setErroPreview("PDF não disponível — regenere os documentos."); return; }
+      const url = URL.createObjectURL(await res.blob());
+      if (cancelado) { URL.revokeObjectURL(url); return; }
+      revogar = url;
+      setPreviewUrl(url);
+    })().catch(() => { if (!cancelado) setErroPreview("Falha ao carregar o PDF."); });
+    return () => { cancelado = true; if (revogar) URL.revokeObjectURL(revogar); };
+    // htmlEditado entra nas dependências porque `criadoEm` e `id` não mudam quando
+    // alguém corrige o texto: sem ele, o preview continuaria mostrando o PDF antigo.
+  }, [selecionado?.id, selecionado?.htmlEditado, selecionado?.atualizadoEm]);
+
+  async function baixar(doc: any, formato: "pdf" | "docx") {
+    const token = localStorage.getItem("avoce_token");
+    const res = await fetch(`/api/documento-gerado/${doc.id}/${formato}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) { alert(`${formato.toUpperCase()} não disponível`); return; }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${doc.tipo}-${doc.titulo.replace(/[^a-zA-Z0-9]/g, "-")}.${formato}`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  if (isLoading) return <p className="text-sm text-gray-400 p-6">Carregando documentos...</p>;
+
+  if (!docs || docs.length === 0) {
+    return (
+      <div className="p-6 text-center">
+        <p className="text-sm text-gray-500 mb-3">Nenhum documento gerado para esta proposta.</p>
+        <button onClick={onRegerar} disabled={regerando} className="btn-secondary">
+          {regerando ? "Gerando..." : "📋 Gerar documentos"}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col md:flex-row gap-4 p-4 min-h-0">
+      {/* Lista */}
+      <div className="md:w-64 flex-shrink-0 space-y-2">
+        {(docs as any[]).map(doc => (
+          <button
+            key={doc.id}
+            onClick={() => setSelId(doc.id)}
+            className={`w-full text-left border rounded-lg px-3 py-2 transition-colors ${
+              selecionado?.id === doc.id ? "border-brand-400 bg-brand-50" : "border-gray-200 hover:bg-gray-50"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${TIPO_DOC_COR(doc.tipo)}`}>
+                {TIPO_DOC_LABEL(doc.tipo, doc.titulo)}
+              </span>
+              {doc.semDadosDoCliente && <span className="text-amber-600" title="Documento não menciona o cliente — confira o template">⚠️</span>}
+            </div>
+            <p className="text-xs text-gray-700 mt-1 leading-snug">{doc.titulo}</p>
+          </button>
+        ))}
+        <button onClick={onRegerar} disabled={regerando}
+          className="w-full text-xs text-gray-500 hover:text-gray-700 border border-dashed border-gray-300 rounded-lg px-3 py-2">
+          {regerando ? "Regenerando..." : "🔄 Regenerar todos"}
+        </button>
+      </div>
+
+      {/* Preview */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {selecionado && (
+          <div className="flex items-center gap-2 mb-2 flex-wrap">
+            <span className="text-sm font-medium text-gray-800 truncate flex-1 min-w-0">{selecionado.titulo}</span>
+            <button onClick={() => baixar(selecionado, "pdf")} className="text-xs px-2 py-1 rounded border border-gray-200 hover:bg-gray-50">PDF</button>
+            {selecionado.docxPath && (
+              <button onClick={() => baixar(selecionado, "docx")} className="text-xs px-2 py-1 rounded border border-gray-200 hover:bg-gray-50">DOCX</button>
+            )}
+            <button
+              onClick={() => selecionado.docxPath && onAbrirOO(selecionado)}
+              disabled={!selecionado.docxPath}
+              title={selecionado.docxPath
+                ? "Abrir o DOCX timbrado no editor OnlyOffice"
+                : "Sem DOCX — regenere os documentos para habilitar o editor"}
+              className={`text-xs px-2 py-1 rounded border ${selecionado.docxPath ? "border-brand-400 bg-brand-50 text-brand-700 hover:bg-brand-100 font-medium" : "border-gray-200 text-gray-300 cursor-not-allowed"}`}
+            >
+              ✏️ Editar no OnlyOffice
+            </button>
+            {/* Editor de HTML antigo: só serve para documento sem DOCX (timbrado não-docx) */}
+            {!selecionado.docxPath && selecionado.htmlEditado && (
+              <button
+                onClick={() => onEdit(selecionado)}
+                title="Corrigir o texto e regerar o PDF"
+                className="text-xs px-2 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50"
+              >
+                Editar texto
+              </button>
+            )}
+          </div>
+        )}
+        {erroPreview
+          ? <div className="flex-1 flex items-center justify-center text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg">{erroPreview}</div>
+          : previewUrl
+            ? <iframe src={previewUrl} title="Documento" className="flex-1 w-full min-h-[420px] border border-gray-200 rounded-lg bg-gray-50" />
+            : <div className="flex-1 flex items-center justify-center text-sm text-gray-400 border border-gray-200 rounded-lg">Carregando PDF...</div>}
+      </div>
+    </div>
   );
 }
 
@@ -181,17 +331,23 @@ export default function Propostas() {
     { enabled: !!emitenteIdParaTemplates },
   );
   // Templates de proposta: sempre carregados da página Templates, sem fallback hardcoded
-  const { data: templatesProposta } = trpc.templateDocumento.listar.useQuery({ tipo: "PROPOSTA" });
+  // Filtrados pela empresa emitente selecionada — evita aplicar modelo de outro escritório
+  const { data: templatesProposta } = trpc.templateDocumento.listar.useQuery(
+    { tipo: "PROPOSTA", emitenteId: emitenteIdParaTemplates || undefined },
+  );
 
   const [page, setPage] = useState(1);
   const [filterStatus, setFilterStatus] = useState("");
+  const [soRevisao, setSoRevisao] = useState(false);
   const [filterEmitenteId, setFilterEmitenteId] = useState("");
   const { data, isLoading } = trpc.proposta.listar.useQuery({
     status: filterStatus || undefined,
     emitenteId: filterEmitenteId || undefined,
+    revisao: soRevisao ? "PENDENTE" as const : undefined,
     page,
     pageSize: 20,
   });
+  const { data: qtdRevisao } = trpc.proposta.pendentesDeRevisao.useQuery();
 
   const criar       = trpc.proposta.criar.useMutation({
     onSuccess: () => { utils.proposta.listar.invalidate(); setForm(null); },
@@ -245,6 +401,17 @@ export default function Propostas() {
     },
     onError: (e) => alert(`Erro: ${e.message}`),
   });
+  const liberar = trpc.proposta.liberarParaAssinatura.useMutation({
+    onSuccess: (r) => {
+      alert(r.enviado
+        ? `Liberado! ${r.paktDocs} documento(s) enviados para assinatura pelo WhatsApp do cliente.`
+        : `Documentos liberados e envelopes criados (${r.paktDocs}), mas nada foi enviado pelo WhatsApp — confira o telefone do cliente e reenvie pelo menu.`);
+      utils.proposta.listar.invalidate();
+      utils.proposta.pendentesDeRevisao.invalidate();
+      setRevisaoModal(null);
+    },
+    onError: (e) => alert(`Erro ao liberar: ${e.message}`),
+  });
   const atualizarDocGerado = trpc.templateDocumento.atualizarDocumentoGerado.useMutation({
     onSuccess: () => {
       utils.templateDocumento.listarDocumentosProposta.invalidate();
@@ -263,6 +430,8 @@ export default function Propostas() {
   const [negociacaoObs, setNegociacaoObs]     = useState("");
   const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [revisaoModal, setRevisaoModal] = useState<any | null>(null);
+  const [ooDoc, setOoDoc] = useState<any | null>(null);
   const [editDocModal, setEditDocModal] = useState<any | null>(null);
   const [editDocHtml, setEditDocHtml]   = useState("");
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
@@ -351,7 +520,7 @@ export default function Propostas() {
     const valorNum = form.valorStr ? parseFloat(form.valorStr) : null;
     const valorFmt = valorNum ? valorNum.toLocaleString("pt-BR", { style: "currency", currency: "BRL" }) : "";
 
-    const honorariosExitoNum = form.honorariosExitoPercStr ? parseFloat(form.honorariosExitoPercStr) : null;
+    const honorariosExitoNum = form.honorariosExitoPercStr ? parseFloat(form.honorariosExitoPercStr.replace(",", ".")) : null;
     const vars: Record<string, string> = {
       emitente:          emitente?.nomeFantasia ?? emitente?.nome ?? "",
       cnpj:              fmtCnpj(emitente?.cnpj ?? ""),
@@ -361,7 +530,7 @@ export default function Propostas() {
       emailTomador:      (tomador as any)?.email ?? "",
       telefoneTomador:   (tomador as any)?.telefone ?? "",
       valor:             valorFmt,
-      honorariosExito:   honorariosExitoNum ? `${honorariosExitoNum}%` : "",
+      honorariosExito:   honorariosExitoNum ? `${honorariosExitoNum.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}%` : "",
       diaVencimento:     form.contratoDiaVencimento || "",
       metodoPagamento:   metodosLabel[form.contratoMetodoCobr] ?? "",
       dataAtual:         new Date().toLocaleDateString("pt-BR"),
@@ -388,7 +557,7 @@ export default function Propostas() {
     if (htmlSemTags.length < 5) { alert("O texto da proposta está vazio. Escreva o conteúdo ou aplique um template."); return; }
     const valorEstimado = form.valorStr ? Math.round(parseFloat(form.valorStr) * 100) : null;
     const diaVenc = parseInt(form.contratoDiaVencimento) || null;
-    const honorariosExitoPerc = form.honorariosExitoPercStr ? Math.round(parseFloat(form.honorariosExitoPercStr)) : null;
+    const honorariosExitoPerc = form.honorariosExitoPercStr ? parseFloat(form.honorariosExitoPercStr.replace(",", ".")) : null;
     console.log("[salvar proposta] data:", { emitenteId: form.emitenteId, tomadorId: form.tomadorId, titulo: form.titulo, textoHtmlLen: form.textoHtml?.length, paktSignUrl: form.paktSignUrl });
     const data = {
       emitenteId: form.emitenteId, tomadorId: form.tomadorId,
@@ -471,13 +640,20 @@ export default function Propostas() {
       <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-4 mb-4 space-y-3">
         <div className="flex gap-2 flex-wrap">
           {["", "RASCUNHO", "ENVIADA", "EM_NEGOCIACAO", "ACEITA", "RECUSADA"].map(s => (
-            <button key={s} onClick={() => { setFilterStatus(s); setPage(1); }}
+            <button key={s} onClick={() => { setFilterStatus(s); setSoRevisao(false); setPage(1); }}
               className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-colors ${
-                filterStatus === s ? "bg-brand-600 text-white border-brand-600" : "border-gray-300 text-gray-600 hover:border-brand-400"
+                !soRevisao && filterStatus === s ? "bg-brand-600 text-white border-brand-600" : "border-gray-300 text-gray-600 hover:border-brand-400"
               }`}>
               {s === "" ? "Todas" : STATUS_LABEL[s]?.label ?? s}
             </button>
           ))}
+          <button
+            onClick={() => { setSoRevisao(v => !v); setFilterStatus(""); setPage(1); }}
+            className={`px-3 py-1.5 rounded-md text-sm font-medium border transition-colors ${
+              soRevisao ? "bg-amber-500 text-white border-amber-500" : "border-amber-300 text-amber-700 hover:bg-amber-50"
+            }`}>
+            🔍 Aguardando revisão{qtdRevisao ? ` (${qtdRevisao})` : ""}
+          </button>
         </div>
         {empresas && empresas.length > 1 && (
           <div className="flex items-center gap-2">
@@ -518,7 +694,8 @@ export default function Propostas() {
                 key={p.id}
                 className="hover:bg-gray-50 transition-colors cursor-pointer group"
                 onClick={() => {
-                  if (p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") abrirEditar(p);
+                  if ((p as any).revisaoStatus === "PENDENTE") setRevisaoModal(p);
+                  else if (p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") abrirEditar(p);
                   else window.open(`/api/proposta/${p.tokenAceite}`, "_blank");
                 }}
               >
@@ -541,7 +718,14 @@ export default function Propostas() {
                   {p.validadeAte ? p.validadeAte.slice(0, 10).split("-").reverse().join("/") : "—"}
                 </td>
                 <td className="px-4 py-3">
-                  <StatusBadge status={p.status} />
+                  {(p as any).revisaoStatus === "PENDENTE" ? (
+                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-800"
+                      title="Documentos gerados pela IA, aguardando conferência — nada foi enviado ao cliente">
+                      🔍 Em revisão
+                    </span>
+                  ) : (
+                    <StatusBadge status={p.status} />
+                  )}
                   {(p as any).contratoId && (
                     <span className="ml-1.5 text-green-600 text-xs font-bold" title="Contrato gerado">✓</span>
                   )}
@@ -567,6 +751,27 @@ export default function Propostas() {
                         style={{ top: menuPos.top, bottom: menuPos.bottom, right: menuPos.right, maxHeight: "min(480px, 85vh)" }}
                         onClick={(e) => e.stopPropagation()}
                       >
+                        {/* Revisão pendente: o menu começa por ela */}
+                        {(p as any).revisaoStatus === "PENDENTE" && (
+                          <>
+                            <button onClick={() => { setRevisaoModal(p); setOpenMenuId(null); }}
+                              className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-amber-700 hover:bg-amber-50 font-medium">
+                              🔍 Revisar documentos
+                            </button>
+                            <button
+                              onClick={() => {
+                                if (confirm(`Liberar os documentos de ${p.tomador.nome} para assinatura?\n\nOs links serão criados no PAKT e enviados ao cliente pelo WhatsApp.`))
+                                  liberar.mutate({ id: p.id });
+                                setOpenMenuId(null);
+                              }}
+                              disabled={liberar.isPending}
+                              className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-green-700 hover:bg-green-50 font-medium disabled:opacity-50">
+                              ✅ Liberar para assinatura
+                            </button>
+                            <div className="border-t border-gray-100 mt-1" />
+                          </>
+                        )}
+
                         {/* Abrir */}
                         {(p.status === "RASCUNHO" || p.status === "EM_NEGOCIACAO") ? (
                           <button onClick={() => { abrirEditar(p); setOpenMenuId(null); }}
@@ -582,7 +787,8 @@ export default function Propostas() {
                         )}
 
                         {/* ── Envio ──────────────────────────────────── */}
-                        <div className="border-t border-gray-100 pt-1 mt-1">
+                        {/* Em revisão o envio some: o caminho é liberar, que já manda os links */}
+                        <div className={`border-t border-gray-100 pt-1 mt-1 ${(p as any).revisaoStatus === "PENDENTE" ? "hidden" : ""}`}>
                           <p className="px-3 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400">Envio</p>
                           <button
                             onClick={() => {
@@ -595,28 +801,25 @@ export default function Propostas() {
                           >
                             ✉️ {p.status === "RASCUNHO" ? "Enviar por E-mail" : "Reenviar E-mail"}
                           </button>
-                          {p.status !== "RASCUNHO" && (
-                            <>
-                              <button
-                                onClick={() => {
-                                  if (confirm(`Enviar link via WhatsApp para ${p.tomador.nome}?`))
-                                    enviarWA.mutate({ id: p.id });
-                                  setOpenMenuId(null);
-                                }}
-                                disabled={enviarWA.isPending}
-                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                              >
-                                📱 Enviar via WhatsApp
-                              </button>
-                              <button
-                                onClick={() => { abrirWhatsApp(p); setOpenMenuId(null); }}
-                                className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
-                              >
-                                💬 Copiar link WhatsApp
-                                {copiedId === p.id && <span className="text-xs text-green-600 ml-auto">✓ copiado</span>}
-                              </button>
-                            </>
-                          )}
+                          {/* WhatsApp vale também para rascunho: gera documentos/PAKT como o e-mail */}
+                          <button
+                            onClick={() => {
+                              if (confirm(`${p.status === "RASCUNHO" ? "Enviar" : "Reenviar"} via WhatsApp para ${p.tomador.telefone || p.tomador.nome}?`))
+                                enviarWA.mutate({ id: p.id });
+                              setOpenMenuId(null);
+                            }}
+                            disabled={enviarWA.isPending}
+                            className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                          >
+                            📱 {p.status === "RASCUNHO" ? "Enviar via WhatsApp" : "Reenviar via WhatsApp"}
+                          </button>
+                          <button
+                            onClick={() => { abrirWhatsApp(p); setOpenMenuId(null); }}
+                            className="w-full text-left flex items-center gap-2 px-3 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                          >
+                            💬 Copiar link WhatsApp
+                            {copiedId === p.id && <span className="text-xs text-green-600 ml-auto">✓ copiado</span>}
+                          </button>
                         </div>
 
                         {/* ── Fluxo ──────────────────────────────────── */}
@@ -706,6 +909,73 @@ export default function Propostas() {
               {n}
             </button>
           ))}
+        </div>
+      )}
+
+      {/* ── Editor OnlyOffice (por cima da revisão) ─────────────────────────── */}
+      {ooDoc && (
+        <OnlyOfficeEditor
+          docId={ooDoc.id}
+          titulo={ooDoc.titulo}
+          onClose={() => {
+            setOoDoc(null);
+            // O PDF só é regerado depois do callback do Document Server
+            utils.templateDocumento.listarDocumentosProposta.invalidate();
+          }}
+        />
+      )}
+
+      {/* ── Modal Revisão de Documentos ──────────────────────────────────────── */}
+      {revisaoModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-5xl max-h-[92vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-gray-200 flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-gray-900 truncate">Revisão — {revisaoModal.tomador.nome}</h2>
+                <p className="text-xs text-gray-500 mt-0.5 truncate">
+                  {revisaoModal.titulo} · {(revisaoModal as any).emitente?.nomeFantasia || (revisaoModal as any).emitente?.nome || ""}
+                </p>
+              </div>
+              <button onClick={() => setRevisaoModal(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">×</button>
+            </div>
+
+            <div className="px-6 pt-3">
+              <p className="text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2">
+                A coleta terminou e a IA gerou estes documentos. <strong>Nada foi enviado ao cliente ainda.</strong>{" "}
+                Confira, corrija o que precisar e só então libere para assinatura.
+              </p>
+            </div>
+
+            <div className="flex-1 overflow-y-auto min-h-0">
+              <RevisaoDocs
+                propostaId={revisaoModal.id}
+                regerando={gerarDocumentos.isPending}
+                onRegerar={() => { if (confirm("Regenerar todos os documentos desta proposta?")) gerarDocumentos.mutate({ propostaId: revisaoModal.id }); }}
+                onEdit={(doc) => { setEditDocModal(doc); setEditDocHtml(doc.htmlEditado ?? ""); }}
+                onAbrirOO={(doc) => setOoDoc(doc)}
+              />
+            </div>
+
+            <div className="px-6 py-4 border-t border-gray-200 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xs text-gray-500">
+                Ao liberar: os PDFs viram envelopes no PAKT e os links vão para o cliente
+                {(revisaoModal as any).envioTelefone ? ` (${(revisaoModal as any).envioTelefone})` : ""} e para as testemunhas.
+              </p>
+              <div className="flex gap-3 ml-auto">
+                <button onClick={() => setRevisaoModal(null)} className="btn-secondary">Fechar</button>
+                <button
+                  onClick={() => {
+                    if (confirm(`Liberar os documentos de ${revisaoModal.tomador.nome} para assinatura?`))
+                      liberar.mutate({ id: revisaoModal.id });
+                  }}
+                  disabled={liberar.isPending}
+                  className="btn-primary"
+                >
+                  {liberar.isPending ? "Enviando..." : "✅ Liberar para assinatura"}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -841,10 +1111,10 @@ export default function Propostas() {
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Honorários de Êxito (%)</label>
-                  <input type="number" step="1" min="1" max="100" value={form.honorariosExitoPercStr}
+                  <input type="number" step="0.5" min="0.01" max="100" value={form.honorariosExitoPercStr}
                     onChange={e => setForm({ ...form, honorariosExitoPercStr: e.target.value })}
                     className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-brand-500"
-                    placeholder="Ex: 30" />
+                    placeholder="Ex: 30 ou 12.5" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">Validade da Proposta</label>
