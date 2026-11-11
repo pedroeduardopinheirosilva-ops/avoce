@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Phone, PhoneOff, PhoneCall, PhoneMissed, Clock, Mic, MicOff, Settings, User, Volume2 } from "lucide-react";
 import { trpc } from "../lib/trpc";
 import { useVoip } from "../contexts/VoipContext";
@@ -51,7 +51,7 @@ export default function TelefonePage() {
     uaRef, sessionRef, localStreamRef, remoteAudioRef,
     callSeconds, callSecondsRef, startTimer, stopTimer,
     startRingback, stopRingback,
-    playRemoteStream, setIsIncomingCall,
+    playRemoteStream, setIsIncomingCall, isIncomingCall, incomingCallerInfo,
     atender, rejeitar, registrar, primeAudio,
     voipConfig, setOutgoingLigacaoId,
     micVolume, speakerVolume, setMicVolume, setSpeakerVolume,
@@ -62,6 +62,49 @@ export default function TelefonePage() {
   const [ligacaoId, setLigacaoId] = useState<string | null>(null);
   const ligacaoIdRef = useRef<string | null>(null);
   const [selectedDid, setSelectedDid] = useState<string>("1");
+
+  // ── Ponte para o app iOS (AvoceMobile) ─────────────────────────────────────
+  //
+  // O app carrega ESTA página num WKWebView em vez de trazer um cliente SIP
+  // próprio: com dois clientes, todo conserto feito aqui (ICE, codec,
+  // reconexão) teria de ser refeito lá e, quando alguém esquecesse, o app
+  // ficaria mudo sem ninguém saber por quê.
+  //
+  // Tudo abaixo é ADITIVO — no navegador comum, `window.webkit` não existe e
+  // os avisos viram no-op.
+  //
+  // Sem array de dependências de propósito: `ligar` e `desligar` são
+  // recriadas a cada render e capturam o estado daquele render. Fixar a
+  // primeira versão faria o app discar com uma config velha (voipConfig ainda
+  // indefinido, DID desatualizado).
+  useEffect(() => {
+    (window as any).__avoceVoip = {
+      ligar: (numero: string, did?: string) => ligar(numero, did ?? selectedDid),
+      desligar,
+      atender,
+      rejeitar,
+      registrar,
+      estado: () => (isIncomingCall ? "incoming" : callStatus),
+    };
+  });
+
+  useEffect(() => {
+    const app = (window as any).webkit?.messageHandlers?.avoce;
+    if (!app) return;
+    app.postMessage({ evento: "pronto" });
+    return () => { delete (window as any).__avoceVoip; };
+  }, []);
+
+  // O app precisa do estado para mostrar "Chamando…", "Em ligação" e os botões
+  // de atender/recusar — a UI nativa fica por cima da página.
+  useEffect(() => {
+    (window as any).webkit?.messageHandlers?.avoce?.postMessage({
+      evento: "estado",
+      valor: isIncomingCall ? "incoming" : callStatus,
+      quem: incomingCallerInfo || "",
+      segundos: callSecondsRef.current ?? 0,
+    });
+  }, [callStatus, isIncomingCall, incomingCallerInfo]);
   const [isMuted, setIsMuted] = useState(false);
   const [selectedLigacao, setSelectedLigacao] = useState<Ligacao | null>(null);
   const [notasEdit, setNotasEdit] = useState("");
@@ -80,8 +123,16 @@ export default function TelefonePage() {
     { enabled: !!selectedLigacao?.id, refetchInterval: selectedLigacao?.id ? 5_000 : false }
   );
 
+  // O app iOS carrega esta página como motor e desenha a própria tela: um
+  // `alert()` aqui é engolido pelo WKWebView (que responde sozinho para não
+  // travar), e a desistência vira "o botão não faz nada".
+  function avisarApp(mensagem: string) {
+    (window as any).webkit?.messageHandlers?.avoce?.postMessage({ evento: "erro", mensagem });
+  }
+
   async function ligar(phoneOverride?: string, didOverride?: string) {
     if (!uaRef.current || callStatus !== "registered") {
+      avisarApp("O ramal ainda não está registrado. Tentando registrar de novo — refaça a ligação em alguns segundos.");
       registrar();
       return;
     }
@@ -102,7 +153,11 @@ export default function TelefonePage() {
     try {
       stream = await getMicStream();
     }
-    catch { alert("Sem permissão para usar o microfone."); return; }
+    catch {
+      avisarApp("Sem permissão para usar o microfone. Ajustes → Avoce → Microfone.");
+      alert("Sem permissão para usar o microfone.");
+      return;
+    }
     localStreamRef.current = stream;
 
     const dialTarget = did === "2" ? `L2${phone}` : did === "3" ? `L3${phone}` : phone;

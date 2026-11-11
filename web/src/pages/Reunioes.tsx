@@ -1,6 +1,8 @@
 import { useState, useMemo, useEffect, useRef } from "react";
 import { Video, Plus, Copy, ExternalLink, Clock, CheckCircle, XCircle, Calendar, FileText, CalendarDays, Trash2, ChevronLeft, ChevronRight } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { trpc } from "../lib/trpc";
+import { AgendarReuniaoModal, ROTULO_MODALIDADE, STATUS_REUNIAO, dataHoraTxt } from "../components/AgendarReuniao";
 import { useTranscricaoCapture } from "../lib/useTranscricaoCapture";
 
 const DIAS_SEMANA_NOMES = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
@@ -63,8 +65,9 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
 }
 
-export default function ReunioesPage() {
-  const [tab, setTab] = useState<"reunioes" | "agenda">("reunioes");
+export default function ReunioesPage({ abaInicial = "reunioes" }: { abaInicial?: "reunioes" | "agenda" } = {}) {
+  const navigate = useNavigate();
+  const [tab, setTab] = useState<"reunioes" | "agenda">(abaInicial);
   const [showModal, setShowModal] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [novaForm, setNovaForm] = useState({ titulo: "", agendadaPara: "" });
@@ -101,6 +104,24 @@ export default function ReunioesPage() {
     },
     { enabled: tab === "agenda", staleTime: 30_000 }
   );
+
+  // Reuniões marcadas (SDR, closer, IA) na semana — o que de fato ocupa a agenda.
+  const fimSemana = useMemo(() => { const d = new Date(monday); d.setDate(d.getDate() + 7); return d; }, [monday]);
+  const reunioesSemanaQ = trpc.reunioes.agendaPeriodo.useQuery(
+    { de: monday.toISOString(), ate: fimSemana.toISOString(), ...(agendaUsuarioId ? { responsavelId: agendaUsuarioId } : {}) },
+    { enabled: tab === "agenda", refetchInterval: 60_000 },
+  );
+  const reunioesPorDia = useMemo(() => {
+    const g: Record<string, any[]> = {};
+    for (const r of (reunioesSemanaQ.data as any[] | undefined) ?? []) {
+      if (!r.agendadaPara) continue;
+      (g[new Date(r.agendadaPara).toDateString()] ??= []).push(r);
+    }
+    return g;
+  }, [reunioesSemanaQ.data]);
+  const idsReunioesSemana = useMemo(() => new Set(((reunioesSemanaQ.data as any[] | undefined) ?? []).map(r => r.id)), [reunioesSemanaQ.data]);
+  const [reuniaoAberta, setReuniaoAberta] = useState<any | null>(null);
+  const [editandoReuniao, setEditandoReuniao] = useState<any | null>(null);
 
   const slotsByDay = useMemo(() => {
     const groups: Record<string, any[]> = {};
@@ -645,7 +666,10 @@ export default function ReunioesPage() {
           {/* Week navigation */}
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-base font-bold text-gray-800 flex items-center gap-2">
-              <CalendarDays size={18} className="text-purple-600" /> Agenda de Disponibilidade
+              <CalendarDays size={18} className="text-purple-600" /> Agenda
+              <span className="text-xs font-normal text-gray-500">
+                · {((reunioesSemanaQ.data as any[] | undefined) ?? []).filter(r => r.status === "agendada").length} reunião(ões) marcada(s) na semana
+              </span>
             </h2>
             <div className="flex items-center gap-2">
               <button onClick={() => setWeekOffset(w => w - 1)}
@@ -696,13 +720,34 @@ export default function ReunioesPage() {
               {Array.from({ length: 7 }, (_, i) => {
                 const d = new Date(monday);
                 d.setDate(monday.getDate() + i);
-                const daySlots: any[] = slotsByDay[d.toDateString()] ?? [];
+                // Horário reservado por uma reunião que já aparece como cartão não se repete.
+                const daySlots: any[] = (slotsByDay[d.toDateString()] ?? []).filter((sl: any) => !sl.reuniaoId || !idsReunioesSemana.has(sl.reuniaoId));
+                const dayReunioes: any[] = reunioesPorDia[d.toDateString()] ?? [];
                 const isToday = d.toDateString() === new Date().toDateString();
                 return (
                   <div key={i} className={`p-1.5 border-r last:border-r-0 space-y-1 ${isToday ? "bg-purple-50/20" : ""}`}>
                     {agendaQ.isLoading && i === 0 && (
                       <p className="text-xs text-gray-400 text-center mt-4">...</p>
                     )}
+                    {dayReunioes.map((r: any) => {
+                      const st = STATUS_REUNIAO[r.status] ?? { rotulo: r.status, cor: "bg-gray-100 text-gray-600" };
+                      return (
+                        <button key={r.id} onClick={() => setReuniaoAberta(r)}
+                          title={r.pauta ? `Pauta: ${r.pauta}` : r.titulo}
+                          className={`w-full text-left rounded px-1.5 py-1 text-xs border transition-colors ${
+                            r.status === "agendada" ? "bg-indigo-50 border-indigo-200 hover:bg-indigo-100 text-indigo-900"
+                            : r.status === "cancelada" ? "bg-gray-50 border-gray-200 text-gray-400 line-through"
+                            : "bg-white border-gray-200 hover:bg-gray-50 text-gray-700"}`}>
+                          <p className="font-semibold tabular-nums leading-tight">
+                            {new Date(r.agendadaPara).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
+                            <span className="font-normal opacity-60"> · {r.duracaoMin}min</span>
+                          </p>
+                          <p className="truncate font-medium">{r.contato?.nome ?? r.deal?.titulo ?? r.titulo}</p>
+                          <p className="truncate opacity-70">{r.responsavelNome?.split(" ")[0] ?? "sem responsável"} · {(ROTULO_MODALIDADE[r.modalidade] ?? r.modalidade).replace(/^\S+\s/, "")}</p>
+                          {r.status !== "agendada" && <p className={`mt-0.5 inline-block px-1 rounded ${st.cor}`}>{st.rotulo}</p>}
+                        </button>
+                      );
+                    })}
                     {daySlots.map((slot: any) => {
                       const reservado = !slot.disponivel && slot.reuniaoId;
                       const fechado   = !slot.disponivel && !slot.reuniaoId;
@@ -750,10 +795,63 @@ export default function ReunioesPage() {
 
           {faltaBase.length > 0 && (
             <p className="text-center text-sm text-gray-400 mt-6">
-              Selecione {faltaBase.join(" e ")} na barra lateral para visualizar e criar slots.
+              Para criar horários livres (slots), selecione {faltaBase.join(" e ")} na barra lateral. As reuniões marcadas aparecem sempre.
             </p>
           )}
         </div>
+      )}
+
+      {/* Detalhe da reunião clicada na agenda */}
+      {reuniaoAberta && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onMouseDown={() => setReuniaoAberta(null)}>
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-5 text-sm space-y-2" onMouseDown={e => e.stopPropagation()}>
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <p className="font-semibold text-gray-800">{reuniaoAberta.contato?.nome ?? reuniaoAberta.deal?.titulo ?? reuniaoAberta.titulo}</p>
+                <p className="text-xs text-gray-500">
+                  {reuniaoAberta.agendadaPara ? dataHoraTxt(reuniaoAberta.agendadaPara) : "sem data"} · {reuniaoAberta.duracaoMin} min · {ROTULO_MODALIDADE[reuniaoAberta.modalidade] ?? reuniaoAberta.modalidade}
+                </p>
+              </div>
+              <span className={`text-xs px-1.5 py-0.5 rounded-full ${(STATUS_REUNIAO[reuniaoAberta.status] ?? { cor: "bg-gray-100" }).cor}`}>
+                {(STATUS_REUNIAO[reuniaoAberta.status] ?? { rotulo: reuniaoAberta.status }).rotulo}
+              </span>
+            </div>
+            <p className="text-xs text-gray-600">
+              Conduz: <b>{reuniaoAberta.responsavelNome ?? "—"}</b>
+              {reuniaoAberta.marcadaPorNome && <> · marcada por {reuniaoAberta.marcadaPorNome}</>}
+            </p>
+            {reuniaoAberta.deal?.pipeline && (
+              <p className="text-xs text-gray-500">{reuniaoAberta.deal.pipeline.nome}{reuniaoAberta.deal.stage ? ` · ${reuniaoAberta.deal.stage.nome}` : ""}</p>
+            )}
+            <div className="text-xs">
+              <p className="text-gray-400">Pauta</p>
+              <p className="text-gray-800 whitespace-pre-wrap">{reuniaoAberta.pauta || "—"}</p>
+            </div>
+            <div className="text-xs">
+              <p className="text-gray-400">Anotações</p>
+              <p className="text-gray-800 whitespace-pre-wrap">{reuniaoAberta.notas || "—"}</p>
+            </div>
+            <div className="flex flex-wrap gap-2 pt-2 border-t">
+              {reuniaoAberta.deal?.id && (
+                <button onClick={() => navigate(`/whatsapp?dealId=${reuniaoAberta.deal.id}`)}
+                  className="text-xs px-2.5 py-1 rounded-md border hover:bg-gray-50">Abrir conversa</button>
+              )}
+              {reuniaoAberta.deal?.id && (
+                <button onClick={() => { setEditandoReuniao(reuniaoAberta); setReuniaoAberta(null); }}
+                  className="text-xs px-2.5 py-1 rounded-md border hover:bg-gray-50">Editar / remarcar</button>
+              )}
+              {reuniaoAberta.modalidade === "video" && ["agendada", "em_andamento"].includes(reuniaoAberta.status) && (
+                <button onClick={() => { setSelectedId(reuniaoAberta.id); setTab("reunioes"); setReuniaoAberta(null); }}
+                  className="text-xs px-2.5 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700">Ir para a sala</button>
+              )}
+              <button onClick={() => setReuniaoAberta(null)} className="text-xs px-2.5 py-1 rounded-md border ml-auto">Fechar</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {editandoReuniao?.deal?.id && (
+        <AgendarReuniaoModal dealId={editandoReuniao.deal.id} reuniao={editandoReuniao}
+          onClose={() => setEditandoReuniao(null)} onSalvo={() => reunioesSemanaQ.refetch()} />
       )}
 
       {/* Modal criar */}

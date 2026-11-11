@@ -1,8 +1,8 @@
 import { z } from "zod";
 import { router, authProc } from "./trpc.js";
 import { prisma } from "../db.js";
-import { whereEmpresa } from "./tenant-utils.js";
-import Anthropic from "@anthropic-ai/sdk";
+import { whereEmpresa, canOperate } from "./tenant-utils.js";
+import { callLlm } from "../agent/llm.js";
 
 // ── Supabase fetch helper ─────────────────────────────────────────────────────
 
@@ -225,10 +225,8 @@ export const reengajamentoRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       const { id, ...data } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const c = await prisma.crmCampanhaReengajamento.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!c || c.empresaId !== ctx.empresaId) throw new Error("Campanha não pertence à sua empresa");
-      }
+      const c = await prisma.crmCampanhaReengajamento.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!c || !canOperate(ctx, c.empresaId)) throw new Error("Campanha não pertence à sua empresa");
       return prisma.crmCampanhaReengajamento.update({ where: { id }, data });
     }),
 
@@ -236,10 +234,8 @@ export const reengajamentoRouter = router({
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       const { id } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const c = await prisma.crmCampanhaReengajamento.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!c || c.empresaId !== ctx.empresaId) throw new Error("Campanha não pertence à sua empresa");
-      }
+      const c = await prisma.crmCampanhaReengajamento.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!c || !canOperate(ctx, c.empresaId)) throw new Error("Campanha não pertence à sua empresa");
       return prisma.crmCampanhaReengajamento.delete({ where: { id: input.id } });
     }),
 
@@ -248,9 +244,7 @@ export const reengajamentoRouter = router({
     .input(z.object({ id: z.string() }))
     .query(async ({ input, ctx }) => {
       const campanha = await prisma.crmCampanhaReengajamento.findUniqueOrThrow({ where: { id: input.id } });
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        if (campanha.empresaId !== ctx.empresaId) throw new Error("Campanha não pertence à sua empresa");
-      }
+      if (!canOperate(ctx, campanha.empresaId)) throw new Error("Campanha não pertence à sua empresa");
       const corte = new Date(Date.now() - campanha.diasSemContato * 24 * 60 * 60 * 1000);
       const deals = await prisma.crmDeal.findMany({
         where: {
@@ -285,9 +279,7 @@ export const reengajamentoRouter = router({
         where: { id: input.id },
         include: { projeto: { include: { configs: true } } },
       });
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        if (campanha.empresaId !== ctx.empresaId) throw new Error("Campanha não pertence à sua empresa");
-      }
+      if (!canOperate(ctx, campanha.empresaId)) throw new Error("Campanha não pertence à sua empresa");
 
       if (!campanha.projetoId || !campanha.projeto) {
         return { ok: false, error: "Campanha sem projeto IA vinculado" };
@@ -630,15 +622,6 @@ export const reengajamentoRouter = router({
       batchSize: z.number().int().min(1).max(50).default(20),
     }))
     .mutation(async ({ input }) => {
-      // 1. Buscar API key do Claude
-      const cfg = await prisma.iaProjetoConfig.findFirst({
-        where: { projetoId: input.projetoId, chave: "anthropic_api_key" },
-      });
-      const apiKey = cfg?.valor;
-      if (!apiKey) throw new Error("anthropic_api_key não configurada no projeto IA");
-
-      const anthropic = new Anthropic({ apiKey });
-
       // 2. Pipeline Bot RAP
       const pipeline = await prisma.crmPipeline.findFirst({
         where: { nome: "Bot RAP — Reengajamento" },
@@ -733,16 +716,17 @@ HISTÓRICO DA CONVERSA (bot anterior):
 ${nota.slice(0, 2000) || "Sem histórico de conversa disponível."}`;
 
           try {
-            const resp = await anthropic.messages.create({
-              model: "claude-haiku-4-5-20251001",
-              max_tokens: 512,
-              system: PROMPT_SISTEMA,
+            const resp = await callLlm({
+              projetoId: input.projetoId,
+              systemPrompt: PROMPT_SISTEMA,
               messages: [{ role: "user", content: userMsg }],
+              maxTokens: 512,
+              disableThinking: true,
             });
 
-            const rawText = resp.content[0]?.type === "text" ? resp.content[0].text.trim() : "";
+            const rawText = (resp.content ?? "").trim();
             const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-            if (!jsonMatch) throw new Error("Resposta Claude não continha JSON");
+            if (!jsonMatch) throw new Error("Resposta do LLM não continha JSON");
 
             const analise = JSON.parse(jsonMatch[0]);
 
@@ -859,15 +843,6 @@ ${nota.slice(0, 2000) || "Sem histórico de conversa disponível."}`;
       batchSize: z.number().int().min(1).max(50).default(20),
     }))
     .mutation(async ({ input }) => {
-      // 1. API key
-      const cfg = await prisma.iaProjetoConfig.findFirst({
-        where: { projetoId: input.projetoId, chave: "anthropic_api_key" },
-      });
-      const apiKey = cfg?.valor;
-      if (!apiKey) throw new Error("anthropic_api_key não configurada no projeto IA");
-
-      const anthropic = new Anthropic({ apiKey });
-
       // 2. Buscar IDs pendentes via SQL (JSON path confiável)
       const pendingIds = input.pipelineId
         ? await prisma.$queryRaw<{ id: string }[]>`
@@ -984,16 +959,17 @@ NOTAS / HISTÓRICO:
 ${notasTexto.slice(0, 2500)}`;
 
           try {
-            const resp = await anthropic.messages.create({
-              model: "claude-haiku-4-5-20251001",
-              max_tokens: 600,
-              system: PROMPT_GERAL,
+            const resp = await callLlm({
+              projetoId: input.projetoId,
+              systemPrompt: PROMPT_GERAL,
               messages: [{ role: "user", content: userMsg }],
+              maxTokens: 600,
+              disableThinking: true,
             });
 
-            const rawText = resp.content[0]?.type === "text" ? resp.content[0].text.trim() : "";
+            const rawText = (resp.content ?? "").trim();
             const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-            if (!jsonMatch) throw new Error("Resposta Claude não continha JSON");
+            if (!jsonMatch) throw new Error("Resposta do LLM não continha JSON");
 
             const analise = JSON.parse(jsonMatch[0]);
             const precisaAbordagem = analise.precisa_abordagem !== false;
@@ -1318,12 +1294,8 @@ ${notasTexto.slice(0, 2500)}`;
 
       if (!deals.length) return { ok: true, gerados: 0, msg: "Nenhum lead elegível" };
 
-      const anthropicKey = campanha.projeto?.configs.find((c: any) => c.chave === "anthropic_api_key")?.valor
-        ?? process.env.ANTHROPIC_API_KEY;
+      if (!campanha.projetoId) return { ok: false, error: "Campanha sem projeto IA" };
 
-      if (!anthropicKey) return { ok: false, error: "Chave Anthropic não configurada" };
-
-      const anthropic = new Anthropic({ apiKey: anthropicKey });
       let gerados = 0;
       const erros: string[] = [];
 
@@ -1349,14 +1321,15 @@ ${notasTexto.slice(0, 2500)}`;
 
           if (input.dryRun) { gerados++; processados++; continue; }
 
-          const resp = await anthropic.messages.create({
-            model: "claude-haiku-4-5-20251001",
-            max_tokens: 300,
-            system: "Você gera mensagens de WhatsApp para campanhas de advocacia. IMPORTANTE: NÃO inclua o nome do agente, assinatura, nem qualquer identificação ao final da mensagem.",
+          const resp = await callLlm({
+            projetoId: campanha.projetoId,
+            systemPrompt: "Você gera mensagens de WhatsApp para campanhas de advocacia. IMPORTANTE: NÃO inclua o nome do agente, assinatura, nem qualquer identificação ao final da mensagem.",
             messages: [{ role: "user", content: prompt }],
+            maxTokens: 300,
+            disableThinking: true,
           });
 
-          const rawMensagem = (resp.content[0] as any).text?.trim();
+          const rawMensagem = resp.content?.trim();
           // Strip trailing agent signatures: "Name | Org", "Name\nOrg", or bare name after last punctuation
           const mensagem = rawMensagem
             ? rawMensagem
@@ -1448,16 +1421,23 @@ ${notasTexto.slice(0, 2500)}`;
       const busca = input.busca?.trim() ?? "";
       const buscaParam = busca ? `%${busca}%` : null;
 
+      // Valores do usuário sempre como parâmetro ($n), nunca interpolados no SQL
+      const params: unknown[] = [sourcePipelineIds];
+      const ph = (v: unknown) => { params.push(v); return `$${params.length}`; };
+
       // Condição extra por filtro
       let extraWhere = "";
-      if (input.filtro === "com_mensagem")  extraWhere = `AND d."camposCustom"->>'ia_campanha_id' = '${input.campanhaId}'`;
-      if (input.filtro === "sem_mensagem")  extraWhere = `AND (d."camposCustom"->>'ia_campanha_id' IS NULL OR d."camposCustom"->>'ia_campanha_id' != '${input.campanhaId}')`;
+      if (input.filtro === "com_mensagem")  extraWhere = `AND d."camposCustom"->>'ia_campanha_id' = ${ph(input.campanhaId)}`;
+      if (input.filtro === "sem_mensagem")  extraWhere = `AND (d."camposCustom"->>'ia_campanha_id' IS NULL OR d."camposCustom"->>'ia_campanha_id' != ${ph(input.campanhaId)})`;
       if (input.filtro === "enviados")      extraWhere = `AND d."camposCustom"->>'ia_mensagem_enviada_em' IS NOT NULL`;
-      if (input.filtro === "migrados")      extraWhere = `AND d."camposCustom"->>'ia_campanha_migrado_de' = '${input.campanhaId}'`;
+      if (input.filtro === "migrados")      extraWhere = `AND d."camposCustom"->>'ia_campanha_migrado_de' = ${ph(input.campanhaId)}`;
 
-      const buscaWhere = buscaParam
-        ? `AND (d.titulo ILIKE '${buscaParam}' OR c.nome ILIKE '${buscaParam}')`
-        : "";
+      let buscaWhere = "";
+      if (buscaParam) {
+        const b = ph(buscaParam);
+        buscaWhere = `AND (d.titulo ILIKE ${b} OR c.nome ILIKE ${b})`;
+      }
+      const nWhere = params.length;
 
       type DealRow = {
         id: string; titulo: string; nome: string | null; whatsapp: string | null;
@@ -1481,8 +1461,8 @@ ${notasTexto.slice(0, 2500)}`;
             ${extraWhere}
             ${buscaWhere}
           ORDER BY d."criadoEm" ASC
-          LIMIT $2 OFFSET $3
-        `, sourcePipelineIds, input.porPagina, offset),
+          LIMIT $${nWhere + 1} OFFSET $${nWhere + 2}
+        `, ...params, input.porPagina, offset),
         prisma.$queryRawUnsafe<CountRow[]>(`
           SELECT COUNT(*)::bigint as count
           FROM "CrmDeal" d
@@ -1491,7 +1471,7 @@ ${notasTexto.slice(0, 2500)}`;
             AND d.status = 'aberto'
             ${extraWhere}
             ${buscaWhere}
-        `, sourcePipelineIds),
+        `, ...params),
       ]);
 
       const total = Number(countRows[0]?.count ?? 0);

@@ -37,6 +37,12 @@ type Motor = {
   timer?: string;
   /** funis do CRM que este motor alimenta — usado pela tela para se oferecer */
   pipelines: string[];
+  /**
+   * Disparo de e-mail dos leads novos que o motor trouxe (pelo PSA-MT). O script
+   * aceita `previa` (JSON no stdout, não envia) e `enviar <limite>`; escreve o
+   * próprio estado e se protege com o próprio lock, como o motor.
+   */
+  emails?: { script: string; estado: string; lock: string; pipelines: string[] };
 };
 
 const MOTORES: Record<string, Motor> = {
@@ -51,6 +57,30 @@ const MOTORES: Record<string, Motor> = {
     estado: "estado_motor.json",
     timer: "consef-semanal.timer",
     pipelines: ["pipeline_defesa_icms", "pipeline_contadores"],
+    emails: {
+      script: "emails_novos.sh",
+      estado: "estado_emails.json",
+      lock: ".emails.lock",
+      pipelines: ["pipeline_defesa_icms"],
+    },
+  },
+  "epat-sefaz-sp": {
+    id: "epat-sefaz-sp",
+    nome: "Autos de infração SEFAZ-SP",
+    descricao:
+      "Descobre os AIIMs novos no extrato público do ePAT da SEFAZ-SP, resolve CNPJ e " +
+      "e-mail do autuado na base aberta da Receita Federal e grava os leads no funil.",
+    dir: process.env.EPAT_SP_DIR ?? "/opt/epat-sp-autos",
+    script: "rodar.sh",
+    estado: "estado_motor.json",
+    timer: "epat-sp.timer",
+    pipelines: ["pipeline_defesa_icms_sp"],
+    emails: {
+      script: "emails_sp.sh",
+      estado: "estado_emails.json",
+      lock: ".emails.lock",
+      pipelines: ["pipeline_defesa_icms_sp"],
+    },
   },
 };
 
@@ -60,9 +90,14 @@ function pegar(id: string): Motor {
   return m;
 }
 
-async function lerEstado(m: Motor) {
+function emailsDe(m: Motor) {
+  if (!m.emails) throw new TRPCError({ code: "NOT_FOUND", message: `motor sem disparo de e-mail: ${m.id}` });
+  return m.emails;
+}
+
+async function lerEstado(m: Motor, arquivo = m.estado) {
   try {
-    const raw = await fs.readFile(path.join(m.dir, m.estado), "utf8");
+    const raw = await fs.readFile(path.join(m.dir, arquivo), "utf8");
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
     return null;
@@ -70,9 +105,9 @@ async function lerEstado(m: Motor) {
 }
 
 /** Uma execução só é "rodando" se o lock ainda estiver preso por algum processo. */
-async function rodando(m: Motor): Promise<boolean> {
+async function rodando(m: Motor, lock = ".motor.lock"): Promise<boolean> {
   try {
-    const { stdout } = await execFileP(BIN.flock, ["-n", path.join(m.dir, ".motor.lock"), "-c", "true"]);
+    const { stdout } = await execFileP(BIN.flock, ["-n", path.join(m.dir, lock), "-c", "true"]);
     void stdout;
     return false;            // conseguiu o lock → ninguém rodando
   } catch {
@@ -118,7 +153,10 @@ export const motoresRouter = router({
     .query(({ input }) =>
       Object.values(MOTORES)
         .filter((m) => m.pipelines.includes(input.pipelineId))
-        .map((m) => ({ id: m.id, nome: m.nome, descricao: m.descricao })),
+        .map((m) => ({
+          id: m.id, nome: m.nome, descricao: m.descricao,
+          emails: !!m.emails?.pipelines.includes(input.pipelineId),
+        })),
     ),
 
   status: authProc
@@ -171,6 +209,74 @@ export const motoresRouter = router({
       // setsid + detached: o robô leva minutos e precisa sobreviver ao fim da
       // requisição E a um `pm2 restart avoce` — sem isso o PM2 derruba a árvore.
       const filho = spawn(BIN.setsid, ["bash", alvo], {
+        cwd: m.dir,
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, MOTOR_GATILHO: `manual:${ctx.userId ?? "?"}` },
+      });
+      filho.unref();
+      return { ok: true, iniciadoEm: new Date().toISOString() };
+    }),
+
+  /** Estado do último disparo de e-mails dos autos novos. */
+  emailsStatus: authProc
+    .input(z.object({ motorId: z.string() }))
+    .query(async ({ input }) => {
+      const m = pegar(input.motorId);
+      const e = emailsDe(m);
+      const [estado, emExecucao] = await Promise.all([lerEstado(m, e.estado), rodando(m, e.lock)]);
+      const log = estado?.log ? path.join(m.dir, String(estado.log)) : null;
+      return {
+        rodando: emExecucao,
+        status: (estado?.status as string) ?? null,
+        inicio: (estado?.inicio as string) ?? null,
+        fim: (estado?.fim as string) ?? null,
+        resultado: (estado?.resultado as string) ?? null,
+        log: log ? await tail(log, 30) : "",
+      };
+    }),
+
+  /** O que sairia agora: só os autos que ainda não foram comunicados. Não envia nada. */
+  emailsPrevia: authProc
+    .input(z.object({ motorId: z.string() }))
+    .query(async ({ input }) => {
+      const m = pegar(input.motorId);
+      const e = emailsDe(m);
+      if (await rodando(m, e.lock)) {
+        throw new TRPCError({ code: "CONFLICT", message: "já há um disparo de e-mails em andamento" });
+      }
+      try {
+        const { stdout } = await execFileP("/usr/bin/bash", [path.join(m.dir, e.script), "previa"], {
+          cwd: m.dir, timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
+        });
+        return JSON.parse(stdout) as {
+          emails: { para: string; via: string; empresas: string[]; deal_ids: string[];
+                    autos: string[]; total: number; assunto: string }[];
+          fora: { razao: string; deal_id: string; autos: string[]; motivo: string }[];
+          n_autos: number;
+          limite: number;
+        };
+      } catch (err: any) {
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+          message: `prévia falhou: ${String(err?.stdout || err?.stderr || err?.message).slice(0, 300)}`,
+        });
+      }
+    }),
+
+  emailsDisparar: authProc
+    .input(z.object({ motorId: z.string(), limite: z.number().int().min(1).max(200).default(50) }))
+    .mutation(async ({ input, ctx }) => {
+      const m = pegar(input.motorId);
+      const e = emailsDe(m);
+      if (await rodando(m, e.lock)) {
+        throw new TRPCError({ code: "CONFLICT", message: "já há um disparo de e-mails em andamento" });
+      }
+      if (await rodando(m)) {
+        throw new TRPCError({ code: "CONFLICT", message: "espere a coleta de autos terminar" });
+      }
+      // leva ~1 min por e-mail (intervalo anti-bloqueio do HotelDaWeb): setsid, como o motor
+      const filho = spawn(BIN.setsid, ["bash", path.join(m.dir, e.script), "enviar", String(input.limite)], {
         cwd: m.dir,
         detached: true,
         stdio: "ignore",

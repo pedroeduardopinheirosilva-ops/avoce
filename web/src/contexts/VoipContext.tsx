@@ -357,9 +357,21 @@ export function VoipProvider({ children }: { children: React.ReactNode }) {
 
   const registrar = useCallback(() => {
     const cfg = voipConfig.data;
+    // Ramal próprio do aparelho (app iOS). O AOR do ramal do escritório tem
+    // `max_contacts=1 remove_existing=yes`: se o celular registrasse no MESMO
+    // ramal, derrubaria em silêncio o registro de quem estivesse no navegador.
+    // Só o app grava estas chaves — no navegador elas não existem e nada muda.
+    const extProprio  = localStorage.getItem("avoce_ramal_proprio") ?? "";
+    const passProprio = localStorage.getItem("avoce_ramal_senha") ?? "";
+    // O app iOS marca esta chave: aparelho só registra no ramal DELE. Sem ela,
+    // um celular sem ramal configurado cairia no ramal da recepção e derrubaria
+    // o atendente que estivesse no navegador — o AOR tem max_contacts=1.
+    if (localStorage.getItem("avoce_ramal_exclusivo") === "1" && !(extProprio && passProprio)) return;
     const wss = cfg?.voipAsteriskWss ?? localStorage.getItem("voip_wss") ?? "";
-    const ext = cfg?.voipSipExtension ?? localStorage.getItem("voip_ext") ?? "";
-    const pass = cfg?.voipSipPassword ?? localStorage.getItem("voip_pass") ?? "";
+    const ext = extProprio || (cfg?.voipSipExtension ?? localStorage.getItem("voip_ext") ?? "");
+    const pass = extProprio
+      ? passProprio
+      : (cfg?.voipSipPassword ?? localStorage.getItem("voip_pass") ?? "");
     const domain = cfg?.voipSipDomain ?? wss.replace(/wss?:\/\//, "").split("/")[0] ?? "";
     if (!wss || !ext || !pass || !domain) return;
 

@@ -22,6 +22,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { trpc } from "../lib/trpc";
+import { BotaoAgendarReuniao, ReunioesDoLead } from "../components/AgendarReuniao";
 import VoipDialer, { VoipDialerHandle } from "../components/VoipDialer";
 import { useVoip } from "../contexts/VoipContext";
 
@@ -34,9 +35,12 @@ export type Stage = {
 };
 export type Deal = {
   id: string; titulo: string; valor: string | null; urgencia: boolean;
-  status: string; stageId: string; criadoEm: string;
+  status: string; stageId: string; criadoEm: string; followupEm?: string | null;
   valorEstimado: string | null; iaAtiva: boolean | null; iaPausadaPor: string | null;
-  contato: { id: string; nome: string; whatsapp: string | null; cidade: string | null; fotoPerfilUrl?: string | null; fotoPerfilEm?: string | null } | null;
+  contato: {
+    id: string; nome: string; whatsapp: string | null; cidade: string | null; fotoPerfilUrl?: string | null; fotoPerfilEm?: string | null;
+    instagramId?: string | null; messengerId?: string | null;
+  } | null;
   tags?: { id: string; nome: string; cor: string }[];
 } & DealOrigem;
 type Pipeline = {
@@ -44,6 +48,9 @@ type Pipeline = {
 };
 
 // ── Card draggável ─────────────────────────────────────────────────────────────
+
+/** Tem conversa para abrir no Chat: número de WhatsApp ou lead do Direct/Messenger. */
+const temConversa = (d: Deal) => !!(d.contato?.whatsapp || d.contato?.instagramId || d.contato?.messengerId);
 
 // ── camposCustom ───────────────────────────────────────────────────────────────
 // O JSON de camposCustom vem de integrações (importações, robôs de prospecção) e
@@ -152,17 +159,37 @@ function DealCard({
         </div>
       )}
       <div className="flex items-center justify-between mt-1">
-        <p className="text-xs text-gray-400">{new Date(deal.criadoEm).toLocaleDateString("pt-BR")}</p>
+        <p className="text-xs text-gray-400">
+          {!deal.followupEm && Date.now() - new Date(deal.criadoEm).getTime() < 24 * 3_600_000 && (
+            <span className="mr-1.5 text-[10px] font-bold text-white bg-rose-500 px-1.5 py-0.5 rounded" title="Chegou nas últimas 24h e ainda não teve follow-up">
+              NOVO
+            </span>
+          )}
+          {new Date(deal.criadoEm).toLocaleDateString("pt-BR")}
+          {Date.now() - new Date(deal.criadoEm).getTime() < 24 * 3_600_000 && (
+            <span className="ml-1">{new Date(deal.criadoEm).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</span>
+          )}
+          {deal.followupEm && (
+            <span className="ml-1.5 text-[10px] text-emerald-700 bg-emerald-50 px-1 rounded" title={`Follow-up feito em ${new Date(deal.followupEm).toLocaleString("pt-BR")} — vai para o fim da coluna`}>
+              ✓ FU {new Date(deal.followupEm).toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })}
+            </span>
+          )}
+        </p>
         <div className="flex items-center gap-1">
           {deal.iaAtiva === false && (
             <span className="text-xs bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded-full font-medium">SDR</span>
           )}
-          {deal.contato?.whatsapp && onWhatsApp && (
+          {deal.contato && onWhatsApp && (
             <button
               data-no-open
-              onClick={(e) => { e.stopPropagation(); onWhatsApp(deal); }}
-              className="text-indigo-500 hover:text-indigo-700 hover:bg-indigo-50 p-1 rounded-full transition-colors"
-              title="Atender pelo WhatsApp IA"
+              onClick={(e) => { e.stopPropagation(); if (temConversa(deal)) onWhatsApp(deal); else onOpen(deal); }}
+              className={`p-1 rounded-full transition-colors ${temConversa(deal) ? "text-indigo-500 hover:text-indigo-700 hover:bg-indigo-50" : "text-gray-300 hover:text-gray-500 hover:bg-gray-50"}`}
+              title={
+                deal.contato.whatsapp ? "Atender no Chat (WhatsApp)"
+                : deal.contato.instagramId ? "Abrir a conversa do Instagram no Chat"
+                : deal.contato.messengerId ? "Abrir a conversa do Messenger no Chat"
+                : "Sem WhatsApp cadastrado — abra o card e preencha o número"
+              }
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
             </button>
@@ -286,15 +313,23 @@ export function DealModal({
 
   const utils = trpc.useUtils();
 
-  const { data: allTags } = trpc.crm.listTags.useQuery();
+  // Só as tags do funil deste deal + as gerais: tag de outro funil não se aplica aqui.
+  const { data: allTags } = trpc.crm.listTags.useQuery(pipelineId ? { pipelineId } : undefined);
   const [dealTagIds, setDealTagIds] = useState<string[]>((deal as any)?.tags?.map((t: any) => t.id) ?? []);
-  const setDealTagsMut = trpc.crm.setDealTags.useMutation({
-    onSuccess: () => utils.crm.kanban.invalidate(),
+  // Liga/desliga uma tag por vez — regravar a lista inteira apagava a tag que a IA
+  // tivesse aplicado depois que a modal abriu.
+  const toggleDealTagMut = trpc.crm.toggleDealTag.useMutation({
+    onSuccess: (res) => {
+      setDealTagIds(res.tags.map((t) => t.id));
+      utils.crm.kanban.invalidate();
+      utils.ia.listConversas.invalidate();
+      utils.ia.resumoConversas.invalidate();
+    },
   });
   function toggleDealTag(tagId: string) {
-    const next = dealTagIds.includes(tagId) ? dealTagIds.filter(id => id !== tagId) : [...dealTagIds, tagId];
-    setDealTagIds(next);
-    if (deal?.id) setDealTagsMut.mutate({ dealId: deal.id, tagIds: next });
+    const ativo = !dealTagIds.includes(tagId);
+    setDealTagIds(ativo ? [...dealTagIds, tagId] : dealTagIds.filter(id => id !== tagId));
+    if (deal?.id) toggleDealTagMut.mutate({ dealId: deal.id, tagId, ativo });
   }
 
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -736,9 +771,10 @@ export function DealModal({
             const d = dealDetail as any;
             const wa = d.contato?.whatsapp;
             const tel = d.contato?.telefone;
+            const social = !wa && (d.contato?.instagramId ? "Instagram" : d.contato?.messengerId ? "Messenger" : null);
             return (
               <>
-                {(wa || tel || d.contato?.empresa || d.organizacao) && (
+                {(wa || tel || social || d.contato?.empresa || d.organizacao) && (
                   <div className="border-t pt-4">
                     <p className="text-xs font-semibold text-gray-500 uppercase mb-2">Contato</p>
                     <div className="text-xs text-gray-600 space-y-1.5">
@@ -752,7 +788,17 @@ export function DealModal({
                             onClick={() => { onClose(); navigate(`/whatsapp?dealId=${deal?.id}`); }}
                             className="text-indigo-600 hover:text-indigo-700 font-medium underline"
                           >
-                            Atender pelo WhatsApp IA ↗
+                            Atender no Chat ↗
+                          </button>
+                        </p>
+                      )}
+                      {social && (
+                        <p>💬 {social}{d.contato?.instagramUsername ? ` @${d.contato.instagramUsername}` : ""}{" "}
+                          <button
+                            onClick={() => { onClose(); navigate(`/whatsapp?dealId=${deal?.id}`); }}
+                            className="text-indigo-600 hover:text-indigo-700 font-medium underline"
+                          >
+                            Abrir conversa no Chat ↗
                           </button>
                         </p>
                       )}
@@ -921,61 +967,11 @@ export function DealModal({
                   >
                     {criarReuniaoMut.isPending ? "Criando..." : "📹 Agora"}
                   </button>
-                  <button
-                    onClick={() => setAgendarForm(f => ({ ...f, show: !f.show }))}
-                    className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-lg hover:bg-emerald-700 transition-colors"
-                  >
-                    📅 Agendar
-                  </button>
+                  <BotaoAgendarReuniao dealId={deal!.id}
+                    onSalvo={() => { utils.reunioes.listar.invalidate({ dealId: deal?.id }); utils.crm.kanban.invalidate(); }}
+                    className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-lg hover:bg-emerald-700 transition-colors" />
                 </div>
               </div>
-
-              {/* Formulário inline: agendar reunião pela SDR humana */}
-              {agendarForm.show && (
-                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 mb-3 space-y-2">
-                  <p className="text-xs font-semibold text-emerald-700">Agendar reunião — confirmação e lembretes enviados por WhatsApp automaticamente</p>
-                  <div className="flex flex-col gap-2">
-                    <select
-                      value={agendarForm.usuarioId}
-                      onChange={e => setAgendarForm(f => ({ ...f, usuarioId: e.target.value }))}
-                      className="w-full border border-emerald-300 rounded-lg px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-emerald-300 bg-white"
-                    >
-                      <option value="">Participante (advogado) *</option>
-                      {(usuariosList ?? []).map((u: any) => (
-                        <option key={u.id} value={u.id}>{u.nome}</option>
-                      ))}
-                    </select>
-                    <input
-                      type="datetime-local"
-                      value={agendarForm.agendadaPara}
-                      onChange={e => setAgendarForm(f => ({ ...f, agendadaPara: e.target.value }))}
-                      className="w-full border border-emerald-300 rounded-lg px-2 py-1.5 text-xs outline-none focus:ring-2 focus:ring-emerald-300 bg-white"
-                    />
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => setAgendarForm({ show: false, usuarioId: "", agendadaPara: "" })}
-                        className="flex-1 border border-gray-300 rounded-lg py-1.5 text-xs text-gray-600 hover:bg-gray-50"
-                      >
-                        Cancelar
-                      </button>
-                      <button
-                        onClick={() => criarAgendadaMut.mutate({
-                          dealId:       deal!.id,
-                          usuarioId:    agendarForm.usuarioId,
-                          agendadaPara: agendarForm.agendadaPara,
-                        })}
-                        disabled={!agendarForm.usuarioId || !agendarForm.agendadaPara || criarAgendadaMut.isPending}
-                        className="flex-1 bg-emerald-600 text-white rounded-lg py-1.5 text-xs font-medium hover:bg-emerald-700 disabled:opacity-50"
-                      >
-                        {criarAgendadaMut.isPending ? "Agendando..." : "Confirmar"}
-                      </button>
-                    </div>
-                    {criarAgendadaMut.isError && (
-                      <p className="text-xs text-red-600">{(criarAgendadaMut.error as any)?.message ?? "Erro ao agendar"}</p>
-                    )}
-                  </div>
-                </div>
-              )}
 
               {(reuniaoResult || agendarResult) && (() => {
                 const r = agendarResult ?? reuniaoResult!;
@@ -1006,31 +1002,7 @@ export function DealModal({
                 );
               })()}
 
-              {reunioesDoDeal && reunioesDoDeal.length > 0 && (
-                <div className="space-y-2 max-h-40 overflow-y-auto">
-                  {reunioesDoDeal.map((r: any) => (
-                    <div key={r.id} className="bg-gray-50 border border-gray-200 rounded-lg p-2.5">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-medium text-gray-700 truncate">{r.titulo}</span>
-                        <span className={`text-xs px-1.5 py-0.5 rounded-full flex-shrink-0 ${
-                          r.status === "em_andamento" ? "bg-green-100 text-green-700" :
-                          r.status === "encerrada"    ? "bg-gray-100 text-gray-600" :
-                          r.status === "cancelada"    ? "bg-red-100 text-red-600" :
-                          "bg-yellow-100 text-yellow-700"
-                        }`}>
-                          {r.status === "em_andamento" ? "ao vivo" :
-                           r.status === "encerrada"    ? "encerrada" :
-                           r.status === "cancelada"    ? "cancelada" : "aguardando"}
-                        </span>
-                      </div>
-                      <p className="text-xs text-gray-400 mt-1">
-                        {new Date(r.criadaEm).toLocaleString("pt-BR")}
-                        {r.agendadaPara && ` • Agendada: ${new Date(r.agendadaPara).toLocaleString("pt-BR")}`}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <ReunioesDoLead dealId={deal!.id} onChange={() => utils.crm.kanban.invalidate()} />
             </div>
           )}
 
@@ -1584,7 +1556,11 @@ export default function CrmPage() {
     },
   });
 
-  const { data: allTags, refetch: refetchTags } = trpc.crm.listTags.useQuery();
+  // Tags do funil aberto + gerais — é isso que aparece no filtro e no gerenciador.
+  const { data: allTags, refetch: refetchTags } = trpc.crm.listTags.useQuery(
+    activePipelineId ? { pipelineId: activePipelineId } : undefined,
+  );
+  const [newTagDoFunil, setNewTagDoFunil] = useState(true);
   const createTagMut = trpc.crm.createTag.useMutation({ onSuccess: () => { refetchTags(); setNewTagName(""); } });
   const updateTagMut = trpc.crm.updateTag.useMutation({ onSuccess: () => { refetchTags(); setEditingTag(null); } });
   const deleteTagMut = trpc.crm.deleteTag.useMutation({ onSuccess: () => { refetchTags(); } });
@@ -1600,6 +1576,13 @@ export default function CrmPage() {
   useEffect(() => {
     if (activePipelineId) localStorage.setItem(PIPELINE_STORAGE_KEY, activePipelineId);
   }, [activePipelineId]);
+
+  // Filtro por tag de outro funil esvaziaria o Kanban sem motivo aparente.
+  useEffect(() => {
+    if (!allTags) return;
+    const validas = new Set(allTags.map((t) => t.id));
+    setFilterTagIds((prev) => (prev.every((id) => validas.has(id)) ? prev : prev.filter((id) => validas.has(id))));
+  }, [allTags]);
 
   const [buscaDebounced, setBuscaDebounced] = useState("");
   useEffect(() => {
@@ -1635,8 +1618,9 @@ export default function CrmPage() {
   });
 
   function handleWhatsApp(deal: Deal) {
-    if (!deal.contato?.whatsapp) return;
-    if (deal.iaAtiva !== false) {
+    if (!temConversa(deal)) return;
+    // Direct/Messenger já é atendimento humano; só a IA do WhatsApp precisa pausar.
+    if (deal.contato?.whatsapp && deal.iaAtiva !== false) {
       togglePausaMut.mutate({ dealId: deal.id, pausar: true });
     }
     navigate(`/whatsapp?dealId=${deal.id}`);
@@ -1915,7 +1899,7 @@ export default function CrmPage() {
             <div className="space-y-1.5 mb-3">
               {allTags?.map((tag: any) => (
                 <div key={tag.id} className="flex items-center gap-2">
-                  {editingTag?.id === tag.id ? (
+                  {editingTag && editingTag.id === tag.id ? (
                     <>
                       <input value={editingTag.nome} onChange={e => setEditingTag(t => t ? { ...t, nome: e.target.value } : t)}
                         className="flex-1 border border-gray-200 rounded px-2 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400" />
@@ -1929,6 +1913,9 @@ export default function CrmPage() {
                     <>
                       <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: tag.cor }} />
                       <span className="flex-1 text-xs text-gray-700">{tag.nome}</span>
+                      <span className={`text-[10px] ${tag.pipelineId ? "text-indigo-400" : "text-gray-400"}`}>
+                        {tag.pipelineId ? "deste funil" : "geral"}
+                      </span>
                       <button onClick={() => setEditingTag(tag)} className="text-xs text-gray-400 hover:text-indigo-500">✏</button>
                       <button onClick={() => deleteTagMut.mutate({ id: tag.id })} className="text-xs text-gray-400 hover:text-red-500">🗑</button>
                     </>
@@ -1939,15 +1926,19 @@ export default function CrmPage() {
             <div className="flex items-center gap-2">
               <input value={newTagName} onChange={e => setNewTagName(e.target.value)} placeholder="Nova tag..."
                 className="flex-1 border border-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-400"
-                onKeyDown={e => { if (e.key === "Enter" && newTagName.trim()) createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor }); }} />
+                onKeyDown={e => { if (e.key === "Enter" && newTagName.trim()) createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor, pipelineId: newTagDoFunil ? activePipelineId : null }); }} />
               <input type="color" value={newTagCor} onChange={e => setNewTagCor(e.target.value)}
                 className="w-7 h-7 rounded cursor-pointer border border-gray-200" />
               <button
-                onClick={() => newTagName.trim() && createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor })}
+                onClick={() => newTagName.trim() && createTagMut.mutate({ nome: newTagName.trim(), cor: newTagCor, pipelineId: newTagDoFunil ? activePipelineId : null })}
                 className="text-xs bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700 disabled:opacity-40"
                 disabled={!newTagName.trim()}
               >+ Criar</button>
             </div>
+            <label className="flex items-center gap-1.5 mt-2 text-[11px] text-gray-500">
+              <input type="checkbox" checked={newTagDoFunil} onChange={e => setNewTagDoFunil(e.target.checked)} className="accent-indigo-600" />
+              Só deste funil (desmarque para tag geral, usada em todos)
+            </label>
           </div>
         )}
       </div>

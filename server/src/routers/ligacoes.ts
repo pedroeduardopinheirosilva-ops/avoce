@@ -383,6 +383,28 @@ export const ligacoesRouter = router({
       return prisma.crmLigacao.findUnique({ where: { id: input.id } });
     }),
 
+  /// Ramal SIP deste usuário — o do aparelho dele, não o da recepção.
+  meuRamal: authProc
+    .query(async ({ ctx }) => {
+      if (!ctx.userId) return null;
+      const u = await prisma.usuario.findUnique({
+        where: { id: ctx.userId },
+        select: { voipRamal: true, voipRamalSenha: true },
+      });
+      if (!u?.voipRamal || !u.voipRamalSenha) return null;
+      // O WSS e o domínio continuam vindo do emitente: é o mesmo Asterisk.
+      const emitente = await prisma.empresaEmitente.findFirst({
+        where: { ativo: true, voipAsteriskWss: { not: null } },
+        select: { voipAsteriskWss: true, voipSipDomain: true },
+      });
+      return {
+        ramal: u.voipRamal,
+        senha: u.voipRamalSenha,
+        wss: emitente?.voipAsteriskWss ?? DEFAULT_ASTERISK_WSS,
+        dominio: emitente?.voipSipDomain ?? null,
+      };
+    }),
+
   listar: authProc
     .input(z.object({ dealId: z.string() }))
     .query(async ({ input }) => {

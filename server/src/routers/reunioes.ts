@@ -1,7 +1,13 @@
 import { z }               from "zod";
 import { router, authProc, publicProc } from "./trpc.js";
 import { prisma }           from "../db.js";
+import { resolverEmitenteId, reservarOuCriarSlot, liberarSlotDaReuniao } from "../lib/agenda-slot.js";
 import { TRPCError }        from "@trpc/server";
+import { whereEmpresa }     from "./tenant-utils.js";
+import {
+  MODALIDADES, RESULTADOS_REUNIAO, agendarReuniao, atualizarReuniao, cancelarReuniao, reunioesDoLead, agendaDoPeriodo,
+  registrarResultadoReuniao,
+} from "../lib/reuniao-agenda.js";
 import jwt                  from "jsonwebtoken";
 import fs                   from "node:fs/promises";
 import path                 from "node:path";
@@ -18,6 +24,66 @@ function gerarRoomName(): string {
   let s = "avoce-";
   for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * chars.length)];
   return s;
+}
+
+async function resolverProjetoId(dealId?: string | null): Promise<string | null> {
+  if (dealId) {
+    const deal = await prisma.crmDeal.findUnique({ where: { id: dealId }, select: { projetoId: true } as any });
+    if ((deal as any)?.projetoId) return (deal as any).projetoId;
+  }
+  const proj = await prisma.iaProjeto.findFirst({ select: { id: true } });
+  return proj?.id ?? null;
+}
+
+function formatarChunks(chunks: { speakerRole: string; speakerNome: string | null; conteudo: string }[]): string {
+  return chunks
+    .map(c => `${c.speakerNome ?? (c.speakerRole === "convidado" ? "Cliente" : "Operador")}: ${c.conteudo}`)
+    .join("\n");
+}
+
+const COPILOTO_SYSTEM = `Você é um copiloto jurídico assistindo um advogado DURANTE uma reunião com cliente, em tempo real.
+Com base no trecho de transcrição fornecido, retorne de 2 a 4 sugestões CURTAS e acionáveis, uma por linha, iniciadas por "• ".
+Tipos de sugestão: pergunta importante ainda não feita, documento a solicitar, ponto de atenção jurídico, esclarecimento a pedir.
+Não repita sugestões óbvias já cobertas na conversa. Responda APENAS as sugestões, sem preâmbulo.`;
+
+const RELATORIO_SYSTEM = `Você é assistente jurídico. A partir da transcrição de uma reunião entre advogado e cliente, redija um RELATÓRIO DA REUNIÃO em português, formato markdown, com as seções:
+## Resumo
+## Dados relevantes do caso
+## Documentos e pendências
+## Próximos passos
+Seja objetivo e fiel à transcrição — não invente fatos. Se a transcrição for curta ou inconclusiva, diga isso no resumo.`;
+
+// Gera o relatório IA pós-reunião (fire-and-forget no encerrar)
+async function gerarRelatorioReuniao(sessaoId: string): Promise<void> {
+  const sessao = await prisma.sessaoReuniao.findUnique({
+    where: { id: sessaoId },
+    select: { id: true, dealId: true, titulo: true, transcricao: true },
+  });
+  if (!sessao?.transcricao || sessao.transcricao.length < 200) return;
+
+  const projetoId = await resolverProjetoId(sessao.dealId);
+  if (!projetoId) return;
+
+  const { callLlm } = await import("../agent/llm.js");
+  const res = await callLlm({
+    projetoId,
+    dealId: sessao.dealId ?? undefined,
+    systemPrompt: RELATORIO_SYSTEM,
+    // maxTokens alto: DeepSeek v4 é modelo de raciocínio e consome budget "pensando"
+    messages: [{ role: "user", content: sessao.transcricao.slice(0, 60_000) }],
+    maxTokens: 4096,
+    stageChave: "relatorio_reuniao",
+  });
+  const relatorio = res.content?.trim();
+  if (!relatorio) return;
+
+  await prisma.sessaoReuniao.update({ where: { id: sessaoId }, data: { resumoIa: relatorio } });
+  if (sessao.dealId) {
+    await prisma.crmNota.create({
+      data: { dealId: sessao.dealId, conteudo: `📋 Relatório IA — ${sessao.titulo}\n\n${relatorio}` },
+    }).catch(() => {});
+  }
+  console.log(`[Reunião] Relatório IA gerado sessaoId=${sessaoId} chars=${relatorio.length}`);
 }
 
 function gerarJitsiJwt(roomName: string, userName: string, moderator = true): string | null {
@@ -112,18 +178,47 @@ export const reunioesRouter = router({
       const duracao = sessao?.iniciadaEm
         ? Math.floor((Date.now() - sessao.iniciadaEm.getTime()) / 1000)
         : undefined;
+
+      // Monta a transcrição final a partir dos chunks rotulados: "[MM:SS] Nome: fala"
+      const chunks = await prisma.reuniaoTranscricaoChunk.findMany({
+        where: { sessaoId: input.id },
+        orderBy: { criadaEm: "asc" },
+      });
+      let transcricaoFinal = sessao?.transcricao ?? null; // legado (sessões antigas sem chunks)
+      if (chunks.length > 0) {
+        const base = (sessao?.iniciadaEm ?? chunks[0].criadaEm).getTime();
+        const mmss = (d: Date) => {
+          const s = Math.max(0, Math.floor((d.getTime() - base) / 1000));
+          return `[${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}]`;
+        };
+        transcricaoFinal = chunks
+          .map(c => `${mmss(c.criadaEm)} ${c.speakerNome ?? (c.speakerRole === "convidado" ? "Cliente" : "Operador")}: ${c.conteudo}`)
+          .join("\n");
+      }
+
       const updated = await prisma.sessaoReuniao.update({
         where: { id: input.id },
         data: {
           status:      "encerrada",
           encerradaEm: new Date(),
           duracao,
+          ...(transcricaoFinal !== null ? { transcricao: transcricaoFinal } : {}),
           ...(input.notas !== undefined ? { notas: input.notas } : {}),
         },
       });
 
+      // Reunião feita na sala do Avoce: já entra no registro do lead; a equipe só completa o resumo.
+      if (sessao?.dealId && sessao.iniciadaEm) {
+        await prisma.crmAtividade.create({
+          data: {
+            dealId: sessao.dealId, tipo: "reuniao", resultado: "realizada", canal: "video", origem: "automatica",
+            externoId: `reuniao:${sessao.id}`, duracaoSeg: duracao ?? null, criadoEm: sessao.iniciadaEm,
+          },
+        }).catch(() => {}); // externoId único: encerrar duas vezes não duplica
+      }
+
       // Auto-save transcription as .txt in deal document folder
-      const transcricao = sessao?.transcricao?.trim();
+      const transcricao = transcricaoFinal?.trim();
       if (transcricao && sessao?.dealId) {
         try {
           const dir = path.join(UPLOADS_BASE, "deals", sessao.dealId);
@@ -132,7 +227,7 @@ export const reunioesRouter = router({
           const slug     = sessao.jitsiRoomName.replace(/[^a-z0-9]/gi, "_");
           const filename = `${ts}_transcricao_${slug}.txt`;
           const filePath = path.join(dir, filename);
-          const dataFmt  = new Date(sessao.encerradaEm ?? sessao.criadaEm).toLocaleString("pt-BR");
+          const dataFmt  = new Date(updated.encerradaEm ?? sessao.criadaEm).toLocaleString("pt-BR");
           const conteudo = `TRANSCRIÇÃO DA REUNIÃO\n${sessao.titulo}\nData: ${dataFmt}\n${"─".repeat(60)}\n\n${transcricao}`;
           await fs.writeFile(filePath, conteudo, "utf8");
           await prisma.dealAnexo.create({
@@ -152,14 +247,122 @@ export const reunioesRouter = router({
         }
       }
 
+      // Relatório IA pós-reunião — assíncrono, não bloqueia o encerramento
+      gerarRelatorioReuniao(input.id).catch(e =>
+        console.warn(`[Reunião] Falha ao gerar relatório IA: ${e.message}`));
+
       return updated;
     }),
 
-  cancelar: authProc
+  // Copiloto IA — sugestões em tempo real para o operador durante a reunião
+  copiloto: authProc
     .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
-      return prisma.sessaoReuniao.update({ where: { id: input.id }, data: { status: "cancelada" } });
+    .query(async ({ input }) => {
+      const sessao = await prisma.sessaoReuniao.findUnique({
+        where: { id: input.id },
+        select: { dealId: true, status: true },
+      });
+      if (!sessao || sessao.status !== "em_andamento") return { sugestoes: null };
+
+      // Janela recente da conversa (últimos ~40 chunks)
+      const chunks = await prisma.reuniaoTranscricaoChunk.findMany({
+        where: { sessaoId: input.id },
+        orderBy: { criadaEm: "desc" },
+        take: 40,
+        select: { speakerRole: true, speakerNome: true, conteudo: true },
+      });
+      if (chunks.length < 3) return { sugestoes: null };
+
+      const projetoId = await resolverProjetoId(sessao.dealId);
+      if (!projetoId) return { sugestoes: null };
+
+      const { callLlm } = await import("../agent/llm.js");
+      try {
+        const res = await callLlm({
+          projetoId,
+          dealId: sessao.dealId ?? undefined,
+          systemPrompt: COPILOTO_SYSTEM,
+          // maxTokens alto: DeepSeek v4 é modelo de raciocínio e consome budget "pensando"
+          messages: [{ role: "user", content: formatarChunks(chunks.reverse()).slice(-8000) }],
+          maxTokens: 4096,
+          stageChave: "copiloto_reuniao",
+        });
+        return { sugestoes: res.content?.trim() || null };
+      } catch (e: any) {
+        console.warn(`[Reunião] Copiloto falhou: ${e.message}`);
+        return { sugestoes: null };
+      }
     }),
+
+  cancelar: authProc
+    .input(z.object({ id: z.string(), motivo: z.string().max(500).optional() }))
+    .mutation(async ({ input, ctx }) => {
+      // Devolve o horário à agenda e registra o cancelamento no lead.
+      return cancelarReuniao(ctx as any, input.id, input.motivo);
+    }),
+
+  /** SDR/closer marca reunião do lead: quem conduz, quando, como, pauta e anotações. */
+  agendar: authProc
+    .input(z.object({
+      dealId:          z.string(),
+      responsavelId:   z.string(),
+      agendadaPara:    z.string(),
+      duracaoMin:      z.number().int().min(10).max(480).default(60),
+      modalidade:      z.enum(MODALIDADES).default("video"),
+      pauta:           z.string().max(5000).optional(),
+      notas:           z.string().max(20000).optional(),
+      avisarCliente:   z.boolean().default(true),
+      ignorarConflito: z.boolean().default(false),
+    }))
+    .mutation(async ({ input, ctx }) => agendarReuniao(ctx as any, input)),
+
+  /** Pauta, anotações, remarcar, trocar quem conduz ou a modalidade. */
+  atualizar: authProc
+    .input(z.object({
+      id:              z.string(),
+      pauta:           z.string().max(5000).nullable().optional(),
+      notas:           z.string().max(20000).nullable().optional(),
+      agendadaPara:    z.string().optional(),
+      duracaoMin:      z.number().int().min(10).max(480).optional(),
+      modalidade:      z.enum(MODALIDADES).optional(),
+      responsavelId:   z.string().optional(),
+      ignorarConflito: z.boolean().default(false),
+    }))
+    .mutation(async ({ input, ctx }) => atualizarReuniao(ctx as any, input)),
+
+  /** Resultado de uma reunião agendada: realizada, não compareceu, remarcada ou cancelada. */
+  registrarResultado: authProc
+    .input(z.object({
+      id:              z.string(),
+      resultado:       z.enum(RESULTADOS_REUNIAO),
+      canal:           z.enum(MODALIDADES).optional(),
+      duracaoMin:      z.number().min(0).max(600).optional(),
+      nota:            z.string().max(20000).optional(),
+      em:              z.string().optional(),
+      novaData:        z.string().optional(),
+      ignorarConflito: z.boolean().default(false),
+    }))
+    .mutation(async ({ input, ctx }) => registrarResultadoReuniao(ctx as any, input)),
+
+  /** Reuniões do lead (todas as empresas que o usuário opera, não só a principal). */
+  doLead: authProc
+    .input(z.object({ dealId: z.string() }))
+    .query(async ({ input, ctx }) => reunioesDoLead(ctx as any, input.dealId)),
+
+  /** Reuniões com data no período, para a agenda. */
+  agendaPeriodo: authProc
+    .input(z.object({
+      de:                 z.string(),
+      ate:                z.string(),
+      responsavelId:      z.string().optional(),
+      incluirCanceladas:  z.boolean().default(false),
+    }))
+    .query(async ({ input, ctx }) => agendaDoPeriodo(ctx as any, {
+      ...whereEmpresa(ctx as any),
+      agendadaPara: { gte: new Date(input.de), lt: new Date(input.ate) },
+      ...(input.responsavelId ? { responsavelId: input.responsavelId } : {}),
+      ...(input.incluirCanceladas ? {} : { status: { not: "cancelada" } }),
+    })),
 
   getJitsiUrl: authProc
     .input(z.object({ id: z.string() }))
@@ -185,6 +388,28 @@ export const reunioesRouter = router({
     .input(z.object({ id: z.string(), notas: z.string() }))
     .mutation(async ({ input }) => {
       return prisma.sessaoReuniao.update({ where: { id: input.id }, data: { notas: input.notas } });
+    }),
+
+  // Transcrição ao vivo — chunks rotulados por interlocutor, em ordem de chegada
+  getTranscricao: authProc
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      const [sessao, chunks] = await Promise.all([
+        prisma.sessaoReuniao.findUnique({ where: { id: input.id }, select: { iniciadaEm: true } }),
+        prisma.reuniaoTranscricaoChunk.findMany({
+          where: { sessaoId: input.id },
+          orderBy: { criadaEm: "asc" },
+          select: { id: true, speakerRole: true, speakerNome: true, conteudo: true, criadaEm: true },
+        }),
+      ]);
+      const base = (sessao?.iniciadaEm ?? chunks[0]?.criadaEm)?.getTime();
+      return chunks.map(c => ({
+        id:      c.id,
+        role:    c.speakerRole,
+        nome:    c.speakerNome ?? (c.speakerRole === "convidado" ? "Cliente" : "Operador"),
+        texto:   c.conteudo,
+        segundos: base ? Math.max(0, Math.floor((c.criadaEm.getTime() - base) / 1000)) : 0,
+      }));
     }),
 
   addTranscricaoChunk: authProc
@@ -306,137 +531,16 @@ export const reunioesRouter = router({
       usuarioId:    z.string(),
       agendadaPara: z.string(),
     }))
-    .mutation(async ({ input }) => {
-      const agendadaPara = new Date(input.agendadaPara);
-
-      const deal = await prisma.crmDeal.findUnique({
-        where: { id: input.dealId },
-        include: { contato: { select: { id: true, nome: true, whatsapp: true } } },
+    .mutation(async ({ input, ctx }) => {
+      // Compatibilidade: a mesma regra do `agendar` (quem marcou, conflito, atividade, etapa).
+      const r = await agendarReuniao(ctx as any, {
+        dealId: input.dealId, responsavelId: input.usuarioId, agendadaPara: input.agendadaPara,
       });
-      if (!deal) throw new TRPCError({ code: "NOT_FOUND" });
-
-      const projetoId = (deal as any).projetoId as string | null;
-      const contato   = deal.contato;
-
-      const projeto = projetoId
-        ? await prisma.iaProjeto.findUnique({
-            where: { id: projetoId },
-            select: { empresaId: true, pipelineId: true },
-          })
-        : null;
-
-      const emitenteId = projeto?.empresaId
-        ? (await prisma.empresaEmitente.findFirst({
-            where: { empresaId: projeto.empresaId },
-            select: { id: true },
-          }))?.id ?? null
-        : null;
-
-      // Formata label no mesmo padrão dos AgendaSlots gerados pela secretária
-      const tz        = "America/Sao_Paulo";
-      const weekday   = new Intl.DateTimeFormat("pt-BR", { timeZone: tz, weekday: "long" }).format(agendadaPara);
-      const diaMes    = new Intl.DateTimeFormat("pt-BR", { timeZone: tz, day: "2-digit", month: "2-digit" }).format(agendadaPara);
-      const horaFmt   = new Intl.DateTimeFormat("pt-BR", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(agendadaPara);
-      const horarioLabel = `${weekday.charAt(0).toUpperCase() + weekday.slice(1)} (${diaMes}) às ${horaFmt}`;
-
-      // Cria AgendaSlot para bloquear a agenda do usuário participante
-      let slotId: string | null = null;
-      if (emitenteId) {
-        const agendaSlot = await (prisma.agendaSlot as any).create({
-          data: {
-            emitenteId,
-            usuarioId:    input.usuarioId,
-            inicio:       agendadaPara,
-            fim:          new Date(agendadaPara.getTime() + 60 * 60 * 1000),
-            disponivel:   false,
-            reservadoPara: input.dealId,
-          },
-        });
-        slotId = agendaSlot.id as string;
-      }
-
-      let sessaoId: string;
-      let linkConvidado: string;
-
-      if (projetoId && contato?.whatsapp) {
-        // Fluxo completo SDR: envia confirmação ao cliente + notifica advogada
-        const { criarReuniaoAgente } = await import("../agent/secretaria-meeting.js");
-        const slotObj = slotId
-          ? { id: slotId, inicio: agendadaPara, fim: new Date(agendadaPara.getTime() + 60 * 60 * 1000), label: horarioLabel }
-          : undefined;
-        const reuniao = await criarReuniaoAgente(
-          projetoId,
-          input.dealId,
-          { id: contato.id, nome: contato.nome ?? "Cliente", whatsapp: contato.whatsapp },
-          horarioLabel,
-          slotObj,
-        );
-        if (!reuniao) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Falha ao criar reunião" });
-        sessaoId      = reuniao.sessaoId;
-        linkConvidado = reuniao.linkConvidado;
-      } else {
-        // Fallback: cria SessaoReuniao diretamente sem WhatsApp
-        const roomName = gerarRoomName();
-        const titulo   = `Reunião com ${contato?.nome ?? deal.titulo}`;
-        const sessao   = await prisma.sessaoReuniao.create({
-          data: {
-            titulo,
-            dealId:       input.dealId,
-            contatoId:    contato?.id,
-            empresaId:    projeto?.empresaId ?? undefined,
-            emitenteId:   emitenteId ?? undefined,
-            criadoPor:    input.usuarioId,
-            jitsiRoomName: roomName,
-            agendadaPara,
-          },
-        });
-        if (slotId) {
-          await (prisma.agendaSlot as any).update({
-            where: { id: slotId },
-            data: { reuniaoId: sessao.id },
-          });
-        }
-        sessaoId      = sessao.id;
-        linkConvidado = `${APP_BASE_URL}/sala/${(sessao as any).tokenConvidado}`;
-      }
-
-      // Move deal para stage aguardando_reuniao do pipeline do projeto
-      if (projeto?.pipelineId) {
-        const stageAguardando = await prisma.crmStage.findFirst({
-          where: { pipelineId: projeto.pipelineId, chave: "aguardando_reuniao" },
-        });
-        if (stageAguardando) {
-          await prisma.crmDeal.update({
-            where: { id: input.dealId },
-            data: { stageId: stageAguardando.id, iaStageChave: "aguardando_reuniao" },
-          });
-        }
-      }
-
-      // Gera JWT Jitsi com o nome do usuário selecionado como participante
-      const sessaoData = await prisma.sessaoReuniao.findUnique({
-        where: { id: sessaoId },
-        select: { jitsiRoomName: true },
-      });
-      const selectedUser = await prisma.usuario.findUnique({
-        where: { id: input.usuarioId },
-        select: { nome: true },
-      });
-      const jwtToken = sessaoData
-        ? gerarJitsiJwt(sessaoData.jitsiRoomName, selectedUser?.nome ?? "Advogado", true)
-        : null;
-      const jitsiUrl = sessaoData
-        ? jwtToken
-          ? `https://${JITSI_HOST}/${encodeURIComponent(sessaoData.jitsiRoomName)}?jwt=${jwtToken}`
-          : `https://${JITSI_HOST}/${encodeURIComponent(sessaoData.jitsiRoomName)}`
-        : "";
-
-      return {
-        sessaoId,
-        jitsiUrl,
-        linkConvidado,
-        titulo: `Reunião com ${contato?.nome ?? deal.titulo}`,
-      };
+      const sessao = await prisma.sessaoReuniao.findUnique({ where: { id: r.sessaoId }, select: { jitsiRoomName: true, titulo: true } });
+      const usuario = await prisma.usuario.findUnique({ where: { id: input.usuarioId }, select: { nome: true } });
+      const base = sessao ? `https://${JITSI_HOST}/${encodeURIComponent(sessao.jitsiRoomName)}` : "";
+      const token = sessao ? gerarJitsiJwt(sessao.jitsiRoomName, usuario?.nome ?? "Advogado", true) : null;
+      return { sessaoId: r.sessaoId, jitsiUrl: token ? `${base}?jwt=${token}` : base, linkConvidado: r.linkConvidado, titulo: sessao?.titulo ?? "Reunião" };
     }),
 
   // Public — no auth — used by /sala/:token page
@@ -445,12 +549,20 @@ export const reunioesRouter = router({
     .query(async ({ input }) => {
       const sessao = await prisma.sessaoReuniao.findUnique({
         where: { tokenConvidado: input.token },
-        select: { titulo: true, status: true, jitsiRoomName: true },
+        select: { id: true, titulo: true, status: true, jitsiRoomName: true, contato: { select: { nome: true } } },
       });
       if (!sessao) throw new TRPCError({ code: "NOT_FOUND", message: "Reunião não encontrada" });
       if (sessao.status === "cancelada") throw new TRPCError({ code: "FORBIDDEN", message: "Esta reunião foi cancelada" });
 
       const urlBase = `https://${JITSI_HOST}/${encodeURIComponent(sessao.jitsiRoomName)}`;
-      return { titulo: sessao.titulo, status: sessao.status, jitsiUrl: urlBase, jitsiHost: JITSI_HOST, roomName: sessao.jitsiRoomName };
+      return {
+        id: sessao.id,
+        titulo: sessao.titulo,
+        status: sessao.status,
+        jitsiUrl: urlBase,
+        jitsiHost: JITSI_HOST,
+        roomName: sessao.jitsiRoomName,
+        contatoNome: sessao.contato?.nome ?? null,
+      };
     }),
 });

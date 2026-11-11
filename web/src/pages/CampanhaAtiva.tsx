@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { trpc } from "../lib/trpc";
+import { DisparosSegmentados } from "../components/DisparosSegmentados";
 import {
   Send, RefreshCw, Edit2, Check, X, ChevronLeft, ChevronRight,
   Users, MessageSquare, CheckCircle, ArrowRight, Search, Loader2,
@@ -139,6 +140,8 @@ export default function CampanhaAtiva() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+      <DisparosSegmentados />
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>

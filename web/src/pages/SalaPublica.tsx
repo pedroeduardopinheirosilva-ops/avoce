@@ -1,7 +1,8 @@
 import { useParams } from "react-router-dom";
-import { useEffect, useRef } from "react";
-import { Video, ExternalLink, Clock } from "lucide-react";
+import { useState } from "react";
+import { Video, ExternalLink, Clock, ShieldCheck } from "lucide-react";
 import { trpc } from "../lib/trpc";
+import { useTranscricaoCapture } from "../lib/useTranscricaoCapture";
 
 export default function SalaPublica() {
   const { token } = useParams<{ token: string }>();
@@ -10,56 +11,30 @@ export default function SalaPublica() {
     { enabled: !!token, retry: false }
   );
 
-  // Auto-recording — guest side (uses tokenConvidado for auth)
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef   = useRef<MediaStream | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const chunksRef   = useRef<Blob[]>([]);
-  const sessaoId    = (q.data as any)?.id as string | undefined;
-  const isLive      = (q.data as any)?.status === "em_andamento";
+  // Consentimento LGPD — o convidado só é transcrito após autorizar
+  const [entrou, setEntrou] = useState(false);
+  const [autorizaTranscricao, setAutorizaTranscricao] = useState(true);
 
-  function sendChunk(id: string, blob: Blob) {
-    if (blob.size < 1000) return;
-    const fd = new FormData();
-    fd.append("audio", blob, "chunk.webm");
-    fetch(`/api/reuniao/${id}/transcricao-chunk?token=${encodeURIComponent(token ?? "")}`, {
-      method: "POST",
-      body: fd,
-    }).catch(() => {});
+  // Transcrição — lado do convidado: captura o próprio mic, rotulado com o nome do contato
+  const sessaoId = (q.data as any)?.id as string | undefined;
+  const isLive   = (q.data as any)?.status === "em_andamento";
+  useTranscricaoCapture({
+    sessaoId,
+    enabled:    isLive && !!sessaoId && entrou && autorizaTranscricao,
+    nome:       (q.data as any)?.contatoNome ?? "Cliente",
+    guestToken: token,
+  });
+
+  function handleEntrar() {
+    if (autorizaTranscricao && sessaoId) {
+      fetch(`/api/reuniao/${sessaoId}/consentimento?token=${encodeURIComponent(token ?? "")}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }).catch(() => {});
+    }
+    setEntrou(true);
   }
-
-  useEffect(() => {
-    if (!isLive || !sessaoId) return;
-
-    navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(stream => {
-      streamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-      const recorder = new MediaRecorder(stream, { mimeType });
-      recorderRef.current = recorder;
-      chunksRef.current = [];
-
-      recorder.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        sendChunk(sessaoId, blob);
-        chunksRef.current = [];
-      };
-
-      recorder.start();
-      intervalRef.current = setInterval(() => {
-        if (recorderRef.current?.state === "recording") {
-          recorderRef.current.stop();
-          setTimeout(() => { recorderRef.current?.start(); }, 200);
-        }
-      }, 30_000);
-    }).catch(() => {});
-
-    return () => {
-      if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      if (recorderRef.current?.state !== "inactive") recorderRef.current?.stop();
-      streamRef.current?.getTracks().forEach(t => t.stop());
-    };
-  }, [isLive, sessaoId]);
 
   if (q.isLoading) {
     return (
@@ -99,6 +74,42 @@ export default function SalaPublica() {
             className="text-sm border rounded-lg px-4 py-2 hover:bg-gray-50">
             Atualizar
           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // em_andamento — tela de consentimento LGPD antes de entrar
+  if (!entrou) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+        <div className="text-center text-gray-600 bg-white rounded-xl shadow-sm p-8 max-w-md w-full">
+          <ShieldCheck size={40} className="mx-auto mb-3 text-indigo-500" />
+          <h2 className="text-lg font-semibold text-gray-800 mb-2">{(sessao as any).titulo}</h2>
+          <p className="text-sm text-gray-500 mb-4">
+            Esta videochamada pode ser <strong>gravada e transcrita</strong> para registro do
+            atendimento jurídico, nos termos da Lei Geral de Proteção de Dados (LGPD).
+            O conteúdo é tratado com confidencialidade e usado exclusivamente no seu caso.
+          </p>
+          <label className="flex items-start gap-2 text-left text-sm text-gray-700 mb-5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={autorizaTranscricao}
+              onChange={e => setAutorizaTranscricao(e.target.checked)}
+              className="mt-0.5 accent-indigo-600"
+            />
+            <span>Autorizo a gravação e a transcrição da minha fala nesta reunião.</span>
+          </label>
+          <button
+            onClick={handleEntrar}
+            className="w-full bg-indigo-600 text-white rounded-lg py-2.5 text-sm font-medium hover:bg-indigo-700">
+            Entrar na reunião
+          </button>
+          {!autorizaTranscricao && (
+            <p className="text-[11px] text-gray-400 mt-3">
+              Você entrará normalmente, mas sua fala não será transcrita.
+            </p>
+          )}
         </div>
       </div>
     );
