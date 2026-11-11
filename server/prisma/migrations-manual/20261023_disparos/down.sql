@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS "CrmDisparoItem";
+DROP TABLE IF EXISTS "CrmDisparo";
