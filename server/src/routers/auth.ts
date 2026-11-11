@@ -4,6 +4,7 @@ import bcrypt        from "bcryptjs";
 import { TRPCError } from "@trpc/server";
 import { router, publicProc, authProc } from "./trpc.js";
 import { prisma }    from "../db.js";
+import { canOperate, canAccess } from "./tenant-utils.js";
 import type { PermissoesUsuario } from "./permission-constants.js";
 
 // ── Rate limiting para login: 5 tentativas por IP a cada 15 minutos ───────────
@@ -74,6 +75,7 @@ export const authRouter = router({
       empresaId: z.string().optional(),
     }))
     .mutation(async ({ input, ctx }) => {
+      if (ctx.role !== "admin") throw new Error("Apenas administradores podem criar usuários");
       const hash = await bcrypt.hash(input.senha, 10);
       // Só admin global (sem empresaId) pode definir empresaId manualmente
       const empresaId = input.empresaId
@@ -98,7 +100,7 @@ export const authRouter = router({
       email:     z.string().email().optional(),
       senha:     z.string().min(6).optional(),
       ativo:     z.boolean().optional(),
-      role:      z.string().optional(),
+      role:      z.enum(["user", "admin"]).optional(),
       whatsapp:  z.string().regex(/^\d{10,15}$/).nullable().optional(), // somente dígitos
     }))
     .mutation(async ({ input, ctx }) => {
@@ -106,12 +108,24 @@ export const authRouter = router({
       const data: any = { ...rest };
       if (senha) data.senha = await bcrypt.hash(senha, 10);
 
-      // Verify the user belongs to the same empresa (unless admin)
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const target = await prisma.usuario.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!target || target.empresaId !== ctx.empresaId) {
-          throw new Error("Usuário não pertence à sua empresa");
+      // Não-admin só edita o próprio cadastro e não muda papel nem status: antes qualquer
+      // usuário se promovia a admin ou trocava senha/WhatsApp de colegas (o WhatsApp é a
+      // identidade no Assistente Interno).
+      const target = await prisma.usuario.findUnique({ where: { id }, select: { empresaId: true, role: true, ativo: true } });
+      if (ctx.role !== "admin") {
+        if (id !== ctx.userId) throw new Error("Apenas administradores podem editar outros usuários");
+        // O formulário sempre reenvia `ativo`; só recusa se tentar MUDAR papel/status
+        if ((rest.role !== undefined && rest.role !== target?.role) ||
+            (rest.ativo !== undefined && rest.ativo !== target?.ativo)) {
+          throw new Error("Apenas administradores podem alterar papel ou status");
         }
+        delete data.role;
+        delete data.ativo;
+      }
+
+      // Verify the user belongs to the same empresa (unless admin)
+      if (!target || !canOperate(ctx, target.empresaId)) {
+        throw new Error("Usuário não pertence à sua empresa");
       }
 
       return (prisma as any).usuario.update({
@@ -128,9 +142,9 @@ export const authRouter = router({
       // Prevent self-deletion
       if (input.id === ctx.userId) throw new Error("Não é possível excluir sua própria conta");
       // Tenant admin can only delete users from same empresa
-      if (ctx.empresaId) {
+      {
         const target = await prisma.usuario.findUnique({ where: { id: input.id }, select: { empresaId: true } });
-        if (!target || target.empresaId !== ctx.empresaId) throw new Error("Usuário não pertence à sua empresa");
+        if (!target || !canOperate(ctx, target.empresaId)) throw new Error("Usuário não pertence à sua empresa");
       }
       return prisma.usuario.delete({ where: { id: input.id } });
     }),
@@ -146,6 +160,17 @@ export const authRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       if (ctx.role !== "admin") throw new Error("Apenas administradores podem alterar permissões");
+      const target = await prisma.usuario.findUnique({ where: { id: input.id }, select: { empresaId: true } });
+      if (!target || !canOperate(ctx, target.empresaId)) throw new Error("Usuário não pertence à sua empresa");
+      // Admin de empresa só concede empresas/emitentes que ele mesmo alcança
+      const p = input.permissoes;
+      if (p?.empresas?.some((e) => !canAccess(ctx, e))) throw new Error("Empresa fora do seu escopo");
+      if (p?.emitentes?.length) {
+        const emits = await prisma.empresaEmitente.findMany({ where: { id: { in: p.emitentes } }, select: { empresaId: true } });
+        if (emits.length !== new Set(p.emitentes).size || emits.some((e) => !canAccess(ctx, e.empresaId))) {
+          throw new Error("Emitente fora do seu escopo");
+        }
+      }
       return prisma.usuario.update({
         where: { id: input.id },
         data:  { permissoes: input.permissoes as any },

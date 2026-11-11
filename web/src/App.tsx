@@ -1,9 +1,11 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { useEffect } from "react";
 import Layout     from "./components/Layout";
+import Disparos           from "./pages/Disparos";
 import LoginPage  from "./pages/Login";
 import { VoipProvider } from "./contexts/VoipContext";
 import Dashboard  from "./pages/Dashboard";
+import Painel     from "./pages/Painel";
 import Empresas   from "./pages/Empresas";
 import Tomadores  from "./pages/Tomadores";
 import Contratos  from "./pages/Contratos";
@@ -15,13 +17,9 @@ import TemplatesDocumentos from "./pages/TemplatesDocumentos";
 import Crm                 from "./pages/Crm";
 import Whatsapp            from "./pages/Whatsapp";
 import ConfigIA            from "./pages/ConfigIA";
-import Pipedrive           from "./pages/Pipedrive";
-import Reengajamento       from "./pages/Reengajamento";
-import CampanhaAtiva       from "./pages/CampanhaAtiva";
 import Financeiro          from "./pages/Financeiro";
 import Usuarios           from "./pages/Usuarios";
 import AssistenteInterno  from "./pages/AssistenteInterno";
-import MarketingAutopilot from "./pages/MarketingAutopilot";
 import ContasBancarias    from "./pages/Financeiro/ContasBancarias";
 import ContaBancariaForm  from "./pages/Financeiro/ContaBancariaForm";
 import Extrato            from "./pages/Financeiro/Extrato";
@@ -31,6 +29,7 @@ import Reunioes           from "./pages/Reunioes";
 import Telefone           from "./pages/Telefone";
 import SalaPublica        from "./pages/SalaPublica";
 import Tenants            from "./pages/Tenants";
+import Assinaturas        from "./pages/Assinaturas";
 import { trpc } from "./lib/trpc";
 import { AuthContext, type AuthUser } from "./lib/usePermission";
 
@@ -71,6 +70,7 @@ export default function App() {
           <Route path="whatsapp"   element={<Whatsapp />} />
           <Route path="config-ia"  element={<ConfigIA />} />
           <Route path="dashboard"  element={<Dashboard />} />
+          <Route path="painel"     element={<Painel />} />
           <Route path="empresas"   element={<Empresas />} />
           <Route path="tomadores"  element={<Tomadores />} />
           <Route path="contratos"  element={<Contratos />} />
@@ -79,9 +79,7 @@ export default function App() {
           <Route path="cobrancas"  element={<Cobrancas />} />
           <Route path="propostas"           element={<Propostas />} />
           <Route path="templates-documentos" element={<TemplatesDocumentos />} />
-          <Route path="pipedrive"           element={<Pipedrive />} />
-          <Route path="reengajamento"       element={<Reengajamento />} />
-          <Route path="campanha-ativa"      element={<CampanhaAtiva />} />
+          <Route path="assinaturas"         element={<Assinaturas />} />
           <Route path="financeiro"          element={<Financeiro />} />
           <Route path="financeiro/contas"   element={<ContasBancarias />} />
           <Route path="financeiro/contas/nova" element={<ContaBancariaForm />} />
@@ -92,9 +90,10 @@ export default function App() {
           <Route path="usuarios"            element={<Usuarios />} />
           <Route path="tenants"             element={<Tenants />} />
           <Route path="assistente-interno"  element={<AssistenteInterno />} />
-          <Route path="marketing-autopilot" element={<MarketingAutopilot />} />
           <Route path="reunioes"           element={<Reunioes />} />
+          <Route path="agenda"             element={<Reunioes abaInicial="agenda" />} />
           <Route path="telefone"           element={<Telefone />} />
+          <Route path="disparos"            element={<Disparos />} />
         </Route>
       </Routes>
     </BrowserRouter>

@@ -22,6 +22,9 @@ import { assinaturaRouter }           from "./assinaturas.js";
 import { painelRouter }               from "./painel.js";
 import { audienciaRouter }            from "./audiencia.js";
 import { motoresRouter }              from "./motores.js";
+import { metaCapiRouter }             from "./metaCapi.js";
+import { metaSocialRouter }           from "./metaSocial.js";
+import { disparosRouter }             from "./disparos.js";
 
 export type { Context } from "./trpc.js";
 
@@ -49,6 +52,9 @@ export const appRouter = router({
   painel:            painelRouter,
   audiencia:         audienciaRouter,
   motores:           motoresRouter,
+  metaCapi:          metaCapiRouter,
+  metaSocial:        metaSocialRouter,
+  disparos:          disparosRouter,
 });
 
 export type AppRouter = typeof appRouter;

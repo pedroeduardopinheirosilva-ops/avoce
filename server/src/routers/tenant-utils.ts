@@ -39,6 +39,22 @@ export function canAccess(ctx: TenantCtx, recursoEmpresaId: string | null | unde
 }
 
 /**
+ * Verifica se o usuário pode OPERAR um recurso de uma empresa.
+ *
+ * Igual a `canAccess`, mas também libera o admin da plataforma (role admin sem
+ * empresa primária) — que pode ter `empresas_full` e ainda assim precisa alcançar
+ * registros de empresa nula/legada.
+ *
+ * Use no lugar da comparação crua `recurso.empresaId !== ctx.empresaId`: aquela
+ * ignora `permissoes.empresas`, então trava todo usuário que opera mais de uma
+ * empresa (e trava por completo quem não tem empresa primária).
+ */
+export function canOperate(ctx: TenantCtx, recursoEmpresaId: string | null | undefined): boolean {
+  if (ctx.role === "admin" && !ctx.empresaId) return true;
+  return canAccess(ctx, recursoEmpresaId);
+}
+
+/**
  * Drop-in replacement for the inline `empresaFilter` pattern used in
  * emitente-scoped routers (notas, cobrancas, contratos, propostas, etc.).
  *

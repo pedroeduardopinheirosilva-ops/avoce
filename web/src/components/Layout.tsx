@@ -1,12 +1,11 @@
 import { useState } from "react";
+import { trpc } from "../lib/trpc";
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
-import {
+import { CalendarDays,
   LayoutDashboard,
+  BarChart3,
   KanbanSquare,
   MessageSquare,
-  RefreshCw,
-  Megaphone,
-  ArrowDownToLine,
   FileText,
   ScrollText,
   FilePlus2,
@@ -23,7 +22,6 @@ import {
   Bot,
   User,
   LogOut,
-  Rocket,
   Menu,
   X,
   Video,
@@ -31,6 +29,8 @@ import {
   PhoneOff,
   PhoneCall,
   Shield,
+  PenLine,
+  Send,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { AvoceLockup } from "./Logo";
@@ -50,14 +50,13 @@ const groups: NavGroup[] = [
   {
     label: "Comercial",
     items: [
+      { to: "/painel",        label: "Painel Diário", icon: BarChart3,     moduloChave: "painel" },
       { to: "/crm",           label: "Funil CRM",     icon: KanbanSquare,  moduloChave: "crm" },
-      { to: "/whatsapp",      label: "WhatsApp IA",   icon: MessageSquare, moduloChave: "whatsapp" },
+      { to: "/whatsapp",      label: "Chat",          icon: MessageSquare, moduloChave: "whatsapp" },
+      { to: "/agenda",        label: "Agenda",        icon: CalendarDays,   moduloChave: "reunioes" },
       { to: "/reunioes",      label: "Reuniões",      icon: Video,          moduloChave: "reunioes" },
       { to: "/telefone",      label: "Telefone",      icon: Phone,          moduloChave: "telefone" },
-      { to: "/reengajamento",       label: "Reengajamento",    icon: RefreshCw,      moduloChave: "reengajamento" },
-      { to: "/campanha-ativa",      label: "Campanha Ativa",   icon: Megaphone,      moduloChave: "reengajamento" },
-      { to: "/pipedrive",           label: "Pipedrive",        icon: ArrowDownToLine, moduloChave: "pipedrive" },
-      { to: "/marketing-autopilot", label: "Mkt Autopilot",    icon: Rocket,          moduloChave: "marketing_autopilot" },
+      { to: "/disparos",      label: "Disparos",      icon: Send,           moduloChave: "crm" },
     ],
   },
   {
@@ -66,6 +65,7 @@ const groups: NavGroup[] = [
       { to: "/propostas",            label: "Propostas", icon: FileText,   moduloChave: "propostas" },
       { to: "/contratos",            label: "Contratos", icon: ScrollText, moduloChave: "contratos" },
       { to: "/templates-documentos", label: "Templates", icon: FilePlus2,  moduloChave: "templates_documentos" },
+      { to: "/assinaturas",          label: "Assinaturas", icon: PenLine, moduloChave: "assinaturas" },
     ],
   },
   {
@@ -178,6 +178,8 @@ function ActiveCallOverlay() {
 }
 
 export default function Layout() {
+  // Ligações de follow-up vencendo hoje/atrasadas — número ao lado do "Painel Diário".
+  const followups = trpc.painel.followupsPendentes.useQuery(undefined, { refetchInterval: 5 * 60_000, retry: false });
   const navigate = useNavigate();
   const { user } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -296,6 +298,14 @@ export default function Layout() {
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", lineHeight: 1 }}>
                           {item.label}
                         </span>
+                        {item.to === "/painel" && !!followups.data && (
+                          <span
+                            title={`${followups.data} ligação(ões) de follow-up para hoje/atrasadas`}
+                            style={{ marginLeft: "auto", background: "#dc2626", color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 9, padding: "1px 6px", lineHeight: "14px" }}
+                          >
+                            {followups.data}
+                          </span>
+                        )}
                       </>
                     )}
                   </NavLink>

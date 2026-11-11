@@ -2,9 +2,11 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { router, authProc } from "./trpc.js";
 import { prisma } from "../db.js";
-import { whereEmpresa } from "./tenant-utils.js";
+import { whereEmpresa, canOperate } from "./tenant-utils.js";
+import { whereTagVisivel } from "./crm.js";
 import { invalidateClientCache } from "../agent/llm.js";
-import { fieldEncrypt } from "../lib/field-crypto.js";
+import { fieldEncryptIfPlain } from "../lib/field-crypto.js";
+import { registrarQuemVe } from "../services/quem-atende.js";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Seed data — Projeto Carreteiros
@@ -85,8 +87,98 @@ Após 2 tentativas sem resposta → parar completamente.
 {INSTRUÇÃO BASE}`;
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Acesso a deals do WhatsApp
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Um deal é operável por quem tem a empresa dona do deal entre as suas — inclusive
+ * pelas empresas extras de `permissoes.empresas`, e não só pela empresa primária.
+ * Atendente de uma empresa do grupo operando o projeto de outra é o caso normal aqui.
+ */
+function assertPodeOperarDeal(
+  ctx: { empresaId?: string; empresaIds?: string[]; role?: string },
+  deal: { empresaId: string | null },
+): void {
+  if (canOperate(ctx, deal.empresaId)) return;
+  throw new TRPCError({ code: "FORBIDDEN", message: "Deal não pertence à sua empresa" });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Router
 // ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Filtros da caixa do WhatsApp IA. Os funis (Carreteiros, Defesa ICMS, Subvenção,
+ * Contadores…) dividem a mesma caixa; sem filtro o SDR de um funil garimpava as
+ * conversas dele no meio das dos outros.
+ */
+const filtroConversas = z.object({
+  projetoId: z.string().optional(),
+  pipelineId: z.string().optional(),
+  /** Conversa com QUALQUER uma destas tags (mesma regra do filtro do Kanban). */
+  tagIds: z.array(z.string()).optional(),
+  semTag: z.boolean().optional(),
+  atendimento: z.enum(["ia", "humano"]).optional(),
+  /** Última mensagem é do lead — ninguém respondeu ainda. */
+  aguardando: z.boolean().optional(),
+  /** Próximo follow-up vence hoje ou já passou (rotina diária do SDR). */
+  followup: z.boolean().optional(),
+  /** Esconde as conversas abertas por comentário/Live do Instagram ou Facebook. */
+  semComentarios: z.boolean().optional(),
+});
+
+/** Títulos de origem gravados em meta-social.ts: "Comentário Instagram · FILA", "Live Facebook · comentario"... */
+const PREFIXOS_COMENTARIO = ["Comentário Instagram", "Comentário Facebook", "Live Instagram", "Live Facebook"];
+const VEIO_DE_COMENTARIO = {
+  OR: PREFIXOS_COMENTARIO.map((p) => ({ origemAnuncioTitulo: { startsWith: p } })),
+};
+/** O título nulo entra de propósito: NOT sobre coluna nula dá NULL no SQL e a conversa sem origem sumiria junto. */
+const NAO_VEIO_DE_COMENTARIO = {
+  OR: [{ origemAnuncioTitulo: null }, { NOT: VEIO_DE_COMENTARIO }],
+};
+
+/** Fim do dia de hoje em São Paulo — "vence hoje" inclui o dia inteiro. */
+function fimDeHojeSP(): Date {
+  const hoje = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo" }).format(new Date());
+  return new Date(new Date(`${hoje}T00:00:00-03:00`).getTime() + 24 * 3600_000);
+}
+
+function whereFiltroConversas(f: z.infer<typeof filtroConversas>): Record<string, unknown> {
+  return {
+    ...(f.projetoId ? { projetoId: f.projetoId } : {}),
+    ...(f.pipelineId ? { pipelineId: f.pipelineId } : {}),
+    ...(f.tagIds?.length ? { tags: { some: { id: { in: f.tagIds } } } } : f.semTag ? { tags: { none: {} } } : {}),
+    ...(f.atendimento ? { iaAtiva: f.atendimento === "ia" } : {}),
+    ...(f.followup ? { status: "aberto", proximoContatoEm: { lt: fimDeHojeSP() } } : {}),
+    // Em AND porque a busca global usa o OR do nível de cima para os termos.
+    ...(f.semComentarios ? { AND: [NAO_VEIO_DE_COMENTARIO] } : {}),
+  };
+}
+
+const includeConversa = {
+  contato: true,
+  mensagens: { orderBy: { enviadaEm: "desc" as const }, take: 1 },
+  stage: { select: { pipelineId: true, nome: true, cor: true } },
+  pipeline: { select: { id: true, nome: true, cor: true } },
+  tags: { select: { id: true, nome: true, cor: true, pipelineId: true } },
+};
+
+/**
+ * Variantes de um número para busca "por pedaço", porque o banco guarda o
+ * WhatsApp em formatos diferentes: com e sem DDI 55, com e sem o 9º dígito
+ * (`557799656376` convive com `5577999656376`) e com máscara em `telefone`.
+ * Sem isso, colar "(77) 99965-6376" da agenda não achava nada.
+ */
+function variantesNumero(digitos: string): string[] {
+  const v = new Set<string>([digitos]);
+  let d = digitos;
+  if (d.startsWith("55") && d.length >= 12) { d = d.slice(2); v.add(d); }
+  if (d.length === 11 && d[2] === "9") v.add(d.slice(0, 2) + d.slice(3)); // sem 9º dígito
+  if (d.length === 10) v.add(d.slice(0, 2) + "9" + d.slice(2));           // com 9º dígito
+  if (d.length === 9 && d[0] === "9") v.add(d.slice(1));                  // sem DDD, sem o 9
+  if (d.length === 8) v.add("9" + d);
+  return [...v];
+}
 
 export const iaRouter = router({
   // ── Projetos ──────────────────────────────────────────────────────────────
@@ -94,6 +186,67 @@ export const iaRouter = router({
   listProjetos: authProc.query(({ ctx }) =>
     prisma.iaProjeto.findMany({ where: whereEmpresa(ctx), orderBy: { criadoEm: "asc" } })
   ),
+
+  /**
+   * Números de onde se pode abrir uma conversa nova: um item por projeto ativo, com a
+   * instância Evolution e o telefone/nome do perfil conectado nela. O número vem do próprio
+   * Evolution (best-effort, 3s) — se não responder, a tela mostra só o nome da instância.
+   */
+  listCanaisNovaConversa: authProc.query(async ({ ctx }) => {
+    const projetos = await prisma.iaProjeto.findMany({
+      where: { ...whereEmpresa(ctx), ativo: true },
+      orderBy: { criadoEm: "asc" },
+      select: {
+        id: true, nome: true, empresaId: true,
+        configs: { where: { categoria: "whatsapp" }, select: { chave: true, valor: true } },
+      },
+    });
+    const empresas = await prisma.empresa.findMany({
+      where: { id: { in: projetos.map((p) => p.empresaId).filter(Boolean) as string[] } },
+      select: { id: true, nome: true },
+    });
+    const empresaNome = new Map(empresas.map((e) => [e.id, e.nome]));
+
+    const perfis = new Map<string, Promise<{ telefone: string | null; perfil: string | null; status: string | null }>>();
+    const perfilDa = (baseUrl: string, apiKey: string, instancia: string) => {
+      const chave = `${baseUrl}|${instancia}`;
+      if (!perfis.has(chave)) {
+        perfis.set(chave, (async () => {
+          try {
+            const r = await fetch(`${baseUrl}/instance/fetchInstances?instanceName=${encodeURIComponent(instancia)}`, {
+              headers: { apikey: apiKey }, signal: AbortSignal.timeout(3000),
+            });
+            const lista = (await r.json()) as Array<{ ownerJid?: string; profileName?: string; connectionStatus?: string }>;
+            const i = Array.isArray(lista) ? lista[0] : undefined;
+            return {
+              telefone: i?.ownerJid?.split("@")[0] ?? null,
+              perfil: i?.profileName ?? null,
+              status: i?.connectionStatus ?? null,
+            };
+          } catch {
+            return { telefone: null, perfil: null, status: null };
+          }
+        })());
+      }
+      return perfis.get(chave)!;
+    };
+
+    const canais = await Promise.all(projetos.map(async (p) => {
+      const get = (k: string) => p.configs.find((c) => c.chave === k)?.valor ?? "";
+      const baseUrl = get("evolution_api_url"), apiKey = get("evolution_api_key"), instancia = get("evolution_instancia");
+      const info = baseUrl && instancia ? await perfilDa(baseUrl, apiKey, instancia) : null;
+      return {
+        projetoId: p.id,
+        projetoNome: p.nome,
+        empresaNome: (p.empresaId && empresaNome.get(p.empresaId)) || null,
+        instancia: instancia || null,
+        telefone: info?.telefone ?? null,
+        perfil: info?.perfil ?? null,
+        conectado: info?.status ? info.status === "open" : null,
+      };
+    }));
+    return canais.filter((c) => c.instancia);
+  }),
 
   getProjeto: authProc
     .input(z.object({ id: z.string() }))
@@ -103,9 +256,7 @@ export const iaRouter = router({
         include: { configs: true, personas: { orderBy: { ordem: "asc" } }, fases: { orderBy: { ordem: "asc" } } },
       });
       if (!projeto) throw new Error("Projeto não encontrado");
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        if (projeto.empresaId !== ctx.empresaId) throw new Error("Projeto não pertence à sua empresa");
-      }
+      if (!canOperate(ctx, projeto.empresaId)) throw new Error("Projeto não pertence à sua empresa");
       return projeto;
     }),
 
@@ -119,10 +270,8 @@ export const iaRouter = router({
     .input(z.object({ id: z.string(), nome: z.string().optional(), ativo: z.boolean().optional(), whatsappInstancia: z.string().optional() }))
     .mutation(async ({ input, ctx }) => {
       const { id, ...data } = input;
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const p = await prisma.iaProjeto.findUnique({ where: { id }, select: { empresaId: true } });
-        if (!p || p.empresaId !== ctx.empresaId) throw new Error("Projeto não pertence à sua empresa");
-      }
+      const p = await prisma.iaProjeto.findUnique({ where: { id }, select: { empresaId: true } });
+      if (!p || !canOperate(ctx, p.empresaId)) throw new Error("Projeto não pertence à sua empresa");
       return prisma.iaProjeto.update({ where: { id }, data });
     }),
 
@@ -160,7 +309,8 @@ export const iaRouter = router({
         lead_reconhecimento_vinculo: "#14b8a6", lead_qualificado: "#8b5cf6",
         lead_indeciso: "#f59e0b", com_closer: "#f97316",
         sem_resposta_closer: "#ef4444", aguardando_reuniao: "#a855f7",
-        aguardando_docs_pessoais: "#06b6d4", aguardando_assinatura: "#10b981",
+        aguardando_docs_pessoais: "#06b6d4", docs_em_revisao: "#f59e0b",
+        aguardando_assinatura: "#10b981",
         lead_desqualificado: "#6b7280", descartado: "#dc2626",
       };
 
@@ -281,6 +431,17 @@ export const iaRouter = router({
       })
     ),
 
+  /** Liga/desliga uma persona para todo o sistema. Desligada, ela não responde
+   *  nem envia proativa — o deal segue vivo e a conversa fica com a equipe. */
+  setPersonaAtiva: authProc
+    .input(z.object({ projetoId: z.string(), chave: z.string(), ativo: z.boolean() }))
+    .mutation(({ input }) =>
+      prisma.iaPersona.update({
+        where: { projetoId_chave: { projetoId: input.projetoId, chave: input.chave } },
+        data: { ativo: input.ativo },
+      })
+    ),
+
   upsertPersona: authProc
     .input(z.object({
       projetoId: z.string(),
@@ -344,39 +505,190 @@ export const iaRouter = router({
       })
     ),
 
+  // ── Entregáveis (vídeo por dor, enviado ao fim da triagem) ───────────────
+
+  listEntregaveis: authProc
+    .input(z.object({ projetoId: z.string() }))
+    .query(async ({ input }) => {
+      const [lista, etapaCfg] = await Promise.all([
+        prisma.iaEntregavel.findMany({ where: { projetoId: input.projetoId }, orderBy: [{ ordem: "asc" }, { criadoEm: "asc" }] }),
+        prisma.iaProjetoConfig.findFirst({ where: { projetoId: input.projetoId, chave: "entregavel_etapa" } }),
+      ]);
+      const enviados = lista.length
+        ? await prisma.$queryRaw<{ chave: string; n: bigint }[]>`
+            SELECT (qualificacao->'_entregavel_enviado'->>'chave') AS chave, count(*) AS n
+            FROM "CrmDeal" WHERE "projetoId" = ${input.projetoId} AND qualificacao ? '_entregavel_enviado'
+            GROUP BY 1`
+        : [];
+      const porChave = new Map(enviados.map((r) => [r.chave, Number(r.n)]));
+      return {
+        etapa: etapaCfg?.valor || "lead_qualificado",
+        itens: lista.map(({ arquivoPath, ...e }) => ({
+          ...e,
+          temArquivo: !!arquivoPath,
+          url: arquivoPath ? `/api/ia-entregavel/${e.id}/arquivo` : null,
+          enviados: porChave.get(e.chave) ?? 0,
+        })),
+      };
+    }),
+
+  salvarEntregavel: authProc
+    .input(z.object({
+      id: z.string().optional(),
+      projetoId: z.string(),
+      chave: z.string().min(1).regex(/^[a-z0-9_]+$/, "Use só letras minúsculas, números e _"),
+      titulo: z.string().min(1),
+      palavrasChave: z.string(),
+      legenda: z.string().nullable().optional(),
+      padrao: z.boolean().optional(),
+      ativo: z.boolean().optional(),
+      ordem: z.number().int().optional(),
+    }))
+    .mutation(async ({ input }) => {
+      const { id, projetoId, ...data } = input;
+      // Só um entregável padrão por projeto.
+      if (data.padrao) {
+        await prisma.iaEntregavel.updateMany({ where: { projetoId, padrao: true, ...(id ? { id: { not: id } } : {}) }, data: { padrao: false } });
+      }
+      return id
+        ? prisma.iaEntregavel.update({ where: { id }, data })
+        : prisma.iaEntregavel.create({ data: { projetoId, ...data } });
+    }),
+
+  excluirEntregavel: authProc
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      const e = await prisma.iaEntregavel.delete({ where: { id: input.id } });
+      if (e.arquivoPath) { try { (await import("node:fs")).unlinkSync(e.arquivoPath); } catch {} }
+      return { ok: true };
+    }),
+
+  setEntregavelEtapa: authProc
+    .input(z.object({ projetoId: z.string(), etapa: z.string().min(1) }))
+    .mutation(async ({ input }) => {
+      await prisma.iaProjetoConfig.upsert({
+        where: { projetoId_chave: { projetoId: input.projetoId, chave: "entregavel_etapa" } },
+        create: { projetoId: input.projetoId, chave: "entregavel_etapa", valor: input.etapa, categoria: "entregavel" },
+        update: { valor: input.etapa },
+      });
+      return { ok: true };
+    }),
+
+  /** Manda o entregável para um número de teste (o seu), sem mexer em deal nenhum. */
+  testarEntregavel: authProc
+    .input(z.object({ id: z.string(), whatsapp: z.string().min(10) }))
+    .mutation(async ({ input }) => {
+      const e = await prisma.iaEntregavel.findUnique({ where: { id: input.id } });
+      if (!e) throw new TRPCError({ code: "NOT_FOUND", message: "Entregável não encontrado" });
+      const { dispararEntregavel } = await import("../agent/entregaveis.js");
+      await dispararEntregavel(e.projetoId, e, input.whatsapp.replace(/\D/g, ""));
+      return { ok: true };
+    }),
+
+  /** Qual entregável este deal receberia, sem enviar — para conferir as palavras-chave. */
+  simularEntregavel: authProc
+    .input(z.object({ projetoId: z.string(), dealId: z.string() }))
+    .query(async ({ input }) => {
+      const { escolherEntregavel, corpusDoDeal } = await import("../agent/entregaveis.js");
+      const lista = await prisma.iaEntregavel.findMany({ where: { projetoId: input.projetoId, ativo: true }, orderBy: [{ ordem: "asc" }] });
+      const e = escolherEntregavel(lista, await corpusDoDeal(input.dealId));
+      return e ? { chave: e.chave, titulo: e.titulo } : null;
+    }),
+
   // ── Mensagens WhatsApp ────────────────────────────────────────────────────
 
   getMensagens: authProc
-    .input(z.object({ dealId: z.string(), limit: z.number().optional() }))
-    .query(async ({ input }) => {
-      const limit = input.limit ?? 100;
+    .input(z.object({ dealId: z.string(), limit: z.number().optional(), q: z.string().optional() }))
+    .query(async ({ input, ctx }) => {
+      // A tela da conversa consulta isto a cada 5 s: é o que diz quem está atendendo,
+      // para assinar a mensagem que a pessoa mandar direto pelo WhatsApp.
+      registrarQuemVe(input.dealId, ctx.userId);
+      // Com `q`, procura no histórico INTEIRO do deal em vez de devolver só a
+      // última janela: o filtro do painel era client-side sobre as 100 últimas,
+      // então mensagem antiga achada na busca global abria a conversa vazia.
+      const q = (input.q ?? "").trim();
+      const limit = input.limit ?? (q ? 200 : 100);
       const rows = await prisma.crmMensagemWhatsapp.findMany({
-        where: { dealId: input.dealId },
+        where: {
+          dealId: input.dealId,
+          ...(q ? { conteudo: { contains: q, mode: "insensitive" as const } } : {}),
+        },
         orderBy: { enviadaEm: "desc" },
         take: limit,
       });
       return rows.reverse();
     }),
 
+  /**
+   * Apaga uma mensagem da conversa. `paraTodos` (só mensagem enviada por nós, no
+   * WhatsApp) também a apaga do celular do lead; se o WhatsApp recusar (passou
+   * do prazo, instância fora), NÃO apaga do painel e devolve o erro, para o
+   * atendente não achar que sumiu do lado do lead. Sai do banco de vez — e,
+   * com isso, também do histórico que o agente lê.
+   */
+  apagarMensagem: authProc
+    .input(z.object({ mensagemId: z.string(), paraTodos: z.boolean().default(false) }))
+    .mutation(async ({ input, ctx }) => {
+      const msg = await prisma.crmMensagemWhatsapp.findUnique({
+        where: { id: input.mensagemId },
+        include: { deal: { include: { contato: true } } },
+      });
+      if (!msg) throw new TRPCError({ code: "NOT_FOUND", message: "Mensagem não encontrada" });
+      if (!msg.deal) throw new TRPCError({ code: "FORBIDDEN", message: "Mensagem sem conversa" });
+      assertPodeOperarDeal(ctx, msg.deal);
+
+      let apagadaNoWhatsapp = false;
+      if (input.paraTodos) {
+        if (msg.direcao !== "out" || msg.canal !== "whatsapp") {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Só dá para apagar para todos uma mensagem nossa no WhatsApp" });
+        }
+        const phone = msg.deal.contato?.whatsapp;
+        if (!msg.evolutionMessageId || !phone || !msg.deal.projetoId) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Mensagem sem identificador do WhatsApp — só dá para apagar do Avoce" });
+        }
+        const configs = await prisma.iaProjetoConfig.findMany({ where: { projetoId: msg.deal.projetoId, categoria: "whatsapp" } });
+        const get = (k: string) => configs.find((c) => c.chave === k)?.valor ?? "";
+        const evo = { baseUrl: get("evolution_api_url"), apiKey: get("evolution_api_key"), instancia: get("evolution_instancia") };
+        if (!evo.baseUrl) throw new TRPCError({ code: "BAD_REQUEST", message: "Evolution API não configurada" });
+        const { deleteMessageForEveryone } = await import("../services/evolution.js");
+        const r = await deleteMessageForEveryone(evo, phone, msg.evolutionMessageId);
+        if (!r.ok) {
+          console.warn(`[apagarMensagem] WhatsApp recusou ${msg.id}: ${r.erro}`);
+          throw new TRPCError({ code: "BAD_REQUEST", message: `O WhatsApp não apagou para todos (o prazo é de ~2 dias após o envio). Nada foi apagado. Detalhe: ${r.erro}` });
+        }
+        apagadaNoWhatsapp = true;
+      }
+
+      await prisma.crmMensagemWhatsapp.delete({ where: { id: msg.id } });
+
+      // Áudio/arquivo guardado por nós em disco vai junto.
+      const arq = msg.midiaUrl?.match(/^\/api\/audio\/([a-zA-Z0-9_.-]+)$/)?.[1];
+      if (arq) {
+        const { unlink } = await import("node:fs/promises");
+        const { resolve, join } = await import("node:path");
+        await unlink(join(resolve(process.env.AUDIO_DIR ?? "./audio"), arq)).catch(() => {});
+      }
+
+      console.log(`[apagarMensagem] ${msg.id} (${msg.direcao}/${msg.tipo}) deal=${msg.dealId} por=${ctx.userId} whatsapp=${apagadaNoWhatsapp}`);
+      return { ok: true, apagadaNoWhatsapp };
+    }),
+
   listConversas: authProc
-    .input(z.object({ projetoId: z.string().optional() }))
+    .input(filtroConversas)
     .query(async ({ input, ctx }) => {
       const deals = await prisma.crmDeal.findMany({
         where: {
           ...whereEmpresa(ctx),
-          ...(input.projetoId ? { projetoId: input.projetoId } : {}),
+          ...whereFiltroConversas(input),
           mensagens: { some: {} },
         },
-        include: {
-          contato: true,
-          mensagens: {
-            orderBy: { enviadaEm: "desc" },
-            take: 1,
-          },
-          stage: { select: { pipelineId: true } },
-        },
-        orderBy: { ultimoContatoEm: "desc" },
-        take: 50,
+        include: includeConversa,
+        // Janela ampla ordenada pelo campo do deal; a ordem final é decidida abaixo pela data da
+        // última mensagem de verdade, porque ultimoContatoEm pode ficar para trás (deal criado
+        // fora do fluxo do agente, importação, backfill) e nesse caso a conversa afundaria para
+        // fora do corte e a mensagem sumiria do painel mesmo estando gravada.
+        orderBy: { ultimoContatoEm: { sort: "desc", nulls: "last" } },
+        take: 300,
       });
 
       // Resolve SDR names for deals with IA paused
@@ -386,19 +698,210 @@ export const iaRouter = router({
         : [];
       const sdrMap = new Map(sdrUsers.map((u) => [u.id, u.nome]));
 
-      return deals.map((d) => ({
-        ...d,
-        sdrNome: d.iaPausadaPor ? (sdrMap.get(d.iaPausadaPor) ?? "Atendente") : null,
-      }));
+      const ultimaMensagemEm = (d: (typeof deals)[number]) =>
+        d.mensagens[0]?.enviadaEm?.getTime() ?? d.ultimoContatoEm?.getTime() ?? 0;
+
+      // 50 era pouco: só nas últimas 48h o SDR passa de 70 conversas ativas, e as que ficavam
+      // para fora do corte sumiam da caixa mesmo com mensagem nova.
+      return deals
+        // "Aguardando resposta" = a última mensagem é do lead. Só dá para saber depois de
+        // carregar a última mensagem, por isso o filtro é aqui e não no where.
+        .filter((d) => !input.aguardando || d.mensagens[0]?.direcao === "in")
+        .sort((a, b) => ultimaMensagemEm(b) - ultimaMensagemEm(a))
+        .slice(0, 150)
+        .map((d) => ({
+          ...d,
+          sdrNome: d.iaPausadaPor ? (sdrMap.get(d.iaPausadaPor) ?? "Atendente") : null,
+        }));
+    }),
+
+  /**
+   * Contagens para os chips de filtro do WhatsApp IA: conversas por funil e por tag
+   * (tags do funil em foco + gerais). Conta só deals que têm mensagem — é o universo
+   * da caixa de conversas, não o do Kanban.
+   */
+  resumoConversas: authProc
+    .input(z.object({ pipelineId: z.string().optional(), semComentarios: z.boolean().optional() }))
+    .query(async ({ input, ctx }) => {
+      const todasComMensagem = { ...whereEmpresa(ctx), mensagens: { some: {} } };
+      const comMensagem = input.semComentarios
+        ? { ...todasComMensagem, AND: [NAO_VEIO_DE_COMENTARIO] }
+        : todasComMensagem;
+      const [porFunil, pipelines, tags, semTag, followupPendentes, comentarios] = await Promise.all([
+        prisma.crmDeal.groupBy({ by: ["pipelineId"], where: comMensagem, _count: { _all: true } }),
+        prisma.crmPipeline.findMany({
+          where: { ...whereEmpresa(ctx), ativo: true },
+          select: { id: true, nome: true, cor: true, ordem: true, empresaId: true },
+          orderBy: [{ ordem: "asc" }, { nome: "asc" }],
+        }),
+        prisma.crmTag.findMany({
+          where: {
+            AND: [
+              whereTagVisivel(ctx),
+              ...(input.pipelineId ? [{ OR: [{ pipelineId: input.pipelineId }, { pipelineId: null }] }] : []),
+            ],
+          },
+          select: {
+            id: true, nome: true, cor: true, pipelineId: true,
+            _count: {
+              select: {
+                deals: { where: { ...comMensagem, ...(input.pipelineId ? { pipelineId: input.pipelineId } : {}) } },
+              },
+            },
+          },
+          orderBy: [{ pipelineId: { sort: "asc", nulls: "first" } }, { nome: "asc" }],
+        }),
+        prisma.crmDeal.count({
+          where: { ...comMensagem, ...(input.pipelineId ? { pipelineId: input.pipelineId } : {}), tags: { none: {} } },
+        }),
+        prisma.crmDeal.count({
+          where: {
+            ...comMensagem, ...(input.pipelineId ? { pipelineId: input.pipelineId } : {}),
+            status: "aberto", proximoContatoEm: { lt: fimDeHojeSP() },
+          },
+        }),
+        // Sempre sobre todas, para o botão dizer quantas esconde mesmo com o filtro ligado.
+        prisma.crmDeal.count({
+          where: { ...todasComMensagem, ...(input.pipelineId ? { pipelineId: input.pipelineId } : {}), ...VEIO_DE_COMENTARIO },
+        }),
+      ]);
+      const contagem = new Map(porFunil.map((g) => [g.pipelineId, g._count._all]));
+      return {
+        total: porFunil.reduce((acc, g) => acc + g._count._all, 0),
+        semTag,
+        followupPendentes,
+        comentarios,
+        // Funil sem nenhuma conversa não vira chip — só polui a barra.
+        pipelines: pipelines
+          .map((p) => ({ ...p, conversas: contagem.get(p.id) ?? 0 }))
+          .filter((p) => p.conversas > 0 || p.id === input.pipelineId),
+        tags: tags.map(({ _count, ...t }) => ({ ...t, conversas: _count.deals })),
+      };
+    }),
+
+  /**
+   * Busca GLOBAL nas conversas do WhatsApp IA.
+   *
+   * Casa por nome do contato, título do deal, número inteiro ou pedaço do número
+   * (só dígitos, ignora máscara), CPF e — o que faltava — o TEXTO de qualquer
+   * mensagem de qualquer conversa. O filtro do painel só olhava as mensagens já
+   * carregadas da conversa aberta.
+   */
+  buscarConversas: authProc
+    .input(filtroConversas.extend({
+      q: z.string(),
+      limit: z.number().int().min(1).max(100).optional(),
+    }))
+    .query(async ({ input, ctx }) => {
+      const q = input.q.trim();
+      if (q.length < 2) return [];
+      const limit = input.limit ?? 40;
+      const digitos = q.replace(/\D/g, "");
+      const base = {
+        ...whereEmpresa(ctx),
+        ...whereFiltroConversas(input),
+      };
+      const include = includeConversa;
+
+      const orContato: any[] = [
+        { titulo: { contains: q, mode: "insensitive" } },
+        { contato: { nome: { contains: q, mode: "insensitive" } } },
+      ];
+      // 3 dígitos já servem de "parte do número"; menos que isso casa com quase tudo.
+      // O `contains` do Prisma não serve aqui: `whatsapp` é só dígito e `telefone`
+      // vem mascarado ("+55 49 9825-8617"), então a comparação tem que ser feita
+      // com os dois lados normalizados — daí o raw.
+      if (digitos.length >= 3) {
+        const padroes = variantesNumero(digitos).map((v) => `%${v}%`);
+        const contatos = await prisma.$queryRaw<{ id: string }[]>`
+          SELECT id FROM "CrmContato"
+          WHERE regexp_replace(COALESCE(whatsapp, ''), '\D', '', 'g') LIKE ANY(${padroes})
+             OR regexp_replace(COALESCE(telefone, ''), '\D', '', 'g') LIKE ANY(${padroes})
+             OR regexp_replace(COALESCE(cpf, ''),      '\D', '', 'g') LIKE ANY(${padroes})
+          LIMIT 500`;
+        if (contatos.length) orContato.push({ contatoId: { in: contatos.map((c) => c.id) } });
+      }
+
+      const [porContato, msgs] = await Promise.all([
+        prisma.crmDeal.findMany({
+          where: { ...base, OR: orContato },
+          include,
+          orderBy: { ultimoContatoEm: { sort: "desc", nulls: "last" } },
+          take: limit * 3,
+        }),
+        prisma.crmMensagemWhatsapp.findMany({
+          where: { conteudo: { contains: q, mode: "insensitive" }, deal: { ...base } },
+          orderBy: { enviadaEm: "desc" },
+          take: 500,
+          select: { id: true, dealId: true, conteudo: true, direcao: true, enviadaEm: true },
+        }),
+      ]);
+
+      // Primeira (mais recente) mensagem casada por deal + quantas casaram.
+      const hitPorDeal = new Map<string, { msg: (typeof msgs)[number]; total: number }>();
+      for (const m of msgs) {
+        if (!m.dealId) continue;
+        const atual = hitPorDeal.get(m.dealId);
+        if (atual) atual.total++;
+        else hitPorDeal.set(m.dealId, { msg: m, total: 1 });
+      }
+
+      const jaTem = new Set(porContato.map((d) => d.id));
+      const faltando = [...hitPorDeal.keys()].filter((id) => !jaTem.has(id));
+      const porMensagem = faltando.length
+        ? await prisma.crmDeal.findMany({ where: { ...base, id: { in: faltando } }, include })
+        : [];
+
+      const deals = [...porContato, ...porMensagem];
+
+      const sdrIds = [...new Set(deals.map((d) => d.iaPausadaPor).filter(Boolean))] as string[];
+      const sdrUsers = sdrIds.length
+        ? await prisma.usuario.findMany({ where: { id: { in: sdrIds } }, select: { id: true, nome: true } })
+        : [];
+      const sdrMap = new Map(sdrUsers.map((u) => [u.id, u.nome]));
+
+      /** Janela de ~140 caracteres em volta do termo, para mostrar na lista. */
+      const trechoDe = (texto: string): string => {
+        const i = texto.toLowerCase().indexOf(q.toLowerCase());
+        if (i < 0) return texto.slice(0, 140);
+        const ini = Math.max(0, i - 45);
+        const fim = Math.min(texto.length, i + q.length + 95);
+        return `${ini > 0 ? "…" : ""}${texto.slice(ini, fim)}${fim < texto.length ? "…" : ""}`;
+      };
+
+      const quando = (d: (typeof deals)[number]) =>
+        d.mensagens[0]?.enviadaEm?.getTime() ?? d.ultimoContatoEm?.getTime() ?? 0;
+
+      return deals
+        .map((d) => {
+          const hit = hitPorDeal.get(d.id);
+          return {
+            ...d,
+            sdrNome: d.iaPausadaPor ? (sdrMap.get(d.iaPausadaPor) ?? "Atendente") : null,
+            match: hit
+              ? {
+                  tipo: "mensagem" as const,
+                  trecho: trechoDe(hit.msg.conteudo ?? ""),
+                  direcao: hit.msg.direcao,
+                  enviadaEm: hit.msg.enviadaEm,
+                  total: hit.total,
+                }
+              : { tipo: "contato" as const, trecho: "", direcao: "", enviadaEm: null, total: 0 },
+          };
+        })
+        .sort((a, b) => quando(b) - quando(a))
+        .slice(0, limit);
     }),
 
   toggleIaPausa: authProc
     .input(z.object({ dealId: z.string(), pausar: z.boolean() }))
     .mutation(async ({ input, ctx }) => {
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        const d = await prisma.crmDeal.findUnique({ where: { id: input.dealId }, select: { empresaId: true } });
-        if (!d || d.empresaId !== ctx.empresaId) throw new Error("Deal não pertence à sua empresa");
-      }
+      const d = await prisma.crmDeal.findUnique({
+        where: { id: input.dealId },
+        select: { empresaId: true },
+      });
+      if (!d) throw new TRPCError({ code: "NOT_FOUND", message: "Deal não encontrado" });
+      assertPodeOperarDeal(ctx, d);
       const updated = await prisma.crmDeal.update({
         where: { id: input.dealId },
         data: {
@@ -445,10 +948,34 @@ export const iaRouter = router({
         include: { contato: true },
       });
       if (!deal) throw new Error("Deal não encontrado");
-      if (ctx.role !== "admin" || ctx.empresaId) {
-        if (deal.empresaId !== ctx.empresaId) throw new Error("Deal não pertence à sua empresa");
-      }
+      registrarQuemVe(deal.id, ctx.userId);
+      assertPodeOperarDeal(ctx, deal);
       if (!deal?.contatoId) throw new Error("Deal sem contato vinculado");
+
+
+      // Conversa do Instagram Direct / Messenger: responde pela Meta, não pelo Evolution.
+      const { canalDoDeal, enviarManualSocial } = await import("../lib/meta-social.js");
+      const canal = await canalDoDeal(deal.id, deal.contato ?? {});
+      if (canal !== "whatsapp") {
+        const [membro, usuario] = ctx.userId ? await Promise.all([
+          deal.projetoId
+            ? prisma.iaProjetoUsuario.findUnique({ where: { projetoId_usuarioId: { projetoId: deal.projetoId, usuarioId: ctx.userId } } })
+            : null,
+          prisma.usuario.findUnique({ where: { id: ctx.userId } }),
+        ]) : [null, null];
+        const nome = membro?.nomeWhatsapp || usuario?.nome || "Atendente";
+        // Direct e Messenger não têm negrito com *asterisco*: o nome vai numa linha própria.
+        const mid = await enviarManualSocial(deal, deal.contato!, canal, `${nome}\n${input.conteudo}`);
+        const msg = await prisma.crmMensagemWhatsapp.create({
+          data: {
+            dealId: deal.id, contatoId: deal.contatoId, direcao: "out", canal, tipo: "text",
+            conteudo: `*${nome}*\n${input.conteudo}`, remetente: nome, evolutionMessageId: mid ?? undefined,
+            ...(deal.empresaId ? { empresaId: deal.empresaId } : {}),
+          },
+        });
+        await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+        return msg;
+      }
 
       const phone = deal.contato?.whatsapp;
       if (!phone) throw new Error("Contato sem WhatsApp");
@@ -459,7 +986,7 @@ export const iaRouter = router({
         const projeto = await prisma.iaProjeto.findFirst({ where: { empresaId: deal.empresaId } });
         if (projeto) projetoId = projeto.id;
       }
-      if (!projetoId) throw new Error("Nenhum projeto WhatsApp IA configurado para esta empresa");
+      if (!projetoId) throw new Error("Nenhum projeto de Chat (WhatsApp IA) configurado para esta empresa");
 
       // Resolve display name: nomeWhatsapp (project setting) → usuario.nome → "Atendente"
       let nomeRemetente = "Atendente";
@@ -513,6 +1040,7 @@ export const iaRouter = router({
         include: { contato: true },
       });
       if (!deal) throw new Error("Deal não encontrado");
+      registrarQuemVe(deal.id, ctx.userId);
       if (!deal?.contatoId || !deal.projetoId) throw new Error("Deal sem contato ou projeto");
 
       const phone = deal.contato?.whatsapp;
@@ -589,6 +1117,7 @@ export const iaRouter = router({
         include: { contato: true },
       });
       if (!deal) throw new Error("Deal não encontrado");
+      registrarQuemVe(deal.id, ctx.userId);
       if (!deal?.contatoId || !deal.projetoId) throw new Error("Deal sem contato ou projeto");
       const phone = deal.contato?.whatsapp;
       if (!phone) throw new Error("Contato sem WhatsApp");
@@ -646,6 +1175,19 @@ export const iaRouter = router({
       const evoConfig = { baseUrl: get("evolution_api_url"), apiKey: get("evolution_api_key"), instancia: get("evolution_instancia") };
       if (!evoConfig.baseUrl) throw new Error("Evolution API não configurada");
 
+      // Contato e deal pertencem à empresa do PROJETO, não à empresa primária de quem
+      // opera — senão o atendente de outra empresa do grupo cria contato/deal duplicado
+      // em vez de reaproveitar o existente.
+      const projeto = await prisma.iaProjeto.findUnique({
+        where: { id: input.projetoId },
+        select: { empresaId: true },
+      });
+      if (!projeto) throw new TRPCError({ code: "NOT_FOUND", message: "Projeto não encontrado" });
+      if (!canOperate(ctx, projeto.empresaId)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Projeto não pertence à sua empresa" });
+      }
+      const empresaProjeto = projeto.empresaId ?? undefined;
+
       // Normaliza para E.164 BR sem o +: 55DDXXXXXXXXX (13 dígitos)
       // Aceita: 077991322975 (12d 0+DDD+9+8d), 07791322975 (11d 0+DDD+8d),
       //         77 91322975 (10d), 77991322975 (11d), +55 77 9132-2975 (12d c/55), 5577991322975 (13d)
@@ -661,14 +1203,14 @@ export const iaRouter = router({
 
       // Find or create contact
       let contato = await prisma.crmContato.findFirst({
-        where: { whatsapp: phone, ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}) },
+        where: { whatsapp: phone, ...(empresaProjeto ? { empresaId: empresaProjeto } : {}) },
       });
       if (!contato) {
         contato = await prisma.crmContato.create({
           data: {
             nome: input.nomeContato ?? `Lead ${phone}`,
             whatsapp: phone,
-            ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}),
+            ...(empresaProjeto ? { empresaId: empresaProjeto } : {}),
           },
         });
       }
@@ -695,7 +1237,7 @@ export const iaRouter = router({
         let finalStageId = entryStage?.id;
         if (!finalPipelineId || !finalStageId) {
           const pipeline = await prisma.crmPipeline.findFirst({
-            where: ctx.empresaId ? { empresaId: ctx.empresaId } : {},
+            where: empresaProjeto ? { empresaId: empresaProjeto } : {},
             include: { stages: { orderBy: { ordem: "asc" }, take: 1 } },
             orderBy: { ordem: "asc" },
           });
@@ -716,7 +1258,7 @@ export const iaRouter = router({
             iaPausadaEm: new Date(),
             iaStageChave: entryPhase?.chave ?? null,
             status: "aberto",
-            ...(ctx.empresaId ? { empresaId: ctx.empresaId } : {}),
+            ...(empresaProjeto ? { empresaId: empresaProjeto } : {}),
           },
         });
       } else {
@@ -756,7 +1298,7 @@ export const iaRouter = router({
         },
       });
 
-      await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date() } });
+      await prisma.crmDeal.update({ where: { id: deal.id }, data: { ultimoContatoEm: new Date(), followupEm: new Date() } });
       return { dealId: deal.id, contatoId: contato.id };
     }),
 
@@ -803,7 +1345,8 @@ export const iaRouter = router({
       { chave: "com_closer", nomeExibicao: "Lead com Contato do Closer", ordem: 4, cor: "#f97316", personaChave: "closer" },
       { chave: "sem_resposta_closer", nomeExibicao: "Lead sem Resposta ao Closer", ordem: 5, cor: "#ef4444", requerAcaoHumana: true, personaChave: "closer" },
       { chave: "aguardando_docs_pessoais", nomeExibicao: "Aguardando Documentos Pessoais", ordem: 6, cor: "#06b6d4", personaChave: "advogado" },
-      { chave: "aguardando_assinatura", nomeExibicao: "Aguardando Assinatura do Contrato", ordem: 7, cor: "#10b981", personaChave: "advogado" },
+      { chave: "docs_em_revisao", nomeExibicao: "📝 Documentos em Revisão", ordem: 7, cor: "#f59e0b", personaChave: "advogado" },
+      { chave: "aguardando_assinatura", nomeExibicao: "Aguardando Assinatura do Contrato", ordem: 8, cor: "#10b981", personaChave: "advogado" },
     ];
 
     for (const fase of fasesComerciais) {
@@ -945,7 +1488,8 @@ export const iaRouter = router({
       { chave: "com_closer",                  nomeExibicao: "Lead com Contato do Closer",      ordem: 6,  cor: "#f97316", personaChave: "closer" },
       { chave: "sem_resposta_closer",         nomeExibicao: "Lead sem Resposta ao Closer",     ordem: 7,  cor: "#ef4444", requerAcaoHumana: true, personaChave: "closer" },
       { chave: "aguardando_docs_pessoais",    nomeExibicao: "Aguardando Documentos Pessoais",  ordem: 8,  cor: "#06b6d4", personaChave: "advogado" },
-      { chave: "aguardando_assinatura",       nomeExibicao: "Aguardando Assinatura",           ordem: 9,  cor: "#10b981", personaChave: "advogado" },
+      { chave: "docs_em_revisao",             nomeExibicao: "📝 Documentos em Revisão",        ordem: 9,  cor: "#f59e0b", personaChave: "advogado" },
+      { chave: "aguardando_assinatura",       nomeExibicao: "Aguardando Assinatura",           ordem: 10, cor: "#10b981", personaChave: "advogado" },
       { chave: "lead_desqualificado",         nomeExibicao: "Desqualificado",                  ordem: 10, cor: "#6b7280", requerAcaoHumana: true, personaChave: "assistente" },
     ];
 
@@ -1242,6 +1786,8 @@ export const iaRouter = router({
         { chave: "proposta_validade_dias",          valor: "30",           tipo: "numero", categoria: "proposta", descricao: "Validade da proposta em dias" },
         { chave: "proposta_honorarios_tipo",        valor: "exito",        tipo: "texto",  categoria: "proposta", descricao: "Tipo de honorários: exito (%) ou fixo" },
         { chave: "proposta_honorarios_perc",        valor: "30",           tipo: "numero", categoria: "proposta", descricao: "% de honorários de êxito (ex: 30)" },
+        { chave: "proposta_revisao_manual",         valor: "true",         tipo: "texto",  categoria: "proposta", descricao: "Revisar os documentos antes de enviar para assinatura (true/false)" },
+        { chave: "proposta_msg_revisao",            valor: "",             tipo: "texto",  categoria: "proposta", descricao: "Mensagem ao cliente enquanto os documentos estão em revisão ({{nome}}); vazio = texto padrão" },
       ];
       for (const c of propostaConfigs) {
         await prisma.iaProjetoConfig.upsert({
@@ -1322,7 +1868,8 @@ export const iaRouter = router({
       projetoId: z.string(),
       nome:      z.string(),
       evento:    z.string(),
-      destino:   z.string(),
+      // trim: espaço sobrando no destino já quebrou consulta/dedupe de notificações
+      destino:   z.string().transform((s) => s.trim()),
       mensagem:  z.string(),
       ativo:     z.boolean().default(true),
     }))
@@ -1384,7 +1931,7 @@ export const iaRouter = router({
     }))
     .mutation(async ({ input }) => {
       const { id, ...data }: any = input;
-      if (data.apiKey) data.apiKey = fieldEncrypt(data.apiKey);
+      if (data.apiKey) data.apiKey = fieldEncryptIfPlain(data.apiKey);
       const result = id
         ? await prisma.iaLlmProvedor.update({ where: { id }, data })
         : await prisma.iaLlmProvedor.create({ data: { ...data, ativo: data.ativo ?? true } });
@@ -2039,10 +2586,27 @@ export const iaRouter = router({
           });
 
           if (firstStep) {
-            const texto = firstStep.pergunta.replace(/\{nome\}/g, nome);
+            // Os steps do fluxo trazem {nome_persona} e companhia no texto — sem resolver aqui,
+            // o lead recebe a chave literal ("Aqui é {nome_persona}"). Mesmos placeholders que o
+            // stage-engine já resolve nas demais mensagens do fluxo.
+            const { getPersonaNomeExibicao } = await import("../agent/transition-engine.js");
+            const [personaNome, advNome, secNome, assistNome] = await Promise.all([
+              getPersonaNomeExibicao(deal.projetoId!, "coleta_docs"),
+              getPersonaNomeExibicao(deal.projetoId!, "advogado"),
+              getPersonaNomeExibicao(deal.projetoId!, "secretaria"),
+              getPersonaNomeExibicao(deal.projetoId!, "assistente"),
+            ]);
+            const texto = firstStep.pergunta
+              .replace(/\{nome\}/g, nome)
+              .replace(/\{nome_persona\}/g, personaNome)
+              .replace(/\{nome_advogado\}/g, advNome)
+              .replace(/\{nome_secretaria\}/g, secNome)
+              .replace(/\{nome_assistente\}/g, assistNome);
             await sendHumanized(evo, deal.contato.whatsapp, texto, 0);
             await prisma.crmMensagemWhatsapp.create({
-              data: { dealId: deal.id, contatoId: deal.contato.id, direcao: "out", personaChave: "coleta_docs", remetente: "Ana", tipo: "text", conteudo: texto },
+              // remetente era "Ana" fixo, mas quem fala na coleta é a persona coleta_docs —
+              // a caixa mostrava um nome e o texto da mensagem, outro.
+              data: { dealId: deal.id, contatoId: deal.contato.id, direcao: "out", personaChave: "coleta_docs", remetente: personaNome, tipo: "text", conteudo: texto },
             });
             // Mark first step as sent so next incoming message processes the step
             // (not reinitializes the flow with the greeting again)

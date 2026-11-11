@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { trpc } from "../lib/trpc";
 import { FluxoIATab } from "../components/FluxoIATab";
+import { EntregaveisTab } from "../components/EntregaveisTab";
+import { MetaSocialConfig } from "../components/MetaSocialConfig";
 
 type Config = {
   id: string;
@@ -446,7 +448,7 @@ import ConfigAudiencias from "../components/ConfigAudiencias";
 
 export default function ConfigIAPage() {
   const [projetoId, setProjetoId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo" | "followup" | "desqualificacao" | "audiencias">("configs");
+  const [tab, setTab] = useState<"configs" | "personas" | "fases" | "notificacoes" | "qualificacao" | "transicoes" | "proposta" | "fluxo" | "followup" | "desqualificacao" | "audiencias" | "entregaveis" | "social">("configs");
   const [followUpExpanded, setFollowUpExpanded] = useState(false);
   const [followUpMsgExpanded, setFollowUpMsgExpanded] = useState(false);
   const [stageFollowExpanded, setStageFollowExpanded] = useState<Record<string, boolean>>({});
@@ -671,7 +673,7 @@ export default function ConfigIAPage() {
   }
 
   // Group configs by category — exclude managed categories that have dedicated UI sections
-  const EXCLUDED_CATS = new Set(["llm", "tts", "proposta", "follow_up", "reuniao", "coleta_docs", "integracao"]);
+  const EXCLUDED_CATS = new Set(["meta_social", "llm", "tts", "proposta", "follow_up", "reuniao", "coleta_docs", "integracao"]);
   const configsByCategory: Record<string, Config[]> = {};
   for (const c of (configs.data as unknown as Config[]) ?? []) {
     const cat = c.categoria ?? "outros";
@@ -734,8 +736,10 @@ export default function ConfigIAPage() {
               ["notificacoes", "Notificações"],
               ["proposta", "Proposta"],
               ["followup", "Follow-up"],
+              ["entregaveis", "🎬 Entregáveis"],
               ["desqualificacao", "🚫 Desqualificação"],
               ["audiencias", "⚖️ Audiências"],
+              ["social", "📸 Instagram/Facebook"],
             ] as const).map(([t, label]) => (
               <button
                 key={t}
@@ -750,6 +754,8 @@ export default function ConfigIAPage() {
           </div>
 
           {tab === "audiencias" && projetoId && <ConfigAudiencias projetoId={projetoId} />}
+          {tab === "social" && projetoId && <MetaSocialConfig projetoId={projetoId} />}
+          {tab === "entregaveis" && projetoId && <EntregaveisTab projetoId={projetoId} />}
 
           {/* Configs tab */}
           {tab === "configs" && (

@@ -1,6 +1,6 @@
 import { resolve, join } from "node:path";
 import { writeFileSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { extrairMetaCert, invalidarCacheCert } from "./lib/nfse.js";
 import { invalidarCacheSicoobBoleto } from "./lib/sicoob-boleto.js";
@@ -44,13 +44,15 @@ function normalizarPkcs12(input: Buffer, senha: string): Buffer {
   const tmpOut= `${tmp}_out.p12`;
   try {
     writeFileSync(tmpIn, input);
-    execSync(
-      `openssl pkcs12 -legacy -in "${tmpIn}" -out "${tmpPem}" -passin pass:${JSON.stringify(senha)} -passout pass:temp_conv123`,
-      { stdio: "pipe" }
+    // Sem shell e com a senha via env: a senha do certificado é entrada do usuário
+    const env = { ...process.env, P12_SENHA: senha, P12_TMP: "temp_conv123" };
+    execFileSync("openssl",
+      ["pkcs12", "-legacy", "-in", tmpIn, "-out", tmpPem, "-passin", "env:P12_SENHA", "-passout", "env:P12_TMP"],
+      { stdio: "pipe", env }
     );
-    execSync(
-      `openssl pkcs12 -export -in "${tmpPem}" -out "${tmpOut}" -passin pass:temp_conv123 -passout pass:${JSON.stringify(senha)}`,
-      { stdio: "pipe" }
+    execFileSync("openssl",
+      ["pkcs12", "-export", "-in", tmpPem, "-out", tmpOut, "-passin", "env:P12_TMP", "-passout", "env:P12_SENHA"],
+      { stdio: "pipe", env }
     );
     return readFileSync(tmpOut);
   } finally {

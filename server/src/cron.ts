@@ -6,13 +6,16 @@
 import cron                 from "node-cron";
 import { prisma }           from "./db.js";
 import { processarTimeoutsAgente, recuperarMensagensPerdidas, processarHandoffsAtrasados } from "./agent/cron-agent.js";
+import { enviarEntregaveisPendentes } from "./agent/entregaveis.js";
+import { enviarResumoFollowups } from "./agent/followups-diarios.js";
 import { recordCronRun } from "./agent/cron-tracker.js";
 import { emSilencio }       from "./agent/quiet-hours.js";
-import { emitirNfse, type EmpresaConfig } from "./lib/nfse.js";
+import { emitirNfse, dadosNotaEmitida, type EmpresaConfig } from "./lib/nfse.js";
+import { consultarDps, DpsRejeitadaError } from "./lib/nfse-dps.js";
 import { certPathForEmpresa } from "./upload.js";
 import { consultarPix }     from "./lib/sicoob-pix.js";
 import { gerarCobrancaParaContrato } from "./lib/gerar-cobranca.js";
-import { enviarEmailCobranca }       from "./lib/email-cobranca.js";
+import { enviarEmailCobranca, enviarNfseSeNecessario } from "./lib/email-cobranca.js";
 import { fieldDecrypt }             from "./lib/field-crypto.js";
 
 function competenciaAtual(): string {
@@ -35,6 +38,10 @@ async function getCfg(emp: {
   codigoServicoNacional?: string | null;
   codigoNbs?: string | null;
   regimeTributacao?: string | null;
+  nfseProvider?: string | null;
+  codigoMunicipio?: string | null;
+  nfseTpAmb?: string | null;
+  nfseToken?: string | null;
 }): Promise<EmpresaConfig> {
   return {
     cnpj:                   emp.cnpj,
@@ -48,6 +55,10 @@ async function getCfg(emp: {
     codigoNbs:              emp.codigoNbs ?? undefined,
     regimeTributacao:       emp.regimeTributacao ?? undefined,
     simplesNacional:        emp.regime,
+    nfseProvider:           (emp.nfseProvider as EmpresaConfig["nfseProvider"]) ?? undefined,
+    codigoMunicipioEmitente: emp.codigoMunicipio ?? undefined,
+    tpAmb:                  (emp.nfseTpAmb as EmpresaConfig["tpAmb"]) ?? undefined,
+    nfseToken:              fieldDecrypt(emp.nfseToken) || undefined,
   };
 }
 
@@ -138,7 +149,7 @@ export async function emitirContratosDoDia(): Promise<void> {
       const cfg    = await getCfg(contrato.emitente);
       const [mm, yyyy] = competencia.split("/");
       const result = await emitirNfse(contrato.emitenteId, cfg, {
-        valor:         contrato.valor,
+        valor:         valorNota,   // parcela personalizada, quando houver (o registro da nota já usa este valor)
         discriminacao: contrato.descricaoServico,
         tomador: {
           nome:            contrato.tomador.nome,
@@ -159,15 +170,11 @@ export async function emitirContratosDoDia(): Promise<void> {
 
       await prisma.notaFiscal.update({
         where: { id: nota.id },
-        data: {
-          status:      "EMITIDA",
-          numero:      result.numero,
-          codigoVerif: result.codigoVerif,
-          xmlRetorno:  result.xmlRetorno,
-          linkNfse:    result.linkNfse,
-          emitidoEm:   new Date(),
-        },
+        data:  dadosNotaEmitida(result),
       });
+      if (!result.pendente) {
+        enviarNfseSeNecessario(nota.id).catch((e) => console.error(`[CRON] E-mail da nota ${nota.id}:`, e));
+      }
       if (parcelaCustomId) {
         await prisma.contratoParcelaPersonalizada.update({
           where: { id: parcelaCustomId },
@@ -175,7 +182,7 @@ export async function emitirContratosDoDia(): Promise<void> {
         });
       }
 
-      console.log(`[CRON] ✓ Nota ${result.numero} emitida — contrato ${contrato.id} empresa ${contrato.emitente.nome}`);
+      console.log(`[CRON] ✓ Nota ${result.pendente ? `DPS ${result.nDps} (em processamento)` : result.numero} emitida — contrato ${contrato.id} empresa ${contrato.emitente.nome}`);
     } catch (err) {
       const erroMsg = (err instanceof Error ? err.message : String(err)).slice(0, 1000);
       await prisma.notaFiscal.update({
@@ -187,6 +194,60 @@ export async function emitirContratosDoDia(): Promise<void> {
   }
 
   console.log(`[CRON] Faturamento automático concluído — ${contratos.length} contrato(s) processado(s)`);
+}
+
+// ── NFS-e por DPS (E&L) ainda em processamento no Ambiente Nacional ─────────
+// A emissão espera até 90s; o que não saiu nesse prazo fica PENDENTE com idDps
+// e é concluído aqui. Também entrega por e-mail as NFS-e que ficaram sem envio.
+
+export async function reconciliarDpsPendentes(): Promise<void> {
+  const notas = await prisma.notaFiscal.findMany({
+    where:   { status: "PENDENTE", idDps: { not: null } },
+    include: { emitente: true },
+  });
+
+  for (const nota of notas) {
+    try {
+      const r = await consultarDps(await getCfg(nota.emitente), nota.idDps!);
+      if (r.processando) continue;
+      await prisma.notaFiscal.update({
+        where: { id: nota.id },
+        data:  dadosNotaEmitida({
+          numero:      r.numero ?? "",
+          codigoVerif: r.chaveAcesso ?? "",
+          dataEmissao: r.dataEmissao ?? "",
+          linkNfse:    r.linkNfse,
+          xmlRetorno:  r.xmlNfse ?? "",
+          chaveAcesso: r.chaveAcesso,
+        }),
+      });
+      console.log(`[DPS] ✓ ${nota.idDps} autorizada → NFS-e ${r.numero}`);
+      await enviarNfseSeNecessario(nota.id);
+    } catch (err) {
+      if (err instanceof DpsRejeitadaError) {
+        await prisma.notaFiscal.update({
+          where: { id: nota.id },
+          data:  { status: "ERRO", erroMsg: err.message.slice(0, 1000) },
+        });
+        console.error(`[DPS] ✗ ${nota.idDps} rejeitada: ${err.message}`);
+      } else {
+        console.error(`[DPS] Falha ao consultar ${nota.idDps}:`, err);
+      }
+    }
+  }
+
+  // Repescagem: NFS-e por DPS dos últimos 7 dias ainda não entregue ao tomador
+  // (DANFSe indisponível na hora, cobrança que saiu antes da nota etc.)
+  const naoEntregues = await prisma.notaFiscal.findMany({
+    where: {
+      status: "EMITIDA", chaveAcesso: { not: null }, emailEnviadoEm: null,
+      emitidoEm: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+    },
+    select: { id: true },
+  });
+  for (const n of naoEntregues) {
+    await enviarNfseSeNecessario(n.id).catch((e) => console.error(`[DPS] E-mail da nota ${n.id}:`, e));
+  }
 }
 
 // ── Geração automática de cobranças (PIX + Boleto) ──────────────────────────
@@ -390,6 +451,8 @@ async function enviarLembretesReuniao(): Promise<void> {
       status: "agendada",
       agendadaPara: { gte: agora },
       dealId: { not: null },
+      // Marcada sem aviso ao cliente (telefone, presencial, ou a pessoa desmarcou): sem lembrete.
+      avisarCliente: true,
     },
     select: {
       id: true,
@@ -592,6 +655,12 @@ async function detectarNoShows(): Promise<void> {
     if (!projetoId || !r.dealId) continue;
     try {
       await prisma.sessaoReuniao.update({ where: { id: r.id }, data: { status: "no_show" } });
+      await prisma.crmAtividade.create({
+        data: {
+          dealId: r.dealId, tipo: "reuniao", resultado: "no_show", canal: "video", origem: "automatica",
+          externoId: `reuniao:${r.id}`, criadoEm: r.agendadaPara ?? new Date(),
+        },
+      }).catch(() => {});
 
       const nome = r.deal?.contato?.nome ?? "Lead";
       const whatsapp = r.deal?.contato?.whatsapp ?? "";
@@ -747,6 +816,25 @@ export function iniciarCron(): void {
     }
   });
 
+  // A cada 10 min — conclui NFS-e emitidas por DPS que ficaram em processamento
+  cron.schedule("*/10 * * * *", async () => {
+    try {
+      await reconciliarDpsPendentes();
+    } catch (err) {
+      console.error("[DPS] Erro crítico:", err);
+    }
+  });
+
+  // Seg–sáb 08:30 — resumo das ligações de follow-up do dia para a equipe (grupo do SDR)
+  cron.schedule("30 8 * * 1-6", async () => {
+    try {
+      await enviarResumoFollowups();
+      recordCronRun("enviarResumoFollowups");
+    } catch (err) {
+      console.error("[FollowupsDia] Erro crítico:", err);
+    }
+  }, { timezone: "America/Sao_Paulo" });
+
   // A cada 30 min — reprocessa e-mails de cobrança pendentes/falhos (auto-cura)
   cron.schedule("*/30 * * * *", async () => {
     try {
@@ -803,6 +891,12 @@ export function iniciarCron(): void {
     } catch (err) {
       console.error("[CronAgent] Erro ao recuperar mensagens perdidas:", err);
     }
+    try {
+      await enviarEntregaveisPendentes();
+      recordCronRun("enviarEntregaveisPendentes");
+    } catch (err) {
+      console.error("[Entregavel] Erro crítico:", err);
+    }
   });
 
   // ── Marketing Autopilot — a cada hora ──────────────────────────────────
@@ -811,6 +905,28 @@ export function iniciarCron(): void {
       await syncMetricasMkt();
     } catch (err) {
       console.error("[MKT-Sync] Erro:", err);
+    }
+  });
+
+  // ── Meta Conversions API — fila de lead qualificado (a cada minuto) ─────
+  // Sem projeto com meta_capi_ativo=true é só uma consulta vazia.
+  cron.schedule("* * * * *", async () => {
+    try {
+      const { processarFilaMetaCapi } = await import("./lib/meta-capi.js");
+      await processarFilaMetaCapi();
+    } catch (err) {
+      console.error("[MetaCAPI] Erro:", err);
+    }
+  });
+
+  // ── Disparo segmentado — no máximo 1 envio por disparo ativo por minuto ─
+  // As travas (intervalo, teto diário, horário) estão em lib/disparos.ts.
+  cron.schedule("* * * * *", async () => {
+    try {
+      const { processarDisparos } = await import("./lib/disparos.js");
+      await processarDisparos();
+    } catch (err) {
+      console.error("[Disparo] Erro:", err);
     }
   });
 

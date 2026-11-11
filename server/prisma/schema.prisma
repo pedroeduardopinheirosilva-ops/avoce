@@ -161,6 +161,7 @@ model EmpresaEmitente {
   nfseProvider           String?             // "el_vdc" | "issnet_df" — provedor NFS-e
   codigoCnae             String?             // CNAE sem pontuação, ex: "6911701"
   nfseTpAmb              String?             // SPED: "1"=producao (default), "2"=homologacao
+  nfseToken              String?             // E&L DPS: token de integração (cifrado) — portal → Configurações → Integração
 
   empresa            Empresa?          @relation(fields: [empresaId], references: [id])
   cobrancas          Cobranca[]
@@ -354,6 +355,18 @@ model Proposta {
   followUpUltimoEm          DateTime?
   paktAssinadoEm            DateTime?
 
+  // Revisão humana antes do envio para assinatura (fluxo de coleta de docs).
+  // null = proposta manual, sem porteiro; PENDENTE = documentos gerados esperando
+  // conferência; LIBERADA = alguém do escritório liberou e o envio já ocorreu.
+  revisaoStatus             String?
+  revisadoEm                DateTime?
+  revisadoPor               String?
+  // Origem quando a proposta nasce do agente: permite reenviar/liberar depois
+  // usando a mesma instância de WhatsApp e o mesmo número que falou com o cliente.
+  dealId                    String?
+  iaProjetoId               String?
+  envioTelefone             String?
+
   documentosGerados DocumentoGerado[]
   contrato          Contrato?         @relation(fields: [contratoId], references: [id])
   emitente          EmpresaEmitente   @relation(fields: [emitenteId], references: [id])
@@ -385,6 +398,9 @@ model DocumentoGerado {
   docxPath    String?
   htmlEditado String?
   criadoEm    DateTime          @default(now())
+  // Preenchido quando o documento é salvo pelo editor OnlyOffice — é o sinal que
+  // faz o preview do painel de revisão recarregar o PDF novo.
+  atualizadoEm DateTime?
 
   proposta Proposta          @relation(fields: [propostaId], references: [id])
   template TemplateDocumento @relation(fields: [templateId], references: [id])
@@ -478,6 +494,10 @@ model NotaFiscal {
   status       String          @default("PENDENTE")
   xmlRetorno   String?
   linkNfse     String?
+  nDps         Int?            // E&L DPS: nº da DPS (série 900); reenviar o mesmo nº reprocessa sem duplicar
+  idDps        String?         @unique
+  chaveAcesso  String?         // chave nacional (50 dígitos) da NFS-e emitida por DPS
+  emailEnviadoEm DateTime?     // NFS-e (PDF/XML) entregue ao tomador — avulsa ou junto da cobrança
   erroMsg      String?
   emitidoEm    DateTime?
   criadoEm     DateTime        @default(now())
@@ -507,6 +527,7 @@ model CrmPipeline {
   stages   CrmStage[]
   deals    CrmDeal[]
   projetos IaProjeto[]
+  tags     CrmTag[]
 }
 
 model CrmStage {
@@ -551,12 +572,21 @@ model CrmDeal {
   origemAnuncioTexto  String?
   origemUrl           String?
   origemEm            DateTime?
+  // Click-to-WhatsApp: id do clique (externalAdReply.ctwaClid) — é o que a Conversions API
+  // for Business Messaging usa para atribuir o evento ao anúncio. Ver lib/meta-capi.ts.
+  origemCtwaClid      String?
+  origemSourceType    String?   // externalAdReply.sourceType (ad | post)
+  origemEntryPoint    String?   // entryPointConversionSource (ctwa_ad | click_to_chat_link | ...)
   descricao        String?
   camposCustom     Json?
   numeroCnj        String?
   proximoPrazo     DateTime?
   qualificacao     Json?
   ultimoContatoEm  DateTime?
+  // Último follow-up HUMANO (ligação registrada, mensagem do painel ou do celular, chamada
+  // de WhatsApp). Diferente de ultimoContatoEm, que mexe a cada mensagem da IA ou do lead.
+  // Ordena o Kanban: sem follow-up no topo por chegada; com follow-up vai para o fim.
+  followupEm       DateTime?
   // Avaliação jurídica
   parecer          String?   // Texto do parecer da Dra. Daniela
   valorEstimado    Decimal?  @db.Decimal(12, 2)  // Estimativa IA do valor da causa
@@ -579,6 +609,7 @@ model CrmDeal {
   iaPausadaEm      DateTime?
   closerTentativas Int       @default(0)
   proximoContatoEm DateTime?
+  proximoContatoPor String?  // usuário que marcou o próximo follow-up (dono da ligação no painel diário)
   docsConfirmados  Boolean   @default(false)
   iaFlowStepChave          String?   // current step in flow controller (advogado phase)
   iaFlowStepData           Json?     // data collected by flow controller (advogado phase)
@@ -607,6 +638,39 @@ model CrmDeal {
   reunioes  SessaoReuniao[]
   anexos    DealAnexo[]
   tags      CrmTag[]            @relation("DealTags")
+  eventosMeta MetaConversaoEvento[]
+  atividades  CrmAtividade[]
+}
+
+// Fila persistente (outbox) de eventos de conversão devolvidos à Meta.
+// Uma linha por (deal, evento): o eventId é determinístico, então emitir de novo
+// é no-op. Quem grava é agent/lead-qualificado.ts; quem envia é lib/meta-capi.ts.
+model MetaConversaoEvento {
+  id                String    @id @default(cuid())
+  eventId           String    @unique            // sha256(dealId:eventName)
+  dealId            String
+  projetoId         String?
+  eventName         String                       // QualifiedLead
+  ctwaClid          String?
+  via               String?                      // caminho que marcou (ia:qualificacao_completa, crm:manual, ...)
+  stageChave        String?
+  ocorridoEm        DateTime
+  // pendente | enviado | falhou (vai tentar de novo) | morto (esgotou tentativas) | sem_ctwa | expirado
+  status            String    @default("pendente")
+  tentativas        Int       @default(0)
+  proximaTentativaEm DateTime @default(now())
+  enviadoEm         DateTime?
+  testEventCode     String?
+  payload           Json?
+  resposta          Json?
+  erro              String?
+  criadoEm          DateTime  @default(now())
+  atualizadoEm      DateTime  @updatedAt
+
+  deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@index([status, proximaTentativaEm])
+  @@index([projetoId, criadoEm])
 }
 
 model DealAnexo {
@@ -626,14 +690,20 @@ model DealAnexo {
 }
 
 model CrmTag {
-  id        String    @id @default(cuid())
-  empresaId String?
-  nome      String
-  cor       String    @default("#6366f1")
-  criadoEm  DateTime  @default(now())
+  id         String    @id @default(cuid())
+  empresaId  String?
+  // Funil ao qual a tag pertence. null = tag geral, vale para todos os funis.
+  // O WhatsApp IA e o Kanban mostram só as tags do funil em foco + as gerais.
+  pipelineId String?
+  nome       String
+  cor        String    @default("#6366f1")
+  criadoEm   DateTime  @default(now())
 
-  empresa   Empresa?  @relation(fields: [empresaId], references: [id])
-  deals     CrmDeal[] @relation("DealTags")
+  empresa    Empresa?     @relation(fields: [empresaId], references: [id])
+  pipeline   CrmPipeline? @relation(fields: [pipelineId], references: [id], onDelete: SetNull)
+  deals      CrmDeal[]    @relation("DealTags")
+
+  @@index([pipelineId])
 }
 
 model CrmDealStageLog {
@@ -677,6 +747,10 @@ model CrmContato {
   // fotoPerfilEm marca a última tentativa (mesmo sem foto) para não consultar de novo.
   fotoPerfilUrl String?
   fotoPerfilEm  DateTime?
+  // Instagram Direct / Messenger (lib/meta-social.ts): ids de conversa da Meta (IGSID / PSID).
+  instagramId       String?
+  instagramUsername String?
+  messengerId       String?
   criadoEm     DateTime @default(now())
   atualizadoEm DateTime @updatedAt
 
@@ -685,6 +759,9 @@ model CrmContato {
   mensagens  CrmMensagemWhatsapp[]
   ligacoes   CrmLigacao[]
   reunioes   SessaoReuniao[]
+
+  @@index([instagramId])
+  @@index([messengerId])
 }
 
 // ─────────────────────────────────────────────
@@ -720,6 +797,7 @@ model IaProjeto {
   campanhasReengajamento  CrmCampanhaReengajamento[]
   gatesSdr               IaGateSdr[]
   empresasBloqueadas     IaEmpresaBloqueada[]
+  entregaveis            IaEntregavel[]
 }
 
 model IaVinculoFlowPasso {
@@ -925,6 +1003,7 @@ model CrmMensagemWhatsapp {
   dealId             String?
   contatoId          String?
   direcao            String   // in | out
+  canal              String   @default("whatsapp") // whatsapp | instagram | messenger
   remetente          String?
   personaChave       String?
   tipo               String   @default("text") // text | image | audio | document
@@ -1431,6 +1510,13 @@ model SessaoReuniao {
   resumoIa        String?   @db.Text  // relatório IA pós-reunião
   consentimentoEm DateTime? // consentimento LGPD do convidado p/ gravação+transcrição
   consentimentoIp String?
+  // Agendamento pelo SDR/closer: `criadoPor` = quem marcou; `responsavelId` = quem conduz.
+  // `notas` (acima) são as anotações. avisarCliente=false → sem confirmação nem lembretes.
+  pauta           String?   @db.Text
+  responsavelId   String?
+  duracaoMin      Int       @default(60)
+  modalidade      String    @default("video") // video | whatsapp | telefone | presencial
+  avisarCliente   Boolean   @default(true)
   criadaEm        DateTime  @default(now())
   atualizadaEm    DateTime  @updatedAt
 
@@ -1438,6 +1524,9 @@ model SessaoReuniao {
   contato  CrmContato?      @relation(fields: [contatoId], references: [id])
   emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
   chunks   ReuniaoTranscricaoChunk[]
+
+  @@index([agendadaPara])
+  @@index([responsavelId, agendadaPara])
 }
 
 // Transcrição de reunião — 1 chunk por fala, rotulado por quem gravou
@@ -1564,4 +1653,102 @@ model Assinatura {
 
   @@index([emitenteId, status])
   @@index([criadoEm])
+}
+
+// Entregável enviado ao lead quando ele termina a triagem: vídeo (ou imagem/PDF) curto da
+// advogada sobre a dor principal dele — horas extras, tempo de espera, diárias, carga perigosa.
+// Recomendação da mentoria comercial de 12/09/2026: aquece o lead e quebra a desconfiança antes
+// da ligação. A escolha é por palavra-chave (sem LLM); `padrao` cobre quem não casou com nenhum.
+model IaEntregavel {
+  id            String   @id @default(cuid())
+  projetoId     String
+  chave         String
+  titulo        String
+  palavrasChave String   @default("")  // termos separados por "|", casados na qualificação e nas mensagens do lead
+  legenda       String?
+  arquivoPath   String?
+  arquivoTipo   String?                // video | image | document
+  arquivoNome   String?
+  padrao        Boolean  @default(false)
+  ativo         Boolean  @default(true)
+  ordem         Int      @default(0)
+  criadoEm      DateTime @default(now())
+
+  projeto IaProjeto @relation(fields: [projetoId], references: [id], onDelete: Cascade)
+
+  @@unique([projetoId, chave])
+}
+
+// Atividade comercial registrada à mão pelo SDR/closer: a ligação feita pelo celular e a
+// reunião que aconteceu (ou não). Sem isso o painel não tinha como contar "ligações
+// atendidas", "reuniões realizadas" e "no-show" — a SDR fazia o relatório diário na mão.
+model CrmAtividade {
+  id         String    @id @default(cuid())
+  dealId     String
+  tipo       String    // ligacao | reuniao | encerramento
+  // ligacao: atendeu | nao_atendeu | recusou | pediu_retorno | numero_errado
+  // reuniao: agendada | realizada | no_show | remarcada | cancelada · encerramento: ganho | perdido | aberto
+  resultado  String
+  nota       String?
+  usuarioId  String?
+  // Ligação: por onde (whatsapp | celular | voip), sentido (saida | entrada) e quanto durou.
+  // Reunião: video | whatsapp | telefone | presencial, e quanto durou.
+  canal      String?
+  direcao    String?
+  duracaoSeg Int?
+  // manual = SDR registrou; automatica = veio do evento CALL do Evolution (chamada de WhatsApp
+  // feita/recebida no número da instância) ou da sala de reunião do Avoce (externoId "reuniao:<sessão>").
+  // externoId evita registrar em dobro.
+  origem     String    @default("manual")
+  externoId  String?   @unique
+  atendidaEm DateTime?
+  criadoEm   DateTime  @default(now())
+
+  deal CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+
+  @@index([dealId, criadoEm])
+  @@index([tipo, criadoEm])
+}
+
+// ─────────────────────────────────────────────
+// Disparo segmentado (lib/disparos.ts) — mensagem para um recorte do funil
+// (etapa, etiqueta, origem), enviada devagar pelo cron para não queimar o número.
+// ─────────────────────────────────────────────
+
+model CrmDisparo {
+  id           String   @id @default(cuid())
+  empresaId    String?
+  projetoId    String
+  nome         String
+  mensagem     String
+  filtro       Json
+  status       String   @default("rascunho") // rascunho | enviando | pausado | concluido | cancelado
+  intervaloSeg Int      @default(90)
+  limiteDia    Int      @default(60)
+  total        Int      @default(0)
+  enviados     Int      @default(0)
+  falhas       Int      @default(0)
+  pulados      Int      @default(0)
+  criadoPor    String?
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  itens CrmDisparoItem[]
+
+  @@index([status])
+}
+
+model CrmDisparoItem {
+  id        String    @id @default(cuid())
+  disparoId String
+  dealId    String
+  canal     String    // whatsapp | instagram | messenger
+  status    String    @default("pendente") // pendente | enviado | falha | pulado
+  erro      String?
+  enviadoEm DateTime?
+
+  disparo CrmDisparo @relation(fields: [disparoId], references: [id], onDelete: Cascade)
+
+  @@unique([disparoId, dealId])
+  @@index([disparoId, status])
 }

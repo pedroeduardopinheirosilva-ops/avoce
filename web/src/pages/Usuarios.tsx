@@ -5,13 +5,11 @@ import { useAuth } from "../lib/usePermission";
 const MODULO_GROUPS = [
   {
     label: "Comercial", modulos: [
+      { chave: "painel",             label: "Painel Diário" },
       { chave: "crm",                label: "Funil CRM" },
-      { chave: "whatsapp",           label: "WhatsApp IA" },
+      { chave: "whatsapp",           label: "Chat (WhatsApp, Instagram, Messenger)" },
       { chave: "reunioes",           label: "Reuniões" },
       { chave: "telefone",           label: "Telefone / VoIP" },
-      { chave: "reengajamento",      label: "Reengajamento" },
-      { chave: "pipedrive",          label: "Pipedrive" },
-      { chave: "marketing_autopilot", label: "Mkt Autopilot" },
     ],
   },
   {

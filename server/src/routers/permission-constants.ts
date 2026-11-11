@@ -1,5 +1,6 @@
 export const MODULOS = [
   "dashboard",
+  "painel",
   "crm",
   "whatsapp",
   "reengajamento",
@@ -7,6 +8,7 @@ export const MODULOS = [
   "propostas",
   "contratos",
   "templates_documentos",
+  "assinaturas",
   "faturamento",
   "notas",
   "cobrancas",

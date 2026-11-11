@@ -20,7 +20,11 @@ import { propostaHtmlPage, autoConverterEmContrato, logoPathToBase64, enviarEmai
 import { renderTemplate }                   from "./lib/template.js";
 import { handlePixWebhookCobranca }         from "./lib/pix-webhook.js";
 import { gerarBoletoHtml }                  from "./lib/boleto-html.js";
+import { registrarRotasAssinatura }         from "./modules/assinaturas/assinaturas.rest.js";
+import { registrarRotasOnlyOffice }        from "./modules/onlyoffice/onlyoffice.rest.js";
+import { processarConclusao as processarAssinaturaConcluida } from "./modules/assinaturas/assinatura-service.js";
 import jwt                  from "jsonwebtoken";
+import { randomBytes }      from "node:crypto";
 import bcrypt               from "bcryptjs";
 
 const PORT = parseInt(process.env.PORT ?? "8470");
@@ -152,6 +156,20 @@ app.get("/api/logo/:empresaId", async (req, reply) => {
   return reply.status(404).send({ error: "Logo não encontrada" });
 });
 
+// ── Foto de perfil do WhatsApp do contato (baixada pela Evolution, ver services/foto-perfil.ts) ──
+app.get("/api/contato-foto/:contatoId", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : ((req.query as any).token as string | undefined) ?? "";
+  try { jwt.verify(token, process.env.JWT_SECRET!); } catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const { contatoId } = req.params as { contatoId: string };
+  const { fotoPerfilPath } = await import("./services/foto-perfil.js");
+  const p = fotoPerfilPath(contatoId);
+  if (!existsSync(p)) return reply.status(404).send({ error: "Sem foto" });
+  reply.header("Cache-Control", "private, max-age=3600");
+  reply.type("image/jpeg");
+  return reply.send(createReadStream(p));
+});
+
 // ── Upload de timbrado da empresa ─────────────────────────────────────────────
 
 // ── Mídia de apresentação das personas (foto/vídeo enviado ao lead na intro) ──
@@ -174,6 +192,7 @@ app.post("/api/ia-persona-midia/:personaId", async (req, reply) => {
   if (!payload) return reply.status(401).send({ error: "Não autorizado" });
 
   const { personaId } = req.params as { personaId: string };
+  if (!/^[a-z0-9_-]{10,40}$/i.test(personaId)) return reply.status(400).send({ error: "id inválido" });
   let fileBuffer: Buffer | null = null;
   let mimeType = "image/jpeg";
 
@@ -192,7 +211,8 @@ app.post("/api/ia-persona-midia/:personaId", async (req, reply) => {
 
   // Delete old file for this persona if it exists
   const existing = await prisma.iaPersona.findUnique({ where: { id: personaId }, select: { midiaApresentacaoPath: true } });
-  if (existing?.midiaApresentacaoPath) {
+  if (!existing) return reply.status(404).send({ error: "Persona não encontrada" });
+  if (existing.midiaApresentacaoPath) {
     try { unlinkSync(existing.midiaApresentacaoPath); } catch {}
   }
 
@@ -229,6 +249,53 @@ app.get("/api/ia-persona-midia/:personaId", async (req, reply) => {
   const ext = persona.midiaApresentacaoPath.split(".").pop()?.toLowerCase() ?? "jpg";
   reply.type(EXT_MIME[ext] ?? "application/octet-stream");
   return reply.send(createReadStream(persona.midiaApresentacaoPath));
+});
+
+// ── Entregáveis do SDR (vídeo/imagem/PDF por dor do lead) ───────────────────────
+const ENTREGAVEIS_DIR = resolve("./entregaveis-midia");
+mkdirSync(ENTREGAVEIS_DIR, { recursive: true });
+
+app.post("/api/ia-entregavel/:id", async (req, reply) => {
+  const payload = verifyJwt(req);
+  if (!payload) return reply.status(401).send({ error: "Não autorizado" });
+  const { id } = req.params as { id: string };
+  const ent = await prisma.iaEntregavel.findUnique({ where: { id } });
+  if (!ent) return reply.status(404).send({ error: "Entregável não encontrado" });
+
+  let fileBuffer: Buffer | null = null;
+  let mimeType = "application/octet-stream";
+  let nomeOriginal = "";
+  for await (const part of req.parts()) {
+    if (part.type === "file") {
+      mimeType = part.mimetype || mimeType;
+      nomeOriginal = part.filename ?? "";
+      const chunks: Buffer[] = [];
+      for await (const chunk of part.file) chunks.push(chunk);
+      fileBuffer = Buffer.concat(chunks);
+    }
+  }
+  if (!fileBuffer) return reply.status(400).send({ error: "Arquivo não enviado" });
+
+  const tipo = mimeType.startsWith("video/") ? "video" : mimeType.startsWith("image/") ? "image" : "document";
+  const ext = MIME_EXT[mimeType] ?? (mimeType === "application/pdf" ? "pdf" : (nomeOriginal.split(".").pop() || "bin").toLowerCase());
+  if (ent.arquivoPath) { try { unlinkSync(ent.arquivoPath); } catch {} }
+  const filePath = join(ENTREGAVEIS_DIR, `${id}.${ext}`);
+  await writeFile(filePath, fileBuffer);
+  await prisma.iaEntregavel.update({
+    where: { id },
+    data: { arquivoPath: filePath, arquivoTipo: tipo, arquivoNome: nomeOriginal || `${ent.chave}.${ext}` },
+  });
+  return reply.send({ ok: true, tipo, tamanho: fileBuffer.length });
+});
+
+// Público (sem auth): o Evolution baixa o arquivo por esta URL para mandar no WhatsApp.
+app.get("/api/ia-entregavel/:id/arquivo", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const ent = await prisma.iaEntregavel.findUnique({ where: { id }, select: { arquivoPath: true, arquivoNome: true } });
+  if (!ent?.arquivoPath || !existsSync(ent.arquivoPath)) return reply.status(404).send({ error: "Não encontrado" });
+  const ext = ent.arquivoPath.split(".").pop()?.toLowerCase() ?? "";
+  reply.type(EXT_MIME[ext] ?? (ext === "pdf" ? "application/pdf" : "application/octet-stream"));
+  return reply.send(createReadStream(ent.arquivoPath));
 });
 
 // ── Consulta CNPJ via ListaCNPJ interno ───────────────────────────────────────
@@ -647,6 +714,36 @@ app.post("/api/pakt-webhook", {
   const payload = req.body as { event: string; documentId: string; data: any };
   app.log.info({ event: payload.event, documentId: payload.documentId }, "[PAKT-Webhook] Evento recebido");
 
+  // ── Módulo Assinaturas ──────────────────────────────────────────────────────
+  // Documentos criados na página Assinaturas vivem na tabela Assinatura; a conta
+  // PAKT é compartilhada, então um mesmo webhook atende os dois fluxos.
+  try {
+    const assinatura = await prisma.assinatura.findUnique({
+      where: { paktDocumentId: payload.documentId },
+      select: { id: true, webhookEventos: true },
+    });
+    if (assinatura) {
+      const eventos = Array.isArray(assinatura.webhookEventos) ? assinatura.webhookEventos : [];
+      await prisma.assinatura.update({
+        where: { id: assinatura.id },
+        data: {
+          webhookEventos: [
+            ...eventos,
+            { event: payload.event, ts: new Date().toISOString(), data: payload.data ?? null },
+          ] as any,
+        },
+      });
+
+      if (payload.event === "document.completed") {
+        await processarAssinaturaConcluida(payload.documentId);
+      } else if (payload.event === "signer.rejected") {
+        await prisma.assinatura.update({ where: { id: assinatura.id }, data: { status: "CANCELLED" } });
+      }
+    }
+  } catch (e) {
+    app.log.error({ err: e }, "[PAKT-Webhook] Erro no módulo Assinaturas");
+  }
+
   try {
     if (payload.event === "document.completed") {
       const { documentId, data } = payload;
@@ -656,7 +753,32 @@ app.post("/api/pakt-webhook", {
         where: { paktDocumentId: { contains: documentId } } as any,
       });
 
-      if (proposta && proposta.status !== "ACEITA") {
+      // ── Por DOCUMENTO: arquiva no deal cada peça assinada ────────────────
+      // Fora do guard abaixo de propósito: o envelope tem contrato, procuração
+      // e declaração, e cada um dispara seu próprio document.completed. Se isto
+      // rodasse uma vez só, apenas a primeira peça assinada entraria no deal.
+      if (proposta) {
+        try {
+          const { sincronizarAssinadosDaProposta } = await import("./agent/assinados-deal.js");
+          await sincronizarAssinadosDaProposta(
+            proposta.id,
+            (proposta as any).paktDocumentId,
+            process.env.PAKT_API_KEY ?? "",
+            process.env.PAKT_BASE_URL ?? "https://pakt.capium.com.br",
+          );
+        } catch (e) {
+          app.log.error({ err: e }, "[PAKT-Webhook] Falha ao anexar assinado no deal");
+        }
+      }
+
+      // ── Uma vez por PROPOSTA: aceite, card, contrato, e-mail, notificação ──
+      // O guard era `status !== "ACEITA"`, o que confundia "ainda não aceita"
+      // com "ainda não processada": a proposta do fluxo do SDR nasce ACEITA
+      // (o cliente já concordou na conversa antes de os documentos existirem),
+      // então TODA esta cadeia era pulada — sem PDF, sem e-mail de aceite, sem
+      // mover o card e sem avisar o SDR. `aceitoEm` é o marcador correto:
+      // só é gravado aqui dentro, o que mantém a idempotência sem barrar o fluxo.
+      if (proposta && !(proposta as any).aceitoEm) {
         const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
           ?? req.socket.remoteAddress ?? "pakt-webhook";
 
@@ -756,6 +878,11 @@ app.post("/api/pakt-webhook", {
 
   return reply.send({ ok: true });
 });
+
+// ── Módulo Assinaturas — upload multipart, análise por IA e download ─────────
+
+registrarRotasAssinatura(app);
+registrarRotasOnlyOffice(app);
 
 // ── Download PDF assinado da proposta ────────────────────────────────────────
 
@@ -976,12 +1103,17 @@ app.post("/api/template-documento/:id/timbrado", async (req, reply) => {
   catch { return reply.status(401).send({ error: "Não autorizado" }); }
 
   const { id } = req.params as { id: string };
+  // id e extensão viram caminho no disco: sem validar, "../" escrevia/apagava fora da pasta
+  if (!/^[a-z0-9_-]{10,40}$/i.test(id)) return reply.status(400).send({ error: "id inválido" });
+  const tpl = await (prisma as any).templateDocumento.findUnique({ where: { id }, select: { id: true } });
+  if (!tpl) return reply.status(404).send({ error: "Template não encontrado" });
   let fileBuffer: Buffer | null = null;
   let ext = "png";
 
   for await (const part of req.parts()) {
     if (part.type === "file" && part.fieldname === "timbrado") {
       ext = (part.filename?.split(".").pop()?.toLowerCase()) ?? "png";
+      if (!["png", "jpg", "jpeg", "docx"].includes(ext)) return reply.status(400).send({ error: "Formato não permitido" });
       const chunks: Buffer[] = [];
       for await (const chunk of part.file) chunks.push(chunk);
       fileBuffer = Buffer.concat(chunks);
@@ -1158,6 +1290,19 @@ app.post("/api/whatsapp/webhook", async (req, reply) => {
   // Determine event type
   const event: string = body?.event ?? body?.type ?? "";
 
+  // Chamada de WhatsApp (evento CALL do Evolution) → ligação registrada no lead.
+  if (event.toLowerCase() === "call") {
+    const inst: string = body?.instance ?? body?.data?.instance ?? "";
+    const { candidatosDaInstancia } = await import("./agent/projeto-resolver.js");
+    const projetos = await candidatosDaInstancia(inst);
+    if (projetos.length) {
+      const { registrarEventoChamada } = await import("./agent/chamadas-whatsapp.js");
+      const eventos = Array.isArray(body?.data) ? body.data : [body?.data];
+      for (const ev of eventos) await registrarEventoChamada(inst, projetos.map((p) => p.projetoId), ev);
+    }
+    return reply.send({ ok: true });
+  }
+
   // Only process message events
   if (!event.includes("messages")) {
     return reply.send({ ok: true });
@@ -1170,18 +1315,96 @@ app.post("/api/whatsapp/webhook", async (req, reply) => {
     body?.data?.key?.remoteJid?.split("@")[0] ??
     "";
 
-  // Find project by instance name
-  const config = await prisma.iaProjetoConfig.findFirst({
-    where: { chave: "evolution_instancia", valor: instanceName },
-  });
+  // Projetos que atendem esta instância. Normalmente é um só; quando o mesmo
+  // número serve dois funis (Judite atende subvenções E defesa de ICMS), quem
+  // desempata é a própria mensagem — ver agent/projeto-resolver.ts.
+  const { candidatosDaInstancia } = await import("./agent/projeto-resolver.js");
+  const candidatos = await candidatosDaInstancia(instanceName);
 
-  if (!config?.projetoId) {
+  if (candidatos.length === 0) {
     app.log.warn(`[WA-Webhook] Instância desconhecida: "${instanceName}". Configure evolution_instancia em Config IA.`);
     return reply.send({ ok: true });
   }
 
-  await processMessages(body, config.projetoId, app);
+  await processMessages(body, candidatos, app);
   return reply.send({ ok: true });
+});
+
+// ── Mídia das automações do Instagram/Messenger (lib/meta-automacoes.ts) ─────────
+// A Meta baixa áudio/vídeo/PDF/imagem por URL: o GET é público, com nome aleatório e sem listagem.
+const MIDIA_META_TIPOS: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  mp4: "video/mp4", mov: "video/quicktime", webm: "video/webm", ogg: "video/ogg",
+  m4a: "audio/mp4", aac: "audio/aac", wav: "audio/wav", mp3: "audio/mpeg", pdf: "application/pdf",
+};
+const MIDIA_META_LIMITE = 25 * 1024 * 1024;
+const midiaMetaDir = (projetoId: string) => join(process.env.UPLOADS_DIR ?? "/opt/avoce/uploads", "meta-social", projetoId.replace(/[^a-zA-Z0-9_-]/g, ""));
+
+app.post("/api/meta/midia/:projetoId", async (req, reply) => {
+  const auth  = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  let user: any;
+  try { user = jwt.verify(token, process.env.JWT_SECRET!); }
+  catch { return reply.status(401).send({ error: "Não autorizado" }); }
+  const { projetoId } = req.params as { projetoId: string };
+  const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId }, select: { empresaId: true } });
+  if (!projeto) return reply.status(404).send({ error: "Projeto não encontrado" });
+  const { canOperate } = await import("./routers/tenant-utils.js");
+  if (!canOperate(user, projeto.empresaId)) return reply.status(403).send({ error: "Projeto de outra empresa" });
+  const data = await req.file();
+  if (!data) return reply.status(400).send({ error: "Nenhum arquivo enviado" });
+  const ext = extname(data.filename || "").replace(".", "").toLowerCase();
+  if (!MIDIA_META_TIPOS[ext]) return reply.status(400).send({ error: `Formato .${ext || "?"} não aceito pela Meta` });
+  const buffer = await data.toBuffer();
+  if (buffer.length > MIDIA_META_LIMITE) return reply.status(400).send({ error: "Arquivo acima de 25 MB (limite da Meta)" });
+  if (ext.match(/png|jpe?g|gif/) && buffer.length > 8 * 1024 * 1024) return reply.status(400).send({ error: "Imagem acima de 8 MB (limite da Meta)" });
+  const dir = midiaMetaDir(projetoId);
+  mkdirSync(dir, { recursive: true });
+  const arquivo = `${randomBytes(12).toString("hex")}.${ext}`;
+  writeFileSync(join(dir, arquivo), buffer);
+  return reply.send({ arquivo, nome: data.filename, mime: MIDIA_META_TIPOS[ext] });
+});
+
+app.get("/api/meta/midia/:projetoId/:arquivo", async (req, reply) => {
+  const { projetoId, arquivo } = req.params as { projetoId: string; arquivo: string };
+  if (!/^[a-f0-9]{24}\.[a-z0-9]{2,4}$/.test(arquivo)) return reply.status(404).send();
+  const caminho = join(midiaMetaDir(projetoId), arquivo);
+  if (!existsSync(caminho)) return reply.status(404).send();
+  const ext = extname(arquivo).slice(1);
+  return reply.header("Cache-Control", "public, max-age=31536000, immutable").type(MIDIA_META_TIPOS[ext] ?? "application/octet-stream").send(createReadStream(caminho));
+});
+
+// ── Webhook Meta — Instagram Direct, Messenger e comentários (lib/meta-social.ts) ──
+// Plugin próprio para ter o corpo cru: a assinatura X-Hub-Signature-256 é sobre os bytes
+// exatos, e o parser JSON global devolveria só o objeto.
+await app.register(async (meta) => {
+  meta.addContentTypeParser("application/json", { parseAs: "string" }, (_req, body, done) => {
+    try { done(null, { raw: body as string, json: JSON.parse((body as string) || "{}") }); }
+    catch (err: any) { done(err, undefined); }
+  });
+
+  meta.get("/api/meta/webhook", async (req, reply) => {
+    const q = req.query as Record<string, string>;
+    const { verifyTokenValido } = await import("./lib/meta-social.js");
+    if (q["hub.mode"] === "subscribe" && await verifyTokenValido(q["hub.verify_token"] ?? "")) {
+      return reply.type("text/plain").send(q["hub.challenge"] ?? "");
+    }
+    return reply.status(403).send("forbidden");
+  });
+
+  meta.post("/api/meta/webhook", async (req, reply) => {
+    const { raw, json } = (req.body ?? {}) as { raw?: string; json?: any };
+    const { assinaturaValida, segredosDosApps, processarWebhook } = await import("./lib/meta-social.js");
+    const sig = req.headers["x-hub-signature-256"] as string | undefined;
+    const segredos = await segredosDosApps();
+    if (!raw || !segredos.some((s) => assinaturaValida(raw, sig, s))) {
+      app.log.warn("[MetaSocial] Assinatura inválida");
+      return reply.status(401).send({ error: "invalid signature" });
+    }
+    // A Meta quer 200 em poucos segundos; o processamento (Graph, banco) segue depois.
+    reply.send({ ok: true });
+    processarWebhook(json).catch((err) => app.log.error({ err }, "[MetaSocial] Falha no webhook"));
+  });
 });
 
 // In-memory dedup: ignore duplicate webhook calls for the same message ID (5-min TTL)
@@ -1302,28 +1525,59 @@ async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
 
     // 2. Extract message text
     const m = msg.message ?? {};
+    const isAudio = !!m.audioMessage || msg.messageType === "audioMessage";
     const rawText: string | null =
       m.conversation ??
       m.extendedTextMessage?.text ??
-      (m.audioMessage ? "[Áudio]" :
+      (isAudio ? "[Áudio]" :
       m.imageMessage ? "[Imagem]" :
       m.documentMessage ? "[Documento]" : null);
     if (!rawText) return;
 
-    // 3. Find deal for this contact+project
-    const contato = await prisma.crmContato.findFirst({ where: { whatsapp: phone } });
-    if (!contato) return;
-
-    const deal = await prisma.crmDeal.findFirst({
-      where: { contatoId: contato.id, projetoId, status: "aberto" },
-      orderBy: { criadoEm: "desc" },
+    // 3. Find deal for this contact+project — mesma busca da mensagem recebida
+    //    (stage-engine findOrCreateDeal): o telefone pode estar em mais de um contato e
+    //    com ou sem o 9º dígito. Pegar só o primeiro contato descartava em silêncio a
+    //    mensagem da atendente quando o deal aberto estava no outro (Reinaldo 6305, 23/10).
+    const { variantesTelefone } = await import("./agent/projeto-resolver.js");
+    const contatosDoFone = await prisma.crmContato.findMany({
+      where: { whatsapp: { in: variantesTelefone(phone) } },
+      select: { id: true },
     });
-    if (!deal) return;
+    if (!contatosDoFone.length) {
+      app.log.warn(`[WA-Webhook] fromMe para ${phone} sem contato no CRM — não salvo`);
+      return;
+    }
+    let deal = await prisma.crmDeal.findFirst({
+      where: { contatoId: { in: contatosDoFone.map((c) => c.id) }, projetoId, status: "aberto" },
+      orderBy: [{ ultimoContatoEm: { sort: "desc", nulls: "last" } }, { criadoEm: "desc" }],
+    });
+    // Sem card aberto do projeto: antes a mensagem da atendente era descartada ("não salvo") e,
+    // quando o lead respondia, o Avoce achava que era contato novo e a IA saudava no meio da
+    // conversa humana (Marcos 1079, 06/11). Agora: card ganho do cliente → card sem projeto
+    // adotado → card novo. Nos dois últimos a IA fica pausada, porque é gente atendendo.
+    if (!deal) {
+      const { dealGanhoDoContato, adotarDealSemProjeto, createInitialDeal } = await import("./agent/deal-repository.js");
+      const ids = contatosDoFone.map((c) => c.id);
+      deal = await dealGanhoDoContato(projetoId, ids);
+      if (!deal) {
+        const contatoNome = (await prisma.crmContato.findUnique({ where: { id: ids[0] }, select: { nome: true } }))?.nome ?? phone;
+        const base = await adotarDealSemProjeto(projetoId, ids) ?? await createInitialDeal(projetoId, ids[0], contatoNome);
+        deal = await prisma.crmDeal.update({
+          where: { id: base.id },
+          data: { iaAtiva: false, iaPausadaEm: new Date() },
+        });
+        app.log.info(`[WA-Webhook] fromMe para ${phone} sem card aberto — card ${deal.id} no projeto ${projetoId}, IA pausada`);
+      }
+    }
+    const contato = { id: deal.contatoId };
 
     // 4. Content dedup — IA saves messages before sending (without evolutionMessageId).
     //    Strip *Name*\n prefix that Evolution wraps around sent text, then check for recent match.
+    //    Para ÁUDIO esse dedup por conteúdo não serve: o texto é sempre "[Áudio]", então dois
+    //    áudios seguidos em 30s se anulariam. Áudio depende do dedup por evolutionMessageId
+    //    do passo 1 — que cobre, todos os áudios chegam com id.
     const stripped = rawText.replace(/^\*[^*\n]+\*\n/, "").slice(0, 80);
-    const recentDup = await prisma.crmMensagemWhatsapp.findFirst({
+    const recentDup = isAudio ? null : await prisma.crmMensagemWhatsapp.findFirst({
       where: {
         dealId: deal.id,
         direcao: "out",
@@ -1333,14 +1587,38 @@ async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
     });
     if (recentDup) return;
 
-    // 5. Resolve SDR name from deal.iaPausadaPor, or extract from *Name*\n prefix
+    // 5. Quem mandou: o *Nome* em negrito da própria mensagem; senão quem está com a
+    //    conversa aberta no painel agora; só por último quem assumiu (iaPausadaPor).
+    //    Assumir não é mandar: com a Kamilla tendo assumido, o áudio do Dr. Guilherme
+    //    saía como dela (Gilson 5096, 27/10).
+    const { quemEstaAtendendo, nomeDoAtendente } = await import("./services/quem-atende.js");
     let remetente = "Atendente";
+    const atendenteId = quemEstaAtendendo(deal.id) ?? deal.iaPausadaPor ?? null;
     const prefixMatch = rawText.match(/^\*([^*\n]+)\*\n/);
     if (prefixMatch) {
       remetente = prefixMatch[1]; // use the bolded name embedded in the message
-    } else if (deal.iaPausadaPor) {
-      const u = await prisma.usuario.findUnique({ where: { id: deal.iaPausadaPor }, select: { nome: true } });
-      if (u) remetente = u.nome;
+    } else if (atendenteId) {
+      remetente = (await nomeDoAtendente(atendenteId, projetoId)) ?? remetente;
+    }
+
+    // 6. Áudio gravado pelo SDR no próprio WhatsApp: transcrever e guardar o arquivo, igual
+    //    ao que já é feito com o áudio que o lead manda. Sem isso a conversa fica cheia de
+    //    "[Áudio]" e não dá para ler o que o atendente falou.
+    let conteudo = rawText;
+    let tipo = "text";
+    let midiaUrl: string | null = null;
+    if (isAudio) {
+      tipo = "audio";
+      try {
+        const { tryTranscribeAudio } = await import("./agent/media-processor.js");
+        const r = await tryTranscribeAudio(projetoId, msg);
+        midiaUrl = r.midiaUrl ?? null;
+        if (r.text) conteudo = r.text;
+        else app.log.warn(`[WA-Webhook] áudio fromMe de ${phone} sem transcrição — salvo só com o player`);
+      } catch (audioErr: any) {
+        // Transcrição é melhoria, não requisito: nunca deixar de registrar a mensagem por causa dela.
+        app.log.warn({ err: audioErr }, `[WA-Webhook] falha ao transcrever áudio fromMe de ${phone}`);
+      }
     }
 
     await prisma.crmMensagemWhatsapp.create({
@@ -1348,15 +1626,36 @@ async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
         dealId:             deal.id,
         contatoId:          contato.id,
         direcao:            "out",
-        tipo:               "text",
-        conteudo:           rawText,
+        tipo,
+        conteudo,
+        midiaUrl,
         remetente,
         evolutionMessageId: msgId ?? null,
       },
     });
+    // Resposta dada pelo atendente no próprio celular também é contato: mantém o deal no topo
+    // da caixa de conversas em vez de deixá-lo congelado no último toque da IA.
+    // E é handoff: quem chegou aqui passou pelos dois dedups acima, então NÃO é a IA —
+    // é gente digitando no WhatsApp. Sem isto o sistema não ficava sabendo (a pausa só
+    // existia pelo botão do painel) e os dois respondiam o mesmo lead, alternando:
+    // a atendente mandava "Tô sim" e a persona mandava "Haha, pegou! Tô sim, mas..."
+    // na mesma conversa. Assumir a conversa pelo celular agora silencia a IA, igual
+    // ao botão. Na coleta de documentos ela volta sozinha quando o cliente enviar o
+    // arquivo; nos demais casos, pelo botão de reativar no painel.
+    await prisma.crmDeal.update({
+      where: { id: deal.id },
+      data: {
+        ultimoContatoEm: new Date(),
+        followupEm: new Date(),
+        ...(deal.iaAtiva ? { iaAtiva: false, iaPausadaEm: new Date(), ...(atendenteId ? { iaPausadaPor: atendenteId } : {}) } : {}),
+      },
+    });
+    if (deal.iaAtiva) {
+      app.log.info(`[WA-Webhook] dealId=${deal.id} — atendente respondeu pelo WhatsApp; IA pausada`);
+    }
 
     if (msgId) _processedMsgIds.set(msgId, Date.now());
-    app.log.info(`[WA-Webhook] fromMe salvo: ${phone} (${remetente})`);
+    app.log.info(`[WA-Webhook] fromMe salvo: ${phone} (${remetente})${isAudio ? ` [áudio${conteudo !== rawText ? " transcrito" : ""}]` : ""}`);
   } catch (err: any) {
     // P2002 = unique constraint violation (evolutionMessageId) — race condition, safe to ignore
     if (err?.code !== "P2002") {
@@ -1365,12 +1664,38 @@ async function saveFromMeMessage(projetoId: string, msg: any, app: any) {
   }
 }
 
-async function processMessages(body: any, projetoId: string, app: any) {
-  const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId } });
-  if (!projeto?.ativo) return;
+async function processMessages(
+  body: any,
+  candidatos: import("./agent/projeto-resolver.js").CandidatoProjeto[],
+  app: any,
+) {
+  if (candidatos.length === 0) return;
 
-  const { getModoColeta } = await import("./agent/conversational-dispatch.js");
-  const modoColeta = await getModoColeta(projetoId);
+  const { resolverProjeto } = await import("./agent/projeto-resolver.js");
+
+  // Cache por lote: o mesmo telefone não é resolvido duas vezes no mesmo webhook.
+  const _resolvidos = new Map<string, string>();
+  async function projetoDaMensagem(phone: string, msg: any): Promise<string | null> {
+    const cached = _resolvidos.get(phone);
+    if (cached) return cached;
+    const r = await resolverProjeto(candidatos, phone, msg);
+    if (!r) return null;
+    if (candidatos.length > 1) {
+      app.log.info(`[WA-Webhook] ${phone} → projeto ${r.projetoId} (motivo: ${r.motivo})`);
+    }
+    _resolvidos.set(phone, r.projetoId);
+    return r.projetoId;
+  }
+
+  const _projetosAtivos = new Map<string, boolean>();
+  async function projetoAtivo(projetoId: string): Promise<boolean> {
+    const cached = _projetosAtivos.get(projetoId);
+    if (cached !== undefined) return cached;
+    const projeto = await prisma.iaProjeto.findUnique({ where: { id: projetoId } });
+    const ativo = !!projeto?.ativo;
+    _projetosAtivos.set(projetoId, ativo);
+    return ativo;
+  }
 
   const data = body?.data ?? body;
 
@@ -1395,13 +1720,16 @@ async function processMessages(body: any, projetoId: string, app: any) {
     // Skip status broadcasts
     if (msg.key.remoteJid === "status@broadcast") continue;
 
+    const phone = (msg.key.remoteJid as string).replace(/@.*/, "");
+
     if (msg.key.fromMe) {
-      // Capture outgoing messages sent directly from WhatsApp/Evolution manager
-      void saveFromMeMessage(projetoId, msg, app);
+      // Capture outgoing messages sent directly from WhatsApp/Evolution manager.
+      // Mensagem nossa não traz marcador de site: cai na continuidade do deal
+      // que já existe para este telefone, que é justamente o certo aqui.
+      const pidOut = await projetoDaMensagem(phone, msg);
+      if (pidOut && (await projetoAtivo(pidOut))) void saveFromMeMessage(pidOut, msg, app);
       continue;
     }
-
-    const phone = (msg.key.remoteJid as string).replace(/@.*/, "");
     let msgId = msg.key?.id as string | undefined;
     if (!msgId) {
       const content = JSON.stringify(msg.message ?? msg.body ?? "");
@@ -1422,12 +1750,17 @@ async function processMessages(body: any, projetoId: string, app: any) {
       select: { id: true },
     });
     if (teamUser) {
+      const pidInterno = await projetoDaMensagem(phone, msg);
+      if (!pidInterno) continue;
       const { processAssistenteInterno } = await import("./agent/assistente-interno.js");
-      void processAssistenteInterno(projetoId, phone, msg, app).catch((e) =>
+      void processAssistenteInterno(pidInterno, phone, msg, app).catch((e) =>
         app.log.error({ err: e }, "[AssistenteInterno] Erro não tratado"),
       );
       continue;
     }
+
+    const projetoId = await projetoDaMensagem(phone, msg);
+    if (!projetoId || !(await projetoAtivo(projetoId))) continue;
 
     if (processIncomingMessage) {
       debounceForPhone(phone, msg, projetoId, processIncomingMessage, app);
@@ -2458,14 +2791,106 @@ app.get("/api/meta/oauth/callback", async (req, reply) => {
   }
 });
 
-// ── Reunião — transcrição automática de chunk de áudio ────────────────────────
-// Aceita áudio do browser (MediaRecorder) e transcreve via Whisper.
-// Auth: ?token=<tokenConvidado> (guest) ou Authorization: Bearer <jwt> (admin).
+// ── Reunião — transcrição com identificação de interlocutor ───────────────────
+// Cada participante transcreve o PRÓPRIO microfone (papel conhecido a priori):
+// operador via Reunioes.tsx (Bearer JWT), convidado via SalaPublica (?token=).
+// Web Speech API envia texto pronto; fallback MediaRecorder envia áudio → Whisper.
+
+// Padrões típicos de alucinação do Whisper em trechos de silêncio/ruído
+const REUNIAO_HALLUCINATION = [
+  /legendas pela comunidade/i,
+  /amara\.org/i,
+  /^\s*(tchau|obrigad[oa]|valeu|e a[íi])[.!?\s]*$/i,
+  /^\s*a\s*$/i,
+];
+
+function reuniaoChunkValido(texto: string): boolean {
+  const t = texto.trim();
+  if (t.length < 4) return false;
+  if (REUNIAO_HALLUCINATION.some(rx => rx.test(t))) return false;
+  // frase composta de uma única palavra repetida ("E aí E aí E aí")
+  const palavras = t.toLowerCase().replace(/[.,!?]/g, "").split(/\s+/);
+  if (palavras.length >= 3 && new Set(palavras).size === 1) return false;
+  return true;
+}
+
+async function reuniaoAuth(id: string, req: any): Promise<{ sessao: any; role: "operador" | "convidado" } | null> {
+  const tokenParam = ((req.query as any).token as string | undefined)
+    ?? ((req.body as any)?.token as string | undefined);
+  const sessao = await prisma.sessaoReuniao.findUnique({
+    where: { id },
+    select: { id: true, tokenConvidado: true, dealId: true, iniciadaEm: true, contato: { select: { nome: true } } },
+  });
+  if (!sessao) return null;
+
+  if (tokenParam) {
+    if (sessao.tokenConvidado !== tokenParam) return null;
+    return { sessao, role: "convidado" };
+  }
+  const auth = (req.headers.authorization ?? "").replace("Bearer ", "").trim();
+  if (!auth) return null;
+  try {
+    jwt.verify(auth, process.env.JWT_SECRET!);
+    return { sessao, role: "operador" };
+  } catch {
+    return null;
+  }
+}
+
+async function reuniaoSalvarChunk(sessaoId: string, role: string, nome: string | null, texto: string, inicioSegundos: number | null, origem: string) {
+  await prisma.reuniaoTranscricaoChunk.create({
+    data: {
+      sessaoId,
+      speakerRole: role,
+      speakerNome: nome,
+      conteudo: texto,
+      inicioSegundos: inicioSegundos ?? undefined,
+      origem,
+    },
+  });
+  console.log(`[Reunião] Chunk (${origem}) sessaoId=${sessaoId} role=${role} chars=${texto.length}`);
+}
+
+// Consentimento LGPD do convidado — registra aceite com IP e timestamp
+app.post("/api/reuniao/:id/consentimento", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const auth = await reuniaoAuth(id, req);
+  if (!auth || auth.role !== "convidado") return reply.status(403).send({ error: "Não autorizado" });
+
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip;
+  await prisma.sessaoReuniao.update({
+    where: { id },
+    data: { consentimentoEm: new Date(), consentimentoIp: ip },
+  });
+  console.log(`[Reunião] Consentimento LGPD sessaoId=${id} ip=${ip}`);
+  return reply.send({ ok: true });
+});
+
+// Chunk de TEXTO — Web Speech API (transcrição no próprio browser, custo zero)
+app.post("/api/reuniao/:id/transcricao-texto", async (req, reply) => {
+  const { id } = req.params as { id: string };
+  const body = (req.body ?? {}) as { texto?: string; nome?: string; inicioSegundos?: number; token?: string };
+
+  const auth = await reuniaoAuth(id, req);
+  if (!auth) return reply.status(403).send({ error: "Não autorizado" });
+
+  const texto = (body.texto ?? "").trim();
+  if (!reuniaoChunkValido(texto)) return reply.send({ ok: false });
+
+  const nome = body.nome?.trim()
+    || (auth.role === "convidado" ? auth.sessao.contato?.nome ?? "Cliente" : "Operador");
+  await reuniaoSalvarChunk(id, auth.role, nome, texto,
+    Number.isFinite(body.inicioSegundos) ? Math.floor(body.inicioSegundos!) : null, "webspeech");
+  return reply.send({ ok: true });
+});
+
+// Chunk de ÁUDIO — fallback MediaRecorder → Whisper (Safari/iOS, browsers sem Web Speech)
 app.post("/api/reuniao/:id/transcricao-chunk", async (req, reply) => {
   const { id } = req.params as { id: string };
 
   let fileBuffer: Buffer | null = null;
   let audioMime = "audio/webm";
+  const fields: Record<string, string> = {};
   const parts = req.parts();
   for await (const part of parts) {
     if (part.type === "file") {
@@ -2473,34 +2898,21 @@ app.post("/api/reuniao/:id/transcricao-chunk", async (req, reply) => {
       for await (const chunk of part.file) chunks.push(chunk);
       fileBuffer = Buffer.concat(chunks);
       audioMime = part.mimetype || "audio/webm";
+    } else if (part.type === "field") {
+      fields[part.fieldname] = String(part.value ?? "");
     }
   }
-  if (!fileBuffer || fileBuffer.length < 1000) {
+  if (!fileBuffer || fileBuffer.length < 4000) {
     return reply.status(400).send({ error: "Áudio vazio ou muito curto" });
   }
 
-  // Auth: token de convidado na querystring ou Bearer JWT no header
-  const tokenParam = (req.query as any).token as string | undefined;
-  const sessao = await prisma.sessaoReuniao.findUnique({ where: { id }, select: { id: true, tokenConvidado: true, dealId: true, transcricao: true } });
-  if (!sessao) return reply.status(404).send({ error: "Reunião não encontrada" });
+  const auth = await reuniaoAuth(id, req);
+  if (!auth) return reply.status(403).send({ error: "Não autorizado" });
 
-  if (tokenParam) {
-    if (sessao.tokenConvidado !== tokenParam) return reply.status(403).send({ error: "Token inválido" });
-  } else {
-    // Basic Bearer check (any valid JWT from the app is enough)
-    const auth = (req.headers.authorization ?? "").replace("Bearer ", "").trim();
-    if (!auth) return reply.status(401).send({ error: "Não autenticado" });
-    try {
-      jwt.verify(auth, process.env.JWT_SECRET!);
-    } catch {
-      return reply.status(401).send({ error: "Token inválido" });
-    }
-  }
-
-  // Get Whisper API key — try deal's project first, then any project
+  // Whisper API key — projeto do deal primeiro, depois qualquer projeto
   let groqKey = "";
-  if (sessao.dealId) {
-    const deal = await prisma.crmDeal.findUnique({ where: { id: sessao.dealId }, select: { projetoId: true } });
+  if (auth.sessao.dealId) {
+    const deal = await prisma.crmDeal.findUnique({ where: { id: auth.sessao.dealId }, select: { projetoId: true } });
     if (deal?.projetoId) {
       const cfg = await prisma.iaProjetoConfig.findFirst({ where: { projetoId: deal.projetoId, categoria: "audio", chave: "audio_api_key" } });
       groqKey = cfg?.valor ?? "";
@@ -2513,20 +2925,21 @@ app.post("/api/reuniao/:id/transcricao-chunk", async (req, reply) => {
   if (!groqKey) return reply.status(500).send({ error: "audio_api_key não configurada" });
 
   const { transcribeAudio } = await import("./services/whisper.js");
-  const result = await transcribeAudio(fileBuffer, audioMime, groqKey, "whisper-large-v3-turbo", "groq");
-  if (!result.ok || !result.text?.trim()) {
+  const result = await transcribeAudio(
+    fileBuffer, audioMime, groqKey, "whisper-large-v3-turbo", "groq",
+    "Transcrição de reunião jurídica em português brasileiro entre advogado e cliente.",
+  );
+  if (!result.ok || !result.text?.trim() || !reuniaoChunkValido(result.text)) {
     return reply.send({ ok: false, text: "" });
   }
 
-  const chunk = result.text.trim();
-  const atual = sessao.transcricao ?? "";
-  await prisma.sessaoReuniao.update({
-    where: { id },
-    data: { transcricao: atual + (atual ? "\n" : "") + chunk },
-  });
-
-  console.log(`[Reunião] Chunk transcrito sessaoId=${id} chars=${chunk.length}`);
-  return reply.send({ ok: true, text: chunk });
+  const texto = result.text.trim();
+  const nome = fields.nome?.trim()
+    || (auth.role === "convidado" ? auth.sessao.contato?.nome ?? "Cliente" : "Operador");
+  const inicioSegundos = fields.inicioSegundos ? Math.floor(Number(fields.inicioSegundos)) : null;
+  await reuniaoSalvarChunk(id, auth.role, nome, texto,
+    Number.isFinite(inicioSegundos as number) ? inicioSegundos : null, "whisper");
+  return reply.send({ ok: true, text: texto });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
