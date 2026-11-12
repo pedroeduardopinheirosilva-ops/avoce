@@ -12,6 +12,7 @@ import { iaRouter }                     from "./ia.js";
 import { pipedriveRouter }              from "./pipedrive.js";
 import { reengajamentoRouter }          from "./reengajamento.js";
 import { financeiroRouter }             from "./financeiro.js";
+import { finGerencialRouter }           from "./finGerencial.js";
 import { bankingRouter }               from "../modules/banking/banking.router.js";
 import { marketingAutopilotRouter }    from "./marketingAutopilot.js";
 import { ligacoesRouter }              from "./ligacoes.js";
@@ -25,6 +26,8 @@ import { motoresRouter }              from "./motores.js";
 import { metaCapiRouter }             from "./metaCapi.js";
 import { metaSocialRouter }           from "./metaSocial.js";
 import { disparosRouter }             from "./disparos.js";
+import { acordosRouter }              from "./acordos.js";
+import { recebimentosRouter }         from "./recebimentos.js";
 
 export type { Context } from "./trpc.js";
 
@@ -43,6 +46,7 @@ export const appRouter = router({
   pipedrive:         pipedriveRouter,
   reengajamento:     reengajamentoRouter,
   financeiro:        financeiroRouter,
+  fin:               finGerencialRouter,
   banking:           bankingRouter,
   mkt:               marketingAutopilotRouter,
   ligacoes:          ligacoesRouter,
@@ -55,6 +59,8 @@ export const appRouter = router({
   metaCapi:          metaCapiRouter,
   metaSocial:        metaSocialRouter,
   disparos:          disparosRouter,
+  acordos:           acordosRouter,
+  recebimentos:      recebimentosRouter,
 });
 
 export type AppRouter = typeof appRouter;

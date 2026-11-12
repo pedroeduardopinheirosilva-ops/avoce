@@ -36,6 +36,7 @@ const EVENTOS_SUGERIDOS = [
   { value: "stage_entrada:lead_indeciso",      label: "Entrada em: Lead Indeciso" },
   { value: "stage_entrada:FECHADO_GANHO",      label: "Entrada em: Fechado Ganho" },
   { value: "stage_entrada:FECHADO_PERDIDO",    label: "Entrada em: Fechado Perdido" },
+  { value: "alertas_acordos",                  label: "Resumo diário: alertas de acordos e recebimentos" },
 ];
 
 type LlmProvedor = {
@@ -1572,6 +1573,7 @@ export default function ConfigIAPage() {
                       Use <code>stage_entrada:chave_do_stage</code> para qualquer stage.{" "}
                       Variáveis: {'{{nome}}'} {'{{cidade}}'} {'{{telefone}}'} {'{{stage}}'} {'{{cpf}}'}{" "}
                       — <code>proposta_aceita</code>: {'{{valor}}'} — <code>solicita_ligacao</code>: {'{{empresa}}'} {'{{mensagem}}'}
+                      {" "}— <code>alertas_acordos</code> (1×/dia, só se houver alerta): {'{{data}}'} {'{{total}}'} {'{{parcelasVencidas}}'} {'{{repassesPendentes}}'} {'{{semNf}}'} {'{{followupsVencidos}}'} {'{{avaliacoesAtrasadas}}'} {'{{lista}}'} {'{{link}}'}
                     </p>
                   </div>
 

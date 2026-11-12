@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Avatar } from "../components/Avatar";
 import AudienciaLead from "../components/AudienciaLead";
+import AcordoDeal from "../components/acordos/AcordoDeal";
 import MotorColeta from "../components/MotorColeta";
 import { OrigemBadge, OrigemDetalhe, type DealOrigem } from "../components/OrigemLead";
 import { useNavigate } from "react-router-dom";
@@ -662,6 +663,9 @@ export function DealModal({
 
           {/* Audiência designada + mensagem ao cliente */}
           {!isNew && deal?.id && <AudienciaLead dealId={deal.id} />}
+
+          {/* Acordo — registro paralelo ao funil (não mexe em coluna/prazo/audiência) */}
+          {!isNew && deal?.id && <AcordoDeal dealId={deal.id} />}
 
           {/* Parecer — exibido quando preenchido pela IA */}
           {!isNew && dealDetail && (dealDetail as any).parecer && (

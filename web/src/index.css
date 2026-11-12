@@ -31,3 +31,26 @@ html, body {
   100% { transform: translateY(0); opacity: 1; }
 }
 .animate-bounce-in { animation: bounce-in 0.4s ease-out forwards; }
+
+/* ── Impressão / "Salvar como PDF" (lib/exportar.ts → imprimirPdf) ─────────── */
+@media print {
+  @page { size: A4 landscape; margin: 10mm; }
+  html, body { background: #fff !important; }
+  aside, .no-print { display: none !important; }
+  /* layout de tela cheia (h-screen + overflow) cortaria a impressão */
+  html, body, #root, .h-screen, main, .overflow-auto, .overflow-hidden, .overflow-x-auto, .overflow-y-auto {
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  main { display: block !important; }
+  header.md\:hidden { display: none !important; }
+  .print-only { display: block !important; }
+  table { font-size: 9pt; border-collapse: collapse; width: 100%; }
+  th, td { padding: 2px 4px !important; }
+  thead { display: table-header-group; }
+  tr, td, th { break-inside: avoid; page-break-inside: avoid; }
+  .shadow, .shadow-sm, .shadow-xl { box-shadow: none !important; }
+  .sticky { position: static !important; }
+}
+.print-only { display: none; }

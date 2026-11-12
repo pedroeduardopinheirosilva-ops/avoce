@@ -28,7 +28,9 @@ const MODULO_GROUPS = [
   },
   {
     label: "Financeiro", modulos: [
-      { chave: "financeiro", label: "Financeiro" },
+      { chave: "financeiro", label: "Financeiro (ver)" },
+      { chave: "financeiro_editar", label: "Financeiro — editar (lançar, orçamento, empréstimos, aplicações, índices)" },
+      { chave: "acordos", label: "Acordos (funil de tentativa de acordo)" },
     ],
   },
   {

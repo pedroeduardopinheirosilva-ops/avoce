@@ -31,6 +31,16 @@ import { CalendarDays,
   Shield,
   PenLine,
   Send,
+  Handshake,
+  HandCoins,
+  Gauge,
+  Target,
+  Wallet,
+  Landmark,
+  PiggyBank,
+  Percent,
+  ChartColumn,
+  History,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { AvoceLockup } from "./Logo";
@@ -66,6 +76,7 @@ const groups: NavGroup[] = [
       { to: "/contratos",            label: "Contratos", icon: ScrollText, moduloChave: "contratos" },
       { to: "/templates-documentos", label: "Templates", icon: FilePlus2,  moduloChave: "templates_documentos" },
       { to: "/assinaturas",          label: "Assinaturas", icon: PenLine, moduloChave: "assinaturas" },
+      { to: "/acordos",              label: "Acordos",     icon: Handshake, moduloChave: "acordos", end: false },
     ],
   },
   {
@@ -79,11 +90,25 @@ const groups: NavGroup[] = [
   {
     label: "Financeiro",
     items: [
+      { to: "/financeiro/painel",      label: "Painel financeiro", icon: Gauge,    moduloChave: "financeiro" },
       { to: "/financeiro",             label: "Lançamentos",    icon: BookOpen,    moduloChave: "financeiro", end: true },
       { to: "/financeiro/contas",      label: "Contas",         icon: Building2,   moduloChave: "financeiro" },
       { to: "/financeiro/extrato",     label: "Extrato",        icon: AlignLeft,   moduloChave: "financeiro" },
       { to: "/financeiro/conciliacao", label: "Conciliação",    icon: Link2,       moduloChave: "financeiro" },
       { to: "/financeiro/fluxo-caixa", label: "Fluxo de Caixa", icon: TrendingUp,  moduloChave: "financeiro" },
+      { to: "/recebimentos",           label: "Recebimentos",   icon: HandCoins,   moduloChave: "financeiro" },
+    ],
+  },
+  {
+    label: "Gestão financeira",
+    items: [
+      { to: "/financeiro/orcamento",   label: "Orçado × Realizado", icon: Target,      moduloChave: "financeiro" },
+      { to: "/financeiro/fontes",      label: "Fontes de recursos", icon: Wallet,      moduloChave: "financeiro" },
+      { to: "/financeiro/emprestimos", label: "Empréstimos",        icon: Landmark,    moduloChave: "financeiro", end: false },
+      { to: "/financeiro/aplicacoes",  label: "Aplicações",         icon: PiggyBank,   moduloChave: "financeiro" },
+      { to: "/financeiro/indices",     label: "Índices Selic/CDI",  icon: Percent,     moduloChave: "financeiro" },
+      { to: "/financeiro/relatorios",  label: "Relatórios (fluxo, DRE)", icon: ChartColumn, moduloChave: "financeiro", end: false },
+      { to: "/financeiro/log",         label: "Log de alterações",  icon: History,     moduloChave: "financeiro" },
     ],
   },
   {
@@ -243,7 +268,9 @@ export default function Layout() {
             const isGlobalAdmin = user?.role === "admin" && !user?.empresaId;
           const visibleItems = user ? group.items.filter(item => {
             if (item.adminOnly && !isGlobalAdmin) return false;
-            return hasModulo(user, item.moduloChave);
+            // financeiro_editar inclui a leitura: quem só tem ele também enxerga o menu.
+            return hasModulo(user, item.moduloChave)
+              || (item.moduloChave === "financeiro" && hasModulo(user, "financeiro_editar"));
           }) : group.items;
             if (visibleItems.length === 0) return null;
             return (

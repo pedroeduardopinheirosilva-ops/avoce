@@ -4,6 +4,8 @@ import { router, authProc } from "./trpc.js";
 import { prisma }    from "../db.js";
 import { whereEmpresa, canAccess } from "./tenant-utils.js";
 import { marcarEntradaEtapa } from "../agent/lead-qualificado.js";
+import { garantirAvaliacaoAcordo } from "../lib/fin/acordo-avaliacao.js";
+import { ehColunaAjuizado } from "../lib/fin/acordo-indicadores.js";
 
 /**
  * Deal importado (Pipedrive, planilha, bot) costuma nascer com `empresaId` nulo, e
@@ -411,9 +413,11 @@ export const crmRouter = router({
     }))
     .mutation(async ({ input, ctx }) => {
       const { id, proximoPrazo, valor, valorEstimado, valorCausaAjuizada, valorCondenacao, valorAcordo, ...rest } = input;
-      { const d = await prisma.crmDeal.findUnique({ where: { id }, select: { empresaId: true, ...PIPELINE_EMPRESA } });
-        if (!d || !canAccess(ctx, empresaDoDeal(d))) throw new Error("Deal não pertence à sua empresa"); }
-      return prisma.crmDeal.update({
+      let cnjAnterior: string | null = null;
+      { const d = await prisma.crmDeal.findUnique({ where: { id }, select: { empresaId: true, numeroCnj: true, ...PIPELINE_EMPRESA } });
+        if (!d || !canAccess(ctx, empresaDoDeal(d))) throw new Error("Deal não pertence à sua empresa");
+        cnjAnterior = d.numeroCnj; }
+      const atualizado = await prisma.crmDeal.update({
         where: { id },
         data: {
           ...rest,
@@ -426,6 +430,9 @@ export const crmRouter = router({
         },
         include: { contato: true, stage: true },
       });
+      // Funil de acordos (§2.1): CNJ gravado pela 1ª vez → tarefa de avaliação prévia. Nunca lança.
+      if (!cnjAnterior?.trim() && rest.numeroCnj?.trim()) void garantirAvaliacaoAcordo(id, { gatilho: "cnj", usuarioId: ctx.userId });
+      return atualizado;
     }),
 
   // ── Rotina do SDR: atividades, próximo follow-up e encerramento ──────────
@@ -671,15 +678,19 @@ export const crmRouter = router({
           dealId: input.dealId,
           stageAnteriorId: deal.stageId,
           stageNovoId: input.stageId,
+          usuarioId: ctx.userId ?? null, // quem moveu (base do responsável da avaliação de acordo)
         },
       });
       void marcarEntradaEtapa(input.dealId, destino.chave, "crm:manual");
 
-      return prisma.crmDeal.update({
+      const movido = await prisma.crmDeal.update({
         where: { id: input.dealId },
         data: { stageId: input.stageId, pipelineId: destino.pipelineId },
         include: { contato: true, stage: true },
       });
+      // Funil de acordos (§2.1): entrou em coluna "ajuizado" → tarefa de avaliação prévia. Nunca lança.
+      if (ehColunaAjuizado(destino.chave)) void garantirAvaliacaoAcordo(input.dealId, { gatilho: "coluna", usuarioId: ctx.userId });
+      return movido;
     }),
 
   deleteDeal: authProc

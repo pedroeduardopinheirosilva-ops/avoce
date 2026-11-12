@@ -22,6 +22,7 @@ import { handlePixWebhookCobranca }         from "./lib/pix-webhook.js";
 import { gerarBoletoHtml }                  from "./lib/boleto-html.js";
 import { registrarRotasAssinatura }         from "./modules/assinaturas/assinaturas.rest.js";
 import { registrarRotasOnlyOffice }        from "./modules/onlyoffice/onlyoffice.rest.js";
+import { registrarRotasFinAnexos }         from "./modules/fin/fin-anexos.rest.js";
 import { processarConclusao as processarAssinaturaConcluida } from "./modules/assinaturas/assinatura-service.js";
 import jwt                  from "jsonwebtoken";
 import { randomBytes }      from "node:crypto";
@@ -885,6 +886,7 @@ app.post("/api/pakt-webhook", {
 
 registrarRotasAssinatura(app);
 registrarRotasOnlyOffice(app);
+registrarRotasFinAnexos(app); // /api/fin-anexos/upload + /download (comprovantes do financeiro/acordos)
 
 // ── Download PDF assinado da proposta ────────────────────────────────────────
 

@@ -176,6 +176,13 @@ model EmpresaEmitente {
   agendaSlots        AgendaSlot[]
   lancamentos        Lancamento[]
   assinaturas        Assinatura[]
+  // Financeiro gerencial + acordos
+  finFontes          FinFonte[]
+  finOrcamentos      FinOrcamento[]
+  finEmprestimos     FinEmprestimo[]
+  finAplicacoes      FinAplicacao[]
+  finRecebimentos    FinRecebimento[]
+  acordos            Acordo[]
 }
 
 model Lancamento {
@@ -190,11 +197,24 @@ model Lancamento {
   pago       Boolean  @default(true)
   obs        String?
   criadoEm   DateTime @default(now())
+  // Financeiro gerencial (plano AJUSTES-FINANCEIRO-ACORDOS)
+  competencia         DateTime? // mês de competência (DRE/orçado×realizado); null = usa `data`
+  fornecedor          String?
+  formaPagamento      String?   // pix | boleto | cartao | transferencia | dinheiro | debito_automatico | outro
+  comprovantePath     String?   // caminho no MinIO
+  comprovanteNome     String?
+  recorrente          Boolean   @default(false)
+  recorrenciaFimEm    DateTime? // último mês gerado da série (null = sem fim)
+  recorrenciaOrigemId String?   // id do lançamento que originou a série
+  criadoPorId         String?
 
   emitente EmpresaEmitente? @relation(fields: [emitenteId], references: [id])
+  fontes   FinLancamentoFonte[]
 
   @@index([data])
   @@index([emitenteId, tipo])
+  @@index([emitenteId, competencia])
+  @@index([recorrenciaOrigemId])
 }
 
 model Tomador {
@@ -593,6 +613,7 @@ model CrmDeal {
   valorCausaAjuizada Decimal? @db.Decimal(12, 2) // Valor da causa no processo ajuizado
   valorCondenacao  Decimal?  @db.Decimal(12, 2)  // Valor da condenação
   valorAcordo      Decimal?  @db.Decimal(12, 2)  // Valor do acordo homologado
+  ajuizadoEm       DateTime? // data do protocolo da inicial (base do "tempo até o acordo/recebimento")
   // Audiência designada — alimenta as mensagens automáticas ao cliente
   audienciaEm          DateTime? // data e hora da audiência
   audienciaTipo        String?   // inicial_protocolo | inicial_posterior | instrucao | una
@@ -640,6 +661,10 @@ model CrmDeal {
   tags      CrmTag[]            @relation("DealTags")
   eventosMeta MetaConversaoEvento[]
   atividades  CrmAtividade[]
+  // Funil de acordos + recebimentos (plano AJUSTES-FINANCEIRO-ACORDOS)
+  acordos         Acordo[]
+  acordoAvaliacao AcordoAvaliacao?
+  recebimentos    FinRecebimento[]
 }
 
 // Fila persistente (outbox) de eventos de conversão devolvidos à Meta.
@@ -1755,4 +1780,312 @@ model CrmDisparoItem {
 
   @@unique([disparoId, dealId])
   @@index([disparoId, status])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Financeiro gerencial (plano PLANO-AJUSTES-FINANCEIRO-ACORDOS.md)
+// Valores Decimal(14,2); taxas em % a.m. Decimal(12,8). Cálculo em lib/fin/.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Fonte de recursos que paga despesas (rateio) e recebe resgates de aplicação.
+model FinFonte {
+  id           String   @id @default(cuid())
+  emitenteId   String
+  nome         String
+  tipo         String   // emprestimo_psa | emprestimo_bancario | receita_propria | outra
+  ativo        Boolean  @default(true)
+  ordem        Int      @default(0)
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  emitente        EmpresaEmitente      @relation(fields: [emitenteId], references: [id])
+  lancamentos     FinLancamentoFonte[]
+  emprestimos     FinEmprestimo[]
+  aplicacaoMovs   FinAplicacaoMov[]
+
+  @@index([emitenteId, ativo])
+}
+
+// Rateio de um lançamento entre fontes — soma dos valores = valor do lançamento.
+model FinLancamentoFonte {
+  id           String   @id @default(cuid())
+  lancamentoId String
+  fonteId      String
+  valor        Decimal  @db.Decimal(14, 2)
+  percentual   Decimal? @db.Decimal(7, 4) // informativo (ex.: 33.3333); o valor manda
+  criadoEm     DateTime @default(now())
+
+  lancamento Lancamento @relation(fields: [lancamentoId], references: [id], onDelete: Cascade)
+  fonte      FinFonte   @relation(fields: [fonteId], references: [id])
+
+  @@index([lancamentoId])
+  @@index([fonteId])
+}
+
+// Orçamento mensal por categoria de despesa.
+model FinOrcamento {
+  id           String   @id @default(cuid())
+  emitenteId   String
+  categoria    String
+  ano          Int
+  mes          Int      // 1..12
+  valor        Decimal  @db.Decimal(14, 2)
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+
+  @@unique([emitenteId, categoria, ano, mes])
+  @@index([emitenteId, ano, mes])
+}
+
+// Índice mensal GLOBAL (não é por emitente). BCB/SGS: série 4390 (Selic) e 4391 (CDI).
+model FinIndiceMensal {
+  id           String   @id @default(cuid())
+  indice       String   // selic | cdi
+  ano          Int
+  mes          Int      // 1..12
+  taxa         Decimal  @db.Decimal(12, 8) // % a.m. (ex.: 1.10000000 = 1,10% no mês)
+  origem       String   @default("bcb") // bcb | manual (manual não é sobrescrita pelo cron)
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  @@unique([indice, ano, mes])
+}
+
+// Empréstimo: da PSA (corrigido pela Selic por aporte, FIFO) ou bancário (Selic + spread, SAC/Price).
+model FinEmprestimo {
+  id              String   @id @default(cuid())
+  emitenteId      String
+  fonteId         String?
+  tipo            String   // psa | bancario
+  nome            String
+  dataContratacao DateTime
+  valor           Decimal? @db.Decimal(14, 2) // principal contratado (bancário); PSA usa os aportes
+  carenciaMeses   Int      @default(0)
+  spreadAnual     Decimal  @default(6) @db.Decimal(7, 4) // % a.a. sobre a Selic (bancário)
+  numParcelas     Int?     // parcelas de amortização após a carência
+  sistema         String?  // sac | price
+  carenciaModo    String?  // juros_pagos | capitalizados
+  iof             Decimal? @db.Decimal(14, 2)
+  tarifas         Decimal? @db.Decimal(14, 2)
+  ativo           Boolean  @default(true)
+  obs             String?
+  criadoPorId     String?
+  criadoEm        DateTime @default(now())
+  atualizadoEm    DateTime @updatedAt
+
+  emitente EmpresaEmitente    @relation(fields: [emitenteId], references: [id])
+  fonte    FinFonte?          @relation(fields: [fonteId], references: [id], onDelete: SetNull)
+  movs     FinEmprestimoMov[]
+
+  @@index([emitenteId, tipo])
+}
+
+model FinEmprestimoMov {
+  id           String   @id @default(cuid())
+  emprestimoId String
+  // saldo_inicial | aporte | amortizacao | devolucao | pagamento_juros | pagamento_parcela
+  tipo         String
+  data         DateTime
+  valor        Decimal  @db.Decimal(14, 2) // sempre positivo; o tipo dá o sinal
+  previsto     Boolean  @default(false)    // aporte futuro da PSA (só entra na projeção)
+  obs          String?
+  criadoPorId  String?
+  criadoEm     DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  emprestimo FinEmprestimo @relation(fields: [emprestimoId], references: [id], onDelete: Cascade)
+
+  @@index([emprestimoId, data])
+}
+
+// Aplicação financeira (CDB/fundo) remunerada pela Selic ou % do CDI.
+model FinAplicacao {
+  id                  String   @id @default(cuid())
+  emitenteId          String
+  nome                String
+  produto             String?  // CDB, LCI, fundo DI…
+  indexador           String   @default("cdi") // selic | cdi
+  percentualIndexador Decimal  @default(100) @db.Decimal(7, 2) // % do indexador (ex.: 102 = 102% do CDI)
+  ativo               Boolean  @default(true)
+  obs                 String?
+  criadoEm            DateTime @default(now())
+  atualizadoEm        DateTime @updatedAt
+
+  emitente EmpresaEmitente   @relation(fields: [emitenteId], references: [id])
+  movs     FinAplicacaoMov[]
+
+  @@index([emitenteId, ativo])
+}
+
+model FinAplicacaoMov {
+  id          String   @id @default(cuid())
+  aplicacaoId String
+  tipo        String   // aplicacao | resgate | rendimento | ir
+  data        DateTime
+  valor       Decimal  @db.Decimal(14, 2) // sempre positivo; o tipo dá o sinal
+  fonteId     String?  // obrigatório no resgate (fonte que recebe o dinheiro)
+  obs         String?
+  criadoPorId String?
+  criadoEm    DateTime @default(now())
+  atualizadoEm DateTime @updatedAt
+
+  aplicacao FinAplicacao @relation(fields: [aplicacaoId], references: [id], onDelete: Cascade)
+  fonte     FinFonte?    @relation(fields: [fonteId], references: [id], onDelete: SetNull)
+
+  @@index([aplicacaoId, data])
+  @@index([fonteId])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Funil de acordos — registro paralelo ao CrmDeal (não mexe em stage/prazos)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Uma tentativa de acordo. Um deal pode ter vários (histórico), no máximo um em aberto.
+model Acordo {
+  id                    String    @id @default(cuid())
+  dealId                String
+  emitenteId            String?
+  tipo                  String    // previo | posterior
+  // em_negociacao | firmado | aguardando_homologacao | homologado | sem_acordo
+  status                String    @default("em_negociacao")
+  motivo                String?   // por que tentar o acordo (texto livre)
+  // previo | pos_contestacao | pos_replica | pos_pericia | pos_sentenca | recursal | execucao
+  faseOrigem            String?
+  responsavelId         String?
+  contatoEmpresaNome    String?
+  contatoEmpresaPapel   String?   // preposto | advogado
+  contatoEmpresaFone    String?
+  estimativaCondenacao  Decimal?  @db.Decimal(14, 2)
+  valorMinimoAutorizado Decimal?  @db.Decimal(14, 2) // piso autorizado pelo cliente
+  autorizacaoRegistro   String?   // como/quando o cliente autorizou
+  autorizacaoAnexoPath  String?
+  autorizacaoAnexoNome  String?
+  proximoFollowupEm     DateTime?
+  motivoSaida           String?   // empresa_recusou | abaixo_minimo | cliente_recusou | sem_resposta
+  obsSaida              String?
+  valorAcordo           Decimal?  @db.Decimal(14, 2)
+  percHonorarios        Decimal?  @db.Decimal(5, 2) // % contratual sobre cada parcela
+  multaInadimplemento   Decimal?  @db.Decimal(14, 2) // % ou R$, conforme multaTipo
+  multaTipo             String?   // percentual | valor
+  enviadoExecucaoEm     DateTime?
+  firmadoEm             DateTime?
+  homologadoEm          DateTime?
+  encerradoEm           DateTime?
+  criadoPorId           String?
+  criadoEm              DateTime  @default(now())
+  atualizadoEm          DateTime  @updatedAt
+
+  deal         CrmDeal           @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  emitente     EmpresaEmitente?  @relation(fields: [emitenteId], references: [id])
+  rodadas      AcordoRodada[]
+  recebimentos FinRecebimento[]
+  avaliacoes   AcordoAvaliacao[]
+
+  @@index([dealId])
+  @@index([emitenteId, status])
+  @@index([status, proximoFollowupEm])
+}
+
+// Proposta/contraproposta de uma negociação.
+model AcordoRodada {
+  id          String   @id @default(cuid())
+  acordoId    String
+  data        DateTime
+  autor       String   // escritorio | empresa
+  valor       Decimal? @db.Decimal(14, 2)
+  obs         String?
+  criadoPorId String?
+  criadoEm    DateTime @default(now())
+
+  acordo Acordo @relation(fields: [acordoId], references: [id], onDelete: Cascade)
+
+  @@index([acordoId, data])
+}
+
+// Tarefa de avaliação prévia de acordo (§2.1), criada quando o deal é ajuizado. 1 por deal.
+model AcordoAvaliacao {
+  id            String    @id @default(cuid())
+  dealId        String    @unique
+  responsavelId String?
+  prazoEm       DateTime?
+  decisao       String?   // tentar | nao_tentar (null = pendente)
+  justificativa String?
+  decididoEm    DateTime?
+  decididoPorId String?
+  acordoId      String?   // acordo aberto a partir da decisão "tentar"
+  criadoEm      DateTime  @default(now())
+  atualizadoEm  DateTime  @updatedAt
+
+  deal   CrmDeal @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  acordo Acordo? @relation(fields: [acordoId], references: [id], onDelete: SetNull)
+
+  @@index([decisao, prazoEm])
+  @@index([responsavelId])
+}
+
+// Recebimento: parcela de acordo (acordoId + parcelaNumero) ou valor avulso de execução/sentença.
+// Receita do escritório = valorHonorarios + valorSucumbencia; valorRepasse é de terceiro (cliente).
+// Status derivado (não gravado): recebida (tem dataRecebimento) | em_atraso (vencida) | prevista.
+model FinRecebimento {
+  id                      String    @id @default(cuid())
+  emitenteId              String
+  dealId                  String?
+  acordoId                String?
+  parcelaNumero           Int?      // 0 = entrada; 1..N parcelas
+  tipo                    String    // acordo | execucao
+  descricao               String?
+  vencimento              DateTime?
+  valorPrevisto           Decimal?  @db.Decimal(14, 2)
+  dataRecebimento         DateTime?
+  valorBruto              Decimal?  @db.Decimal(14, 2) // efetivamente recebido (sem sucumbência)
+  percHonorarios          Decimal?  @db.Decimal(5, 2)
+  valorHonorarios         Decimal?  @db.Decimal(14, 2)
+  valorSucumbencia        Decimal   @default(0) @db.Decimal(14, 2) // 100% do escritório, sem repasse
+  valorRepasse            Decimal?  @db.Decimal(14, 2)
+  comprovantePath         String?
+  comprovanteNome         String?
+  repasseStatus           String    @default("pendente") // pendente | realizado | nao_aplicavel
+  repasseData             DateTime?
+  repasseComprovantePath  String?
+  repasseComprovanteNome  String?
+  nfStatus                String    @default("a_emitir") // a_emitir | emitida | nao_aplicavel
+  nfValor                 Decimal?  @db.Decimal(14, 2)
+  nfNumero                String?
+  nfData                  DateTime?
+  nfAnexoPath             String?
+  nfAnexoNome             String?
+  notaFiscalId            String?   // NotaFiscal emitida pelo Avoce (sem FK: pode ser NF externa)
+  obs                     String?
+  criadoPorId             String?
+  criadoEm                DateTime  @default(now())
+  atualizadoEm            DateTime  @updatedAt
+
+  emitente EmpresaEmitente @relation(fields: [emitenteId], references: [id])
+  deal     CrmDeal?        @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  acordo   Acordo?         @relation(fields: [acordoId], references: [id], onDelete: SetNull)
+
+  @@unique([acordoId, parcelaNumero])
+  @@index([emitenteId, vencimento])
+  @@index([emitenteId, dataRecebimento])
+  @@index([dealId])
+  @@index([repasseStatus])
+  @@index([nfStatus])
+}
+
+// Trilha de auditoria das mutações do financeiro gerencial e dos acordos.
+model FinAuditLog {
+  id         String   @id @default(cuid())
+  emitenteId String?
+  entidade   String   // nome do modelo (ex.: Lancamento, FinEmprestimoMov, Acordo)
+  entidadeId String
+  acao       String   // criar | atualizar | excluir
+  usuarioId  String?
+  antes      Json?
+  depois     Json?
+  criadoEm   DateTime @default(now())
+
+  @@index([emitenteId, criadoEm])
+  @@index([entidade, entidadeId])
 }

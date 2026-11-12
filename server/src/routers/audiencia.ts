@@ -11,6 +11,7 @@ import {
   type DadosAudiencia, type Modalidade, type TipoAudiencia,
 } from "../services/audiencia.js";
 import { enviarTextoParaDeal, remetenteDoDeal } from "../services/whatsapp-deal.js";
+import { recalcularPrazoAvaliacao } from "../lib/fin/acordo-avaliacao.js";
 
 const INCLUDE_DEAL = {
   contato: true,
@@ -98,7 +99,7 @@ export const audienciaRouter = router({
       // Trocar a data reabre o aviso: a designação anterior já não vale.
       const mudouData = em?.getTime() !== deal.audienciaEm?.getTime();
 
-      return prisma.crmDeal.update({
+      const salvo = await prisma.crmDeal.update({
         where: { id: input.dealId },
         data: {
           audienciaEm:         em,
@@ -112,6 +113,9 @@ export const audienciaRouter = router({
           audienciaLocal: true, audienciaAvisadaEm: true, audienciaLembreteEm: true,
         },
       });
+      // Funil de acordos (§2.1): prazo da avaliação prévia = audiência − 5 dias (se ainda sem decisão). Nunca lança.
+      if (mudouData) void recalcularPrazoAvaliacao(input.dealId);
+      return salvo;
     }),
 
   /**

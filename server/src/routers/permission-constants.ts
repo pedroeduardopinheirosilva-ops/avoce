@@ -13,6 +13,8 @@ export const MODULOS = [
   "notas",
   "cobrancas",
   "financeiro",
+  "financeiro_editar", // mutações do financeiro gerencial (fin.*) — ver lib/fin/perm.ts
+  "acordos",           // funil de acordos
   "empresas",
   "tomadores",
   "config_ia",

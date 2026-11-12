@@ -835,6 +835,16 @@ export function iniciarCron(): void {
     }
   }, { timezone: "America/Sao_Paulo" });
 
+  // Seg–sex 08:40 — alertas de recebimentos/acordos (só projetos com o evento `alertas_acordos` ativo; 1×/dia)
+  cron.schedule("40 8 * * 1-5", async () => {
+    try {
+      const { enviarResumoAlertasAcordos } = await import("./lib/fin/alertas-acordos.js");
+      await enviarResumoAlertasAcordos();
+    } catch (err) {
+      console.error("[AlertasAcordos] Erro crítico:", err);
+    }
+  }, { timezone: "America/Sao_Paulo" });
+
   // A cada 30 min — reprocessa e-mails de cobrança pendentes/falhos (auto-cura)
   cron.schedule("*/30 * * * *", async () => {
     try {
@@ -985,6 +995,17 @@ export function iniciarCron(): void {
       console.error("[CRON-Cleanup] Erro:", e);
     }
   });
+
+  // ── Financeiro gerencial — Selic/CDI do BCB (diário às 06:15; manuais preservados; erro de rede só loga) ──
+  cron.schedule("15 6 * * *", async () => {
+    try {
+      const { cronImportarIndices } = await import("./lib/fin/indices-sync.js");
+      await cronImportarIndices();
+      recordCronRun("finImportarIndices");
+    } catch (e) {
+      console.error("[FinIndices] Erro no cron:", e);
+    }
+  }, { timezone: "America/Sao_Paulo" });
 
   // ── Fotos de perfil do WhatsApp — renova contatos ativos (diário às 04:30) ──
   cron.schedule("30 4 * * *", async () => {
