@@ -667,6 +667,17 @@ app.post("/api/produtividade/ingest", { bodyLimit: 10 * 1024 * 1024 }, async (re
   }
 });
 
+// Download dos binários/instaladores do coletor (público; só nomes da lista)
+app.get("/api/produtividade/coletor/:arquivo", async (req, reply) => {
+  const { arquivo } = req.params as { arquivo: string };
+  const { caminhoColetor } = await import("./lib/produtividade/coletor-dist.js");
+  const caminho = caminhoColetor(arquivo);
+  if (!caminho || !existsSync(caminho)) return reply.status(404).send({ error: "nao_encontrado" });
+  const tipo = arquivo.endsWith(".sh") || arquivo.endsWith(".ps1") ? "text/plain; charset=utf-8" : "application/octet-stream";
+  reply.header("Content-Type", tipo).header("Cache-Control", "no-cache");
+  return reply.send(createReadStream(caminho));
+});
+
 // ── Aceite público de proposta (sem auth) ─────────────────────────────────────
 
 app.get("/api/proposta/:token", async (req, reply) => {
