@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -63,5 +64,14 @@ func TestParear(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestRegistrarNoLogAnexaAoColetorLog(t *testing.T) {
+	dir := t.TempDir()
+	registrarNoLog(dir, "erro no pareamento: %v", "código inválido")
+	b, err := os.ReadFile(filepath.Join(dir, "coletor.log"))
+	if err != nil || !strings.Contains(string(b), "erro no pareamento: código inválido") {
+		t.Errorf("log: %q (%v)", b, err)
 	}
 }

@@ -65,16 +65,24 @@ try {
   Invoke-WebRequest -Uri "$AvoceUrl/api/produtividade/coletor/coletor-windows.exe" -OutFile $novo -UseBasicParsing
   Move-Item -Path $novo -Destination $exe -Force
 
-  # O coletor é um app sem console (windowsgui): confere só o código de saída.
+  # O coletor é um app sem console (windowsgui): o stderr é capturado num arquivo temporário
+  # e o erro também é anotado em coletor.log.
+  $errPar = Join-Path $env:TEMP 'avoce-coletor-parear.err'
+  Remove-Item -Path $errPar -Force -ErrorAction SilentlyContinue
   $p = Start-Process -FilePath $exe -ArgumentList @('parear', '--url', $AvoceUrl, '--codigo', $Codigo, '--nome', $NomePc) `
-        -Wait -PassThru -WindowStyle Hidden
+        -Wait -PassThru -WindowStyle Hidden -RedirectStandardError $errPar
   if ($p.ExitCode -ne 0) {
     Write-Host ''
     Write-Host 'Não foi possível parear este computador. O código pode ter expirado ou já ter sido usado.' -ForegroundColor Red
     Write-Host 'Gere um novo código no painel do Avoce (Produtividade > Dispositivos) e rode o comando de novo.' -ForegroundColor Red
-    Write-Host "Detalhes, se houver, em: $LogColetor"
+    if (Test-Path $errPar) {
+      $detalhe = (Get-Content -Path $errPar -Raw -ErrorAction SilentlyContinue)
+      if ($detalhe) { Write-Host "Detalhe: $($detalhe.Trim())" -ForegroundColor Red }
+    }
+    Write-Host "Registro em: $LogColetor"
     exit 1
   }
+  Remove-Item -Path $errPar -Force -ErrorAction SilentlyContinue
 
   Novo-Atalho (Join-Path $Inicializar 'Avoce Coletor.lnk') $exe 'run' $DirColetor
   Start-Process -FilePath $exe -ArgumentList 'run' -WorkingDirectory $DirColetor -WindowStyle Hidden

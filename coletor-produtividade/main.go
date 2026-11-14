@@ -29,6 +29,17 @@ func falhar(msg string, a ...any) {
 	os.Exit(1)
 }
 
+// registrarNoLog anexa a mensagem ao coletor.log (o mesmo do `run`). No Windows o exe
+// é -H=windowsgui e o stderr se perde; o instalador aponta para esse arquivo.
+func registrarNoLog(dir, msg string, a ...any) {
+	lg, f, err := abrirLog(dir)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	lg.Printf(msg, a...)
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		falhar("uso: coletor parear|run|versao")
@@ -51,6 +62,7 @@ func main() {
 		}
 		h := &http.Client{Timeout: 30 * time.Second}
 		if err := parear(h, dir, *url, *codigo, *nome, nomeSO()); err != nil {
+			registrarNoLog(dir, "erro no pareamento: %v", err)
 			falhar("erro no pareamento: %v", err)
 		}
 		fmt.Println("Computador pareado com sucesso.")
