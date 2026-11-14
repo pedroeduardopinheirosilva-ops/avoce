@@ -35,6 +35,6 @@ export type ResultadoDia = {
   fora: Totais;
   primeiroEvento: Date | null;
   ultimoEvento: Date | null;
-  top: Record<Categoria, { chave: string; seg: number }[]>;
+  top: Record<Categoria, { chave: string; seg: number; tipo: "dominio" | "app" }[]>;
   blocos: { inicio: Date; fim: Date; categoria: Categoria | "pausa"; chave: string; titulos: string[] }[];
 };

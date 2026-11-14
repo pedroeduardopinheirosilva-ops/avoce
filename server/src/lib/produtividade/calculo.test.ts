@@ -65,6 +65,14 @@ describe("calcularDia", () => {
     expect(r.dentro.ativo + r.fora.ativo).toBe(1800);
   });
 
+  it("top marca tipo app para janela sem domínio", () => {
+    const r = calcularDia("2026-11-13", [
+      ev("afk", "09:00", 600, { afk: false }),
+      ev("janela", "09:00", 600, { app: "WINWORD.EXE", titulo: "Doc" }),
+    ], [], pessoa);
+    expect(r.top.neutro[0]).toMatchObject({ chave: "WINWORD.EXE", tipo: "app" });
+  });
+
   it("top e blocos", () => {
     const r = calcularDia("2026-11-13", [
       ev("afk", "09:00", 600, { afk: false }),
@@ -73,7 +81,7 @@ describe("calcularDia", () => {
       ev("janela", "09:00", 1800, { app: "chrome.exe", titulo: "Vídeo" }),
       ev("web", "09:00", 1800, { dominio: "youtube.com", titulo: "Vídeo" }),
     ], [regra("dominio", "youtube.com", "pessoal")], pessoa);
-    expect(r.top.pessoal[0]).toMatchObject({ chave: "youtube.com" });
+    expect(r.top.pessoal[0]).toMatchObject({ chave: "youtube.com", tipo: "dominio" });
     const cats = r.blocos.map((b) => b.categoria);
     expect(cats).toContain("pausa");
     const i = cats.indexOf("pausa");

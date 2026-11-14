@@ -54,9 +54,8 @@ export default function Regras() {
     cargoId: escopo === "cargo" ? cargoSel || null : null,
     usuarioId: escopo === "pessoa" ? pessoaSel || null : null,
   });
-  const neutroPara = (chave: string, categoria: Cat) => {
-    // Chave tem a forma "dominio" ou "app"; heurística: contém ponto = domínio.
-    criar.mutate({ alvo: chave.includes(".") && !chave.includes(" ") ? "dominio" : "app", padrao: chave, categoria, cargoId: escopo === "cargo" && cargoSel ? cargoSel : null, usuarioId: null, prioridade: 0 });
+  const neutroPara = (chave: string, tipo: "app" | "dominio", categoria: Cat) => {
+    criar.mutate({ alvo: tipo, padrao: chave, categoria, cargoId: escopo === "cargo" && cargoSel ? cargoSel : null, usuarioId: null, prioridade: 0 });
   };
 
   return (
@@ -151,11 +150,11 @@ export default function Regras() {
             <p className="text-xs text-gray-500 mb-2">Últimos 30 dias. Cria regra {escopo === "cargo" && cargoSel ? "do cargo selecionado" : "geral"}.</p>
             <ul className="space-y-1">
               {neutrosQ.data?.slice(0, 15).map((n) => (
-                <li key={n.chave} className="flex items-center gap-2 text-sm">
+                <li key={`${n.tipo}:${n.chave}`} className="flex items-center gap-2 text-sm">
                   <span className="truncate flex-1" title={n.chave}>{n.chave}</span>
                   <span className="text-xs text-gray-500">{fmtDur(n.seg)}</span>
-                  <button className={btn} onClick={() => neutroPara(n.chave, "trabalho")} disabled={criar.isPending}>→ trabalho</button>
-                  <button className={btn} onClick={() => neutroPara(n.chave, "pessoal")} disabled={criar.isPending}>→ pessoal</button>
+                  <button className={btn} onClick={() => neutroPara(n.chave, n.tipo, "trabalho")} disabled={criar.isPending}>→ trabalho</button>
+                  <button className={btn} onClick={() => neutroPara(n.chave, n.tipo, "pessoal")} disabled={criar.isPending}>→ pessoal</button>
                 </li>
               ))}
               {neutrosQ.data?.length === 0 && <li className="text-xs text-gray-400">Nada neutro registrado.</li>}

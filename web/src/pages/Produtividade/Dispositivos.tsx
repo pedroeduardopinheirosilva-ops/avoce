@@ -29,7 +29,7 @@ export default function Dispositivos() {
   const u = trpc.useUtils();
   const pessoasQ = trpc.produtividade.pessoas.listar.useQuery(undefined, { refetchInterval: 60_000 });
   const cargosQ = trpc.produtividade.cargos.listar.useQuery();
-  const usuariosQ = trpc.auth.listUsuarios.useQuery();
+  const candidatosQ = trpc.produtividade.pessoas.candidatos.useQuery();
   const [erro, setErro] = useState("");
   const [editExp, setEditExp] = useState<{ id: string; exp: Exp } | null>(null);
   const [novoNome, setNovoNome] = useState("");
@@ -37,7 +37,7 @@ export default function Dispositivos() {
   const [instalar, setInstalar] = useState<{ usuarioId: string; so: "mac" | "windows" } | null>(null);
   const [gerado, setGerado] = useState<{ usuarioId: string; comando: string; expiraEm: Date | string; copiado: boolean } | null>(null);
 
-  const refrescar = () => u.produtividade.pessoas.listar.invalidate();
+  const refrescar = () => { u.produtividade.pessoas.listar.invalidate(); u.produtividade.pessoas.candidatos.invalidate(); };
   const onError = (e: { message: string }) => setErro(e.message);
   const atualizar = trpc.produtividade.pessoas.atualizar.useMutation({ onSuccess: () => { refrescar(); setEditExp(null); setMarcar(""); setErro(""); }, onError });
   const criarPessoa = trpc.produtividade.pessoas.criarSoMonitorado.useMutation({ onSuccess: () => { refrescar(); setNovoNome(""); setErro(""); }, onError });
@@ -45,7 +45,7 @@ export default function Dispositivos() {
   const gerarCodigo = trpc.produtividade.dispositivos.gerarCodigo.useMutation({ onError });
 
   const pessoas = pessoasQ.data ?? [];
-  const candidatos = (usuariosQ.data ?? []).filter((x: { id: string }) => !pessoas.some((p) => p.id === x.id));
+  const candidatos = candidatosQ.data ?? [];
 
   const instalarPara = async (usuarioId: string, nome: string, so: "mac" | "windows") => {
     setErro("");
@@ -177,7 +177,7 @@ export default function Dispositivos() {
           <div className="flex gap-1">
             <select className={`${input} flex-1`} value={marcar} onChange={(e) => setMarcar(e.target.value)}>
               <option value="">Escolha um usuário...</option>
-              {candidatos.map((x: { id: string; nome: string }) => <option key={x.id} value={x.id}>{x.nome}</option>)}
+              {candidatos.map((x) => <option key={x.id} value={x.id}>{x.nome}</option>)}
             </select>
             <button className={btnPrimario} style={estiloPrimario} disabled={!marcar || atualizar.isPending} onClick={() => atualizar.mutate({ usuarioId: marcar, monitorado: true })}>Marcar</button>
           </div>

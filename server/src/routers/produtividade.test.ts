@@ -7,6 +7,8 @@ const st = vi.hoisted(() => ({
   criado: null as any,
   dispCriado: null as any,
   monitorados: [] as any[],
+  dias: [] as any[],
+  findManyArgs: null as any,
 }));
 
 vi.mock("../db.js", () => ({
@@ -14,11 +16,11 @@ vi.mock("../db.js", () => ({
     usuario: {
       findUnique: async ({ select }: any) =>
         select?.verProdutividade ? { verProdutividade: st.verProdutividade } : { permissoes: null },
-      findMany: async () => st.monitorados,
+      findMany: async (a: any) => { st.findManyArgs = a; return st.monitorados; },
       create: async (a: any) => { st.criado = a; return { id: "novo", nome: a.data.nome }; },
       update: async () => ({}),
     },
-    monitorDia: { findMany: async () => [] },
+    monitorDia: { findMany: async () => st.dias },
     monitorDispositivo: {
       create: async (a: any) => { st.dispCriado = a; return { id: "d1", ...a.data }; },
       update: async () => ({}),
@@ -45,7 +47,7 @@ function caller(role = "user") {
 }
 
 beforeEach(() => {
-  st.verProdutividade = true; st.cargoUsuarios = 0; st.criado = null; st.dispCriado = null; st.monitorados = [];
+  st.verProdutividade = true; st.cargoUsuarios = 0; st.criado = null; st.dispCriado = null; st.monitorados = []; st.dias = []; st.findManyArgs = null;
   (prisma.usuario as any).count = async () => st.cargoUsuarios;
 });
 
@@ -61,6 +63,27 @@ describe("produtividade router", () => {
     expect(r).toHaveLength(1);
     expect(r[0]).toMatchObject({ usuarioId: "p1", nome: "Ana", cargo: "Adv", coletorParadoHa: null });
     expect(r[0].soma.dentro.trabalho).toBe(0);
+  });
+
+  it("candidatos: só ativos não monitorados, sem filtro de empresa", async () => {
+    st.monitorados = [{ id: "u9", nome: "Zé", email: "z@x.com" }];
+    const r = await caller().pessoas.candidatos();
+    expect(r).toEqual(st.monitorados);
+    expect(st.findManyArgs.where).toEqual({ ativo: true, monitorado: false });
+  });
+
+  it("neutrosMaisUsados devolve tipo, com fallback para linhas antigas", async () => {
+    st.dias = [
+      { topJson: { neutro: [{ chave: "chrome.exe", seg: 10 }, { chave: "site.com", seg: 5 }, { chave: "Code", seg: 3 }, { chave: "x.com", seg: 2, tipo: "app" }] } },
+      { topJson: { neutro: [{ chave: "chrome.exe", seg: 5, tipo: "app" }] } },
+    ];
+    const r = await caller().neutrosMaisUsados({ de: "2026-11-01", ate: "2026-11-30" });
+    expect(r).toEqual([
+      { tipo: "app", chave: "chrome.exe", seg: 15 },
+      { tipo: "dominio", chave: "site.com", seg: 5 },
+      { tipo: "app", chave: "Code", seg: 3 },
+      { tipo: "app", chave: "x.com", seg: 2 },
+    ]);
   });
 
   it("criarSoMonitorado cria usuário sem nenhum módulo", async () => {

@@ -109,6 +109,14 @@ const pessoasRouter = router({
     }));
   }),
 
+  candidatos: produtividadeProc.query(() =>
+    prisma.usuario.findMany({
+      where: { ativo: true, monitorado: false },
+      orderBy: { nome: "asc" },
+      select: { id: true, nome: true, email: true },
+    }),
+  ),
+
   criarSoMonitorado: produtividadeProc.input(z.object({ nome: z.string().trim().min(1).max(200) })).mutation(async ({ input }) => {
     const senha = await bcrypt.hash(randomBytes(32).toString("hex"), 10);
     const u = await prisma.usuario.create({
@@ -215,10 +223,18 @@ export const produtividadeRouter = router({
     });
     const soma = new Map<string, number>();
     for (const d of dias) {
-      const lista = (d.topJson as { neutro?: { chave: string; seg: number }[] } | null)?.neutro ?? [];
-      for (const it of lista) soma.set(it.chave, (soma.get(it.chave) ?? 0) + it.seg);
+      const lista = (d.topJson as { neutro?: { chave: string; seg: number; tipo?: "dominio" | "app" }[] } | null)?.neutro ?? [];
+      for (const it of lista) {
+        // linhas antigas não têm `tipo`: .exe ou sem ponto = app, senão domínio
+        const tipo = it.tipo ?? (/\.exe$/i.test(it.chave) || !it.chave.includes(".") ? "app" : "dominio");
+        const k = `${tipo}:${it.chave}`;
+        soma.set(k, (soma.get(k) ?? 0) + it.seg);
+      }
     }
-    return [...soma.entries()].map(([chave, seg]) => ({ chave, seg })).sort((a, b) => b.seg - a.seg).slice(0, 30);
+    return [...soma.entries()]
+      .map(([k, seg]) => ({ tipo: (k.startsWith("app:") ? "app" : "dominio") as "app" | "dominio", chave: k.slice(k.indexOf(":") + 1), seg }))
+      .sort((a, b) => b.seg - a.seg)
+      .slice(0, 30);
   }),
 
   regras: regrasRouter,

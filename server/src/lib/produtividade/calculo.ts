@@ -123,7 +123,7 @@ export function calcularDia(
   };
   const dentro = zero();
   const fora = zero();
-  const topMap: Record<Categoria, Map<string, number>> = { trabalho: new Map(), pessoal: new Map(), neutro: new Map() };
+  const topMap: Record<Categoria, Map<string, { seg: number; tipo: "dominio" | "app" }>> = { trabalho: new Map(), pessoal: new Map(), neutro: new Map() };
   const catPos: (Categoria | "pausa")[] = new Array(DIA_SEG);
   const itemPos = new Int32Array(DIA_SEG).fill(-1);
   let primeiro = -1;
@@ -144,12 +144,17 @@ export function calcularDia(
     t[c]++;
     const it = itens[i]!;
     const chave = it.dominio || it.app;
-    if (chave) topMap[c].set(chave, (topMap[c].get(chave) ?? 0) + 1);
+    if (chave) {
+      const k = `${it.dominio ? "d" : "a"}:${chave}`;
+      const e = topMap[c].get(k) ?? { seg: 0, tipo: it.dominio ? "dominio" as const : "app" as const };
+      e.seg++;
+      topMap[c].set(k, e);
+    }
   }
   const top = {} as ResultadoDia["top"];
   for (const c of ["trabalho", "pessoal", "neutro"] as const) {
     top[c] = [...topMap[c].entries()]
-      .map(([chave, seg]) => ({ chave, seg }))
+      .map(([k, v]) => ({ chave: k.slice(2), seg: v.seg, tipo: v.tipo }))
       .sort((a, b) => b.seg - a.seg || a.chave.localeCompare(b.chave))
       .slice(0, 10);
   }
