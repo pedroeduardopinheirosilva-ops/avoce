@@ -18,13 +18,8 @@ export default function Pessoa({ usuarioId, setUsuarioId, dia, setDia }: {
   const pessoas = trpc.produtividade.pessoas.listar.useQuery();
   const q = trpc.produtividade.pessoa.useQuery({ usuarioId: usuarioId ?? "", data: dia }, { enabled: !!usuarioId });
 
-  const dados = q.data as undefined | {
-    blocos?: Bloco[];
-    top?: Record<Cat, { chave: string; seg: number }[]>;
-    primeiroEvento?: Date | string | null;
-    ultimoEvento?: Date | string | null;
-  };
-  const blocos = dados?.blocos ?? [];
+  const dados = q.data;
+  const blocos: Bloco[] = dados?.blocos ?? [];
   const pessoa = pessoas.data?.find((p) => p.id === usuarioId);
   const exp = pessoa?.expediente as { dias: number[]; inicio: string; fim: string } | null | undefined;
   const expPadrao = exp ?? { dias: [1, 2, 3, 4, 5], inicio: "08:00", fim: "18:00" };
@@ -110,10 +105,10 @@ export default function Pessoa({ usuarioId, setUsuarioId, dia, setDia }: {
                   <i className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: COR_CAT[cat] }} />Top 10 · {titulo}
                 </h3>
                 <ol className="text-sm space-y-1">
-                  {(dados.top?.[cat] ?? []).slice(0, 10).map((it) => (
+                  {dados.top[cat].slice(0, 10).map((it) => (
                     <li key={it.chave} className="flex justify-between gap-2"><span className="truncate" title={it.chave}>{it.chave}</span><span className="text-gray-500 shrink-0">{fmtDur(it.seg)}</span></li>
                   ))}
-                  {!(dados.top?.[cat]?.length) && <li className="text-xs text-gray-400">Nada registrado</li>}
+                  {dados.top[cat].length === 0 && <li className="text-xs text-gray-400">Nada registrado</li>}
                 </ol>
               </div>
             ))}

@@ -39,7 +39,14 @@ export default function Dispositivos() {
 
   const refrescar = () => { u.produtividade.pessoas.listar.invalidate(); u.produtividade.pessoas.candidatos.invalidate(); };
   const onError = (e: { message: string }) => setErro(e.message);
-  const atualizar = trpc.produtividade.pessoas.atualizar.useMutation({ onSuccess: () => { refrescar(); setEditExp(null); setMarcar(""); setErro(""); }, onError });
+  // Cargo/expediente/monitorado mudam os números: refaz também Equipe, Pessoa e neutros.
+  const atualizar = trpc.produtividade.pessoas.atualizar.useMutation({
+    onSuccess: () => {
+      refrescar(); setEditExp(null); setMarcar(""); setErro("");
+      u.produtividade.equipe.invalidate(); u.produtividade.pessoa.invalidate(); u.produtividade.neutrosMaisUsados.invalidate();
+    },
+    onError,
+  });
   const criarPessoa = trpc.produtividade.pessoas.criarSoMonitorado.useMutation({ onSuccess: () => { refrescar(); setNovoNome(""); setErro(""); }, onError });
   const revogar = trpc.produtividade.dispositivos.revogar.useMutation({ onSuccess: refrescar, onError });
   const gerarCodigo = trpc.produtividade.dispositivos.gerarCodigo.useMutation({ onError });
@@ -77,7 +84,7 @@ export default function Dispositivos() {
                 <option value="">Sem cargo</option>
                 {cargosQ.data?.map((c) => <option key={c.id} value={c.id}>{c.nome}</option>)}
               </select>
-              <button className={`${btn} ml-auto`} onClick={() => { if (confirm(`Parar de monitorar ${p.nome}?`)) atualizar.mutate({ usuarioId: p.id, monitorado: false }); }}>Desmarcar monitorado</button>
+              <button className={`${btn} ml-auto`} onClick={() => { if (confirm(`Parar de monitorar ${p.nome}?\n\nTodos os dispositivos dessa pessoa serão revogados. Para voltar a monitorar, será preciso reinstalar o coletor em cada computador.`)) atualizar.mutate({ usuarioId: p.id, monitorado: false }); }}>Desmarcar monitorado</button>
             </div>
 
             <div className="text-sm">
@@ -156,6 +163,11 @@ export default function Dispositivos() {
                   <Copy size={12} /> {gerado.copiado ? "Comando copiado." : "Não foi possível copiar automaticamente; copie abaixo."} Cole no terminal (Mac) ou PowerShell (Windows) do computador da pessoa. Válido até {fmtDataHora(gerado.expiraEm)} (24 h).
                 </p>
                 <code className="block text-xs font-mono break-all select-all">{gerado.comando}</code>
+                {window.location.protocol !== "https:" && (
+                  <p className="text-xs font-medium" style={{ color: "var(--avoce-warn)" }}>
+                    Atenção: o comando usa {window.location.origin}. Abra o Avoce pelo endereço público (https) para gerar o comando.
+                  </p>
+                )}
               </div>
             )}
           </div>

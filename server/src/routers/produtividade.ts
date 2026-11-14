@@ -5,15 +5,15 @@ import bcrypt            from "bcryptjs";
 import { randomBytes }   from "node:crypto";
 import { router, authProc } from "./trpc.js";
 import { prisma }        from "../db.js";
-import { calcularDia, dataLocal } from "../lib/produtividade/calculo.js";
-import { carregarEntradasDia }    from "../lib/produtividade/agregar.js";
+import { calcularDia } from "../lib/produtividade/calculo.js";
+import { carregarEntradasDia, sujarDias } from "../lib/produtividade/agregar.js";
 import { gerarCodigoPareamento }  from "../lib/produtividade/ingest.js";
 import { REGRAS_INICIAIS }        from "../lib/produtividade/regras-iniciais.js";
+import { limiteRetencao }         from "../lib/produtividade/retencao.js";
 import type { ResultadoDia, Totais } from "../lib/produtividade/tipos.js";
 
 const HORA_MS = 3600_000;
 const DIA_MS = 24 * HORA_MS;
-const RETENCAO_DIAS = 90;
 
 /** Painel visível só para quem tem `verProdutividade`; lido do banco a cada chamada (admin não ignora). */
 export const produtividadeProc = authProc.use(async ({ ctx, next }) => {
@@ -46,21 +46,51 @@ const somar = (a: Totais, b: Totais): Totais => ({
 });
 const zero = (): Totais => ({ ativo: 0, trabalho: 0, pessoal: 0, neutro: 0 });
 
+type LinhaDia = {
+  segAtivo: number; segTrabalho: number; segPessoal: number; segNeutro: number;
+  segAtivoFora: number; segTrabalhoFora: number; segPessoalFora: number; segNeutroFora: number;
+  primeiroEvento: Date | null; ultimoEvento: Date | null; topJson: Prisma.JsonValue | null;
+};
+
+/** MonitorDia → formato de ResultadoDia (top vem de topJson; sem blocos). */
+function diaParaResultado(data: string, dia: LinhaDia | null): ResultadoDia {
+  const top = (dia?.topJson ?? {}) as Partial<ResultadoDia["top"]>;
+  return {
+    data,
+    dentro: dia ? { ativo: dia.segAtivo, trabalho: dia.segTrabalho, pessoal: dia.segPessoal, neutro: dia.segNeutro } : zero(),
+    fora: dia ? { ativo: dia.segAtivoFora, trabalho: dia.segTrabalhoFora, pessoal: dia.segPessoalFora, neutro: dia.segNeutroFora } : zero(),
+    primeiroEvento: dia?.primeiroEvento ?? null,
+    ultimoEvento: dia?.ultimoEvento ?? null,
+    top: { trabalho: top.trabalho ?? [], pessoal: top.pessoal ?? [], neutro: top.neutro ?? [] },
+    blocos: [],
+  };
+}
+
 const regrasRouter = router({
   listar: produtividadeProc.query(() => prisma.monitorRegra.findMany({ orderBy: [{ categoria: "asc" }, { padrao: "asc" }] })),
-  criar: produtividadeProc.input(z.object(regraBase)).mutation(({ input }) =>
-    prisma.monitorRegra.create({ data: { ...input, cargoId: input.cargoId ?? null, usuarioId: input.usuarioId ?? null } }),
-  ),
-  editar: produtividadeProc.input(z.object({ id: z.string(), ...regraBase })).mutation(({ input }) => {
-    const { id, ...rest } = input;
-    return prisma.monitorRegra.update({ where: { id }, data: { ...rest, cargoId: rest.cargoId ?? null, usuarioId: rest.usuarioId ?? null } });
+  // Toda mudança de regra suja os dias recalculáveis de quem ela afeta (o cron recalcula).
+  criar: produtividadeProc.input(z.object(regraBase)).mutation(async ({ input }) => {
+    const r = await prisma.monitorRegra.create({ data: { ...input, cargoId: input.cargoId ?? null, usuarioId: input.usuarioId ?? null } });
+    await sujarDias(r);
+    return r;
   }),
-  excluir: produtividadeProc.input(z.object({ id: z.string() })).mutation(({ input }) =>
-    prisma.monitorRegra.delete({ where: { id: input.id } }),
-  ),
+  editar: produtividadeProc.input(z.object({ id: z.string(), ...regraBase })).mutation(async ({ input }) => {
+    const { id, ...rest } = input;
+    const antes = await prisma.monitorRegra.findUnique({ where: { id }, select: { cargoId: true, usuarioId: true } });
+    const r = await prisma.monitorRegra.update({ where: { id }, data: { ...rest, cargoId: rest.cargoId ?? null, usuarioId: rest.usuarioId ?? null } });
+    if (antes && (antes.cargoId !== r.cargoId || antes.usuarioId !== r.usuarioId)) await sujarDias(antes);
+    await sujarDias(r);
+    return r;
+  }),
+  excluir: produtividadeProc.input(z.object({ id: z.string() })).mutation(async ({ input }) => {
+    const r = await prisma.monitorRegra.delete({ where: { id: input.id } });
+    await sujarDias(r);
+    return r;
+  }),
   semear: produtividadeProc.mutation(async () => {
     if ((await prisma.monitorRegra.count()) > 0) return { inseridas: 0 };
     const r = await prisma.monitorRegra.createMany({ data: REGRAS_INICIAIS.map((x) => ({ ...x, cargoId: null, usuarioId: null })) });
+    if (r.count > 0) await sujarDias({});
     return { inseridas: r.count };
   }),
 });
@@ -147,6 +177,15 @@ const pessoasRouter = router({
       // Json nullable: limpar (voltar ao padrão) exige Prisma.DbNull
       if (input.expediente !== undefined) data.monitorExpediente = input.expediente ?? Prisma.DbNull;
       await prisma.usuario.update({ where: { id: input.usuarioId }, data });
+      if (input.monitorado === false) {
+        // Parar de monitorar revoga os dispositivos (e códigos pendentes); voltar exige reinstalar o coletor.
+        await prisma.monitorDispositivo.updateMany({
+          where: { usuarioId: input.usuarioId },
+          data: { ativo: false, tokenHash: null, codigoPareamento: null, codigoExpiraEm: null },
+        });
+      }
+      // Cargo muda as regras aplicáveis; expediente muda dentro/fora: recalcular os dias ainda possíveis.
+      if (input.cargoId !== undefined || input.expediente !== undefined) await sujarDias({ usuarioId: input.usuarioId });
       return { ok: true };
     }),
 });
@@ -205,15 +244,14 @@ export const produtividadeRouter = router({
     });
   }),
 
-  pessoa: produtividadeProc.input(z.object({ usuarioId: z.string(), data: dataStr })).query(async ({ input }) => {
-    const limite = dataLocal(new Date(Date.now() - RETENCAO_DIAS * DIA_MS));
-    if (input.data < limite) {
+  pessoa: produtividadeProc.input(z.object({ usuarioId: z.string(), data: dataStr })).query(async ({ input }): Promise<ResultadoDia> => {
+    if (input.data < limiteRetencao()) {
+      // Sem eventos brutos completos: devolve o agregado permanente no mesmo formato, sem linha do tempo.
       const dia = await prisma.monitorDia.findUnique({ where: { usuarioId_data: { usuarioId: input.usuarioId, data: input.data } } });
-      return { ...(dia ?? {}), data: input.data, blocos: [] };
+      return diaParaResultado(input.data, dia);
     }
     const { eventos, regras, pessoa } = await carregarEntradasDia(input.usuarioId, input.data);
-    const r: ResultadoDia = calcularDia(input.data, eventos, regras, pessoa);
-    return r;
+    return calcularDia(input.data, eventos, regras, pessoa);
   }),
 
   neutrosMaisUsados: produtividadeProc.input(z.object({ de: dataStr, ate: dataStr })).query(async ({ input }) => {

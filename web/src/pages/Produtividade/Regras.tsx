@@ -24,11 +24,16 @@ export default function Regras() {
   const [editCargo, setEditCargo] = useState<{ id: string; nome: string } | null>(null);
 
   const refrescar = () => { u.produtividade.regras.listar.invalidate(); u.produtividade.cargos.listar.invalidate(); };
+  // Regra nova muda a classificação: o dia aberto em Pessoa muda já; Equipe/neutros mudam quando o cron recalcular.
+  const refrescarCalculo = () => {
+    refrescar();
+    u.produtividade.neutrosMaisUsados.invalidate(); u.produtividade.equipe.invalidate(); u.produtividade.pessoa.invalidate();
+  };
   const onError = (e: { message: string }) => setErro(e.message);
-  const criar = trpc.produtividade.regras.criar.useMutation({ onSuccess: () => { refrescar(); setForm(null); setErro(""); }, onError });
-  const editar = trpc.produtividade.regras.editar.useMutation({ onSuccess: () => { refrescar(); setForm(null); setErro(""); }, onError });
-  const excluir = trpc.produtividade.regras.excluir.useMutation({ onSuccess: refrescar, onError });
-  const semear = trpc.produtividade.regras.semear.useMutation({ onSuccess: refrescar, onError });
+  const criar = trpc.produtividade.regras.criar.useMutation({ onSuccess: () => { refrescarCalculo(); setForm(null); setErro(""); }, onError });
+  const editar = trpc.produtividade.regras.editar.useMutation({ onSuccess: () => { refrescarCalculo(); setForm(null); setErro(""); }, onError });
+  const excluir = trpc.produtividade.regras.excluir.useMutation({ onSuccess: refrescarCalculo, onError });
+  const semear = trpc.produtividade.regras.semear.useMutation({ onSuccess: refrescarCalculo, onError });
   const criarCargo = trpc.produtividade.cargos.criar.useMutation({ onSuccess: () => { refrescar(); setNovoCargo(""); setErro(""); }, onError });
   const renomearCargo = trpc.produtividade.cargos.renomear.useMutation({ onSuccess: () => { refrescar(); setEditCargo(null); setErro(""); }, onError });
   const excluirCargo = trpc.produtividade.cargos.excluir.useMutation({ onSuccess: () => { refrescar(); setErro(""); }, onError });
