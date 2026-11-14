@@ -949,6 +949,26 @@ export function iniciarCron(): void {
     }
   });
 
+  // ── Monitor de produtividade — recálculo dos dias sujos (a cada 15 min) ──
+  cron.schedule("*/15 * * * *", async () => {
+    try {
+      const { recalcularSujos } = await import("./lib/produtividade/agregar.js");
+      await recalcularSujos();
+    } catch (err) {
+      console.error("[PRODUTIVIDADE] Erro ao recalcular dias:", err);
+    }
+  });
+
+  // ── Monitor de produtividade — retenção de eventos brutos (03:30) ──────
+  cron.schedule("30 3 * * *", async () => {
+    try {
+      const { apagarEventosAntigos } = await import("./lib/produtividade/agregar.js");
+      await apagarEventosAntigos();
+    } catch (err) {
+      console.error("[PRODUTIVIDADE] Erro ao apagar eventos antigos:", err);
+    }
+  });
+
   // ── Marketing Autopilot — verificação de tokens (diariamente às 08:00) ──
   cron.schedule("0 8 * * *", async () => {
     try {
