@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { trpc } from "../lib/trpc";
 import { Outlet, NavLink, useNavigate } from "react-router-dom";
-import { CalendarDays,
+import { Activity,
+  CalendarDays,
   LayoutDashboard,
   BarChart3,
   KanbanSquare,
@@ -124,6 +125,7 @@ const groups: NavGroup[] = [
       { to: "/config-ia",          label: "Config IA",       icon: Bot,    moduloChave: "config_ia" },
       { to: "/assistente-interno", label: "Assistente Int.", icon: Zap,    moduloChave: "assistente_interno" },
       { to: "/usuarios",           label: "Usuários",        icon: User,   moduloChave: "usuarios" },
+      { to: "/produtividade",      label: "Produtividade",   icon: Activity, moduloChave: "produtividade", end: false },
       { to: "/tenants",            label: "Tenants",         icon: Shield, moduloChave: "tenants", adminOnly: true },
     ],
   },
@@ -268,6 +270,8 @@ export default function Layout() {
             const isGlobalAdmin = user?.role === "admin" && !user?.empresaId;
           const visibleItems = user ? group.items.filter(item => {
             if (item.adminOnly && !isGlobalAdmin) return false;
+            // Produtividade: só com a flag explícita (admin/permissoes=null não liberam).
+            if (item.moduloChave === "produtividade") return user.verProdutividade === true;
             // financeiro_editar inclui a leitura: quem só tem ele também enxerga o menu.
             return hasModulo(user, item.moduloChave)
               || (item.moduloChave === "financeiro" && hasModulo(user, "financeiro_editar"));

@@ -41,6 +41,7 @@ import Tenants            from "./pages/Tenants";
 import Assinaturas        from "./pages/Assinaturas";
 import Acordos            from "./pages/Acordos";
 import Recebimentos       from "./pages/Recebimentos";
+import Produtividade      from "./pages/Produtividade";
 import { trpc } from "./lib/trpc";
 import { AuthContext, type AuthUser } from "./lib/usePermission";
 
@@ -93,6 +94,7 @@ export default function App() {
           <Route path="assinaturas"         element={<Assinaturas />} />
           <Route path="acordos/:id?"        element={<Acordos />} />
           <Route path="recebimentos"        element={<Recebimentos />} />
+<Route path="produtividade/*"     element={<Produtividade />} />
           <Route path="financeiro"          element={<Financeiro />} />
           <Route path="financeiro/contas"   element={<ContasBancarias />} />
           <Route path="financeiro/contas/nova" element={<ContaBancariaForm />} />

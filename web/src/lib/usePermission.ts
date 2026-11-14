@@ -6,6 +6,7 @@ export interface AuthUser {
   email: string;
   empresaId: string | null;
   role: string;
+  verProdutividade?: boolean;
   permissoes: { modulos?: string[]; emitentes?: string[]; empresas_full?: string[] } | null;
 }
 
