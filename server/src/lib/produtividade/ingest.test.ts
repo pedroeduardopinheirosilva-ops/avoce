@@ -41,7 +41,7 @@ vi.mock("../../db.js", () => {
 const { parear, ingerir, hashToken, gerarCodigoPareamento } = await import("./ingest.js");
 const { dataLocal } = await import("./calculo.js");
 
-const disp = (o: Partial<Disp> = {}): Disp => ({ id: "d1", usuarioId: "u1", nome: "x", so: null, tokenHash: null, codigoPareamento: null, codigoExpiraEm: null, pareadoEm: null, bucketsVistos: [], ativo: true, ...o });
+const disp = (o: Partial<Disp> = {}): Disp => ({ id: "d1", usuarioId: "u1", nome: "x", so: null, tokenHash: null, codigoPareamento: null, codigoExpiraEm: null, pareadoEm: null, bucketsVistos: [], ativo: true, usuario: { monitorado: true }, ...o });
 const iso = (ms: number) => new Date(ms).toISOString();
 
 beforeEach(() => { st.disps = []; st.eventos = []; st.dias = []; st.updates = 0; });
@@ -75,6 +75,12 @@ describe("ingerir", () => {
     ativo({ ativo: false });
     await expect(ingerir(tok, lote([{ bucket: "afk", inicio: iso(Date.now() - 1000), duracaoSeg: 5 }]))).rejects.toThrow("token_invalido");
     expect(st.eventos).toHaveLength(0);
+  });
+  it("pessoa desmarcada como monitorada: recusado como token inválido e nada é gravado", async () => {
+    ativo({ usuario: { monitorado: false } });
+    await expect(ingerir(tok, lote([{ bucket: "afk", inicio: iso(Date.now() - 1000), duracaoSeg: 5 }]))).rejects.toThrow("token_invalido");
+    expect(st.eventos).toHaveLength(0);
+    expect(st.dias).toHaveLength(0);
   });
   it("reenvio do mesmo evento com duração maior atualiza, não duplica", async () => {
     ativo();

@@ -63,8 +63,14 @@ function diasCobertos(inicio: Date, fim: Date): string[] {
 }
 
 export async function ingerir(token: string, lote: LoteIngest): Promise<{ gravados: number; dias: string[] }> {
-  const disp = token ? await prisma.monitorDispositivo.findFirst({ where: { tokenHash: hashToken(token), ativo: true } }) : null;
-  if (!disp) throw new Error("token_invalido");
+  const disp = token
+    ? await prisma.monitorDispositivo.findFirst({
+        where: { tokenHash: hashToken(token), ativo: true },
+        include: { usuario: { select: { monitorado: true } } },
+      })
+    : null;
+  // Pessoa desmarcada como monitorada: recusa como token inválido (o coletor só registra e segue tentando).
+  if (!disp || !disp.usuario?.monitorado) throw new Error("token_invalido");
 
   const agora = Date.now();
   const max = agora + 5 * 60_000;
