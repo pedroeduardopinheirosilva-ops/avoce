@@ -622,6 +622,38 @@ app.post("/api/pix/webhook", async (req, reply) => {
   }
 });
 
+// ── Monitor de produtividade — coletor do PC (sem JWT; token do dispositivo) ──
+app.post("/api/produtividade/parear", async (req, reply) => {
+  const { parear } = await import("./lib/produtividade/ingest.js");
+  try {
+    const b = (req.body ?? {}) as { codigo?: string; nome?: string; so?: string };
+    const r = await parear({ codigo: b.codigo ?? "", nome: b.nome ?? "", so: b.so ?? "" });
+    return reply.send({ token: r.token });
+  } catch (err: any) {
+    if (err?.message === "codigo_invalido") return reply.status(400).send({ error: "codigo_invalido" });
+    app.log.error({ err }, "[Produtividade] parear");
+    return reply.status(500).send({ error: "Internal error" });
+  }
+});
+
+app.post("/api/produtividade/ingest", { bodyLimit: 10 * 1024 * 1024 }, async (req, reply) => {
+  const { ingerir } = await import("./lib/produtividade/ingest.js");
+  const auth = String(req.headers.authorization ?? "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+  const lote = req.body as any;
+  if (Array.isArray(lote?.eventos) && lote.eventos.length > 5000) {
+    return reply.status(413).send({ error: "lote_grande_demais" });
+  }
+  try {
+    const r = await ingerir(token, lote);
+    return reply.send({ gravados: r.gravados });
+  } catch (err: any) {
+    if (err?.message === "token_invalido") return reply.status(401).send({ error: "token_invalido" });
+    app.log.error({ err }, "[Produtividade] ingest");
+    return reply.status(500).send({ error: "Internal error" });
+  }
+});
+
 // ── Aceite público de proposta (sem auth) ─────────────────────────────────────
 
 app.get("/api/proposta/:token", async (req, reply) => {
