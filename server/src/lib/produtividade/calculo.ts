@@ -1,4 +1,4 @@
-import { classificar } from "./classificar.js";
+import { classificar, dominioDaUrl } from "./classificar.js";
 import {
   EXPEDIENTE_PADRAO,
   type Categoria,
@@ -55,15 +55,20 @@ export function calcularDia(
   const expFim = hhmmSeg(exp.fim);
   const diaUtil = exp.dias.includes(diaSemana);
 
-  // 1. ativo (união entre dispositivos)
+  // 1. ativo por dispositivo; o total global é a união (sem contagem em dobro)
   const ativo = new Uint8Array(DIA_SEG);
+  const ativoDisp = new Map<string, Uint8Array>();
   for (const e of eventos) {
     if (e.bucket !== "afk" || e.afk !== false) continue;
     const f = faixa(e, inicioDia);
-    if (f) ativo.fill(1, f[0], f[1]);
+    if (!f) continue;
+    let g = ativoDisp.get(e.dispositivoId);
+    if (!g) ativoDisp.set(e.dispositivoId, (g = new Uint8Array(DIA_SEG)));
+    g.fill(1, f[0], f[1]);
+    ativo.fill(1, f[0], f[1]);
   }
 
-  // 2. item: janelas ordenadas; primeiro a ocupar fica
+  // 2. item: janelas ordenadas; só vale a janela de um dispositivo ativo naquele segundo
   const itens: Item[] = [];
   const indice = new Map<string, number>();
   const idItem = (it: Item): number => {
@@ -77,25 +82,31 @@ export function calcularDia(
     return i;
   };
   const janelaIdx = new Int32Array(DIA_SEG).fill(-1);
-  const ordenadas = eventos.filter((e) => e.bucket === "janela").sort((a, b) => a.inicio.getTime() - b.inicio.getTime());
-  const webs = eventos.filter((e) => e.bucket === "web").sort((a, b) => a.inicio.getTime() - b.inicio.getTime());
-  const webIdx = new Int32Array(DIA_SEG).fill(-1);
+  const porInicio = (a: EventoBruto, b: EventoBruto) => a.inicio.getTime() - b.inicio.getTime();
+  const ordenadas = eventos.filter((e) => e.bucket === "janela").sort(porInicio);
+  const webs = eventos.filter((e) => e.bucket === "web").sort(porInicio);
   const webItens: Item[] = [];
+  const webDisp = new Map<string, Int32Array>();
   for (const w of webs) {
     const f = faixa(w, inicioDia);
     if (!f) continue;
-    const wi = webItens.push({ app: null, dominio: w.dominio ?? null, titulo: w.titulo ?? null }) - 1;
-    for (let s = f[0]; s < f[1]; s++) if (webIdx[s] === -1) webIdx[s] = wi;
+    const dominio = w.dominio || (w.url ? dominioDaUrl(w.url) : null);
+    const wi = webItens.push({ app: null, dominio, titulo: w.titulo ?? null }) - 1;
+    let g = webDisp.get(w.dispositivoId);
+    if (!g) webDisp.set(w.dispositivoId, (g = new Int32Array(DIA_SEG).fill(-1)));
+    for (let s = f[0]; s < f[1]; s++) if (g[s] === -1) g[s] = wi;
   }
   for (const j of ordenadas) {
     const f = faixa(j, inicioDia);
-    if (!f) continue;
+    const ativoJ = ativoDisp.get(j.dispositivoId);
+    if (!f || !ativoJ) continue;
     const base: Item = { app: j.app ?? null, dominio: null, titulo: j.titulo ?? null };
     const nav = ehNavegador(j.app);
+    const webJ = nav ? webDisp.get(j.dispositivoId) : undefined;
     for (let s = f[0]; s < f[1]; s++) {
-      if (!ativo[s] || janelaIdx[s] !== -1) continue;
-      const w = nav && webIdx[s] !== -1 ? webItens[webIdx[s]!]! : null;
-      janelaIdx[s] = idItem(w ? { app: base.app, dominio: w.dominio, titulo: w.titulo } : base);
+      if (!ativoJ[s] || janelaIdx[s] !== -1) continue;
+      const w = webJ && webJ[s] !== -1 ? webItens[webJ[s]!]! : null;
+      janelaIdx[s] = idItem(w && w.dominio ? w : base);
     }
   }
   const vazio = idItem({ app: null, dominio: null, titulo: null });

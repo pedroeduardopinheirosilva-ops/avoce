@@ -82,4 +82,46 @@ describe("calcularDia", () => {
     expect(r.primeiroEvento).toEqual(new Date("2026-11-13T09:00:00-03:00"));
     expect(r.ultimoEvento).toEqual(new Date("2026-11-13T09:30:00-03:00"));
   });
+
+  it("janela de dispositivo ocioso não contamina o tempo do dispositivo ativo", () => {
+    const r = calcularDia("2026-11-13", [
+      ev("afk", "09:00", 3600, { afk: true, dispositivoId: "B" }),
+      ev("janela", "08:30", 7200, { app: "chrome.exe", dispositivoId: "B" }),
+      ev("web", "08:30", 7200, { dominio: "youtube.com", dispositivoId: "B" }),
+      ev("afk", "09:00", 3600, { afk: false, dispositivoId: "A" }),
+      ev("janela", "09:00", 3600, { app: "WINWORD.EXE", dispositivoId: "A" }),
+    ], [word, regra("dominio", "youtube.com", "pessoal")], pessoa);
+    expect(r.dentro.ativo).toBe(3600);
+    expect(r.dentro.trabalho).toBe(3600);
+    expect(r.dentro.pessoal).toBe(0);
+  });
+
+  it("aba de outro dispositivo não vale para o navegador ativo", () => {
+    const r = calcularDia("2026-11-13", [
+      ev("afk", "09:00", 600, { afk: false, dispositivoId: "A" }),
+      ev("janela", "09:00", 600, { app: "chrome.exe", dispositivoId: "A" }),
+      ev("web", "09:00", 600, { dominio: "youtube.com", dispositivoId: "B" }),
+    ], [regra("dominio", "youtube.com", "pessoal"), regra("app", "chrome", "trabalho")], pessoa);
+    expect(r.dentro.pessoal).toBe(0);
+    expect(r.dentro.trabalho).toBe(600);
+  });
+
+  it("regra de app do navegador não concorre com a de domínio da aba", () => {
+    const r = calcularDia("2026-11-13", [
+      ev("afk", "09:00", 600, { afk: false }),
+      ev("janela", "09:00", 600, { app: "Google Chrome" }),
+      ev("web", "09:00", 600, { dominio: "pje.jus.br" }),
+    ], [regra("app", "google chrome", "pessoal"), regra("dominio", "pje.jus.br", "trabalho")], pessoa);
+    expect(r.dentro.trabalho).toBe(600);
+    expect(r.dentro.pessoal).toBe(0);
+  });
+
+  it("deriva o domínio da url quando a aba não traz dominio", () => {
+    const r = calcularDia("2026-11-13", [
+      ev("afk", "09:00", 600, { afk: false }),
+      ev("janela", "09:00", 600, { app: "chrome.exe" }),
+      ev("web", "09:00", 600, { url: "https://www.youtube.com/watch" }),
+    ], [regra("dominio", "youtube.com", "pessoal")], pessoa);
+    expect(r.dentro.pessoal).toBe(600);
+  });
 });
