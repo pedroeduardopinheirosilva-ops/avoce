@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const st = vi.hoisted(() => ({
   usuario: null as any,
@@ -8,6 +8,7 @@ const st = vi.hoisted(() => ({
   upserts: [] as any[],
   deleteWhere: null as any,
   calcArgs: null as any,
+  updateMany: [] as any[],
 }));
 
 vi.mock("../../db.js", () => ({
@@ -19,11 +20,16 @@ vi.mock("../../db.js", () => ({
       deleteMany: async ({ where }: any) => { st.deleteWhere = where; return { count: 3 }; },
     },
     monitorRegra: { findMany: async () => st.regras },
-    monitorDia: { upsert: async (a: any) => { st.upserts.push(a); }, findMany: async () => [] },
+    monitorDia: {
+      upsert: async (a: any) => { st.upserts.push(a); },
+      findMany: async () => [],
+      updateMany: async (a: any) => { st.updateMany.push(a); return { count: 4 }; },
+    },
   },
 }));
 
-const { recalcularDia, apagarEventosAntigos } = await import("./agregar.js");
+const { recalcularDia, apagarEventosAntigos, sujarDias } = await import("./agregar.js");
+const { limiteRetencao } = await import("./retencao.js");
 
 // 2026-11-11 é quarta; 10:00-03:00 = 13:00Z
 const ev = (bucket: string, hora: number, dur: number, extra: any = {}) => ({
@@ -39,8 +45,12 @@ beforeEach(() => {
     ev("afk", 10, 3600, { afk: false }),
     ev("janela", 10, 3600, { app: "excel.exe", titulo: "planilha" }),
   ];
-  st.upserts = []; st.deleteWhere = null;
+  st.upserts = []; st.deleteWhere = null; st.updateMany = [];
+  // relógio fixo: os dias de teste ficam sempre dentro da retenção
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date("2026-11-13T12:00:00-03:00"));
 });
+afterEach(() => { vi.useRealTimers(); });
 
 describe("recalcularDia", () => {
   it("grava os totais e limpa sujo", async () => {
@@ -67,6 +77,39 @@ describe("recalcularDia", () => {
     await recalcularDia("u1", "2026-11-11");
     expect(st.upserts[0].update.segTrabalho).toBe(0);
     expect(st.upserts[0].update.segTrabalhoFora).toBe(3600);
+  });
+});
+
+describe("recalcularDia fora da retenção", () => {
+  it("dia anterior ao limite não é sobrescrito: só limpa sujo", async () => {
+    const lim = limiteRetencao();
+    const r = await recalcularDia("u1", "2026-08-16");
+    expect("2026-08-16" < lim).toBe(true);
+    expect(r).toBeNull();
+    expect(st.upserts).toHaveLength(0);
+    expect(st.updateMany[0]).toEqual({ where: { usuarioId: "u1", data: "2026-08-16", sujo: true }, data: { sujo: false } });
+  });
+  it("o próprio dia limite ainda é recalculado", async () => {
+    const r = await recalcularDia("u1", limiteRetencao());
+    expect(r).not.toBeNull();
+    expect(st.upserts).toHaveLength(1);
+  });
+});
+
+describe("sujarDias", () => {
+  const base = { data: { gte: "2026-08-17" }, sujo: false };
+  it("regra geral: todos os monitorados, só dias recalculáveis", async () => {
+    expect(await sujarDias({ cargoId: null, usuarioId: null })).toBe(4);
+    expect(st.updateMany[0]).toEqual({ where: { ...base, usuario: { monitorado: true } }, data: { sujo: true } });
+  });
+  it("regra de cargo: quem tem o cargo", async () => {
+    await sujarDias({ cargoId: "c1", usuarioId: null });
+    expect(st.updateMany[0].where.usuario).toEqual({ monitorCargoId: "c1", monitorado: true });
+    expect(st.updateMany[0].where.data).toEqual(base.data);
+  });
+  it("regra de pessoa: só ela", async () => {
+    await sujarDias({ cargoId: null, usuarioId: "u7" });
+    expect(st.updateMany[0].where.usuario).toEqual({ id: "u7", monitorado: true });
   });
 });
 

@@ -1,9 +1,7 @@
 import { prisma } from "../../db.js";
 import { calcularDia, dataLocal } from "./calculo.js";
+import { DIA_MS, corteRetencao, limiteRetencao } from "./retencao.js";
 import type { EventoBruto, Expediente, Regra, ResultadoDia } from "./tipos.js";
-
-const DIA_MS = 86_400_000;
-const RETENCAO_DIAS = 90;
 
 export type EntradasDia = {
   eventos: EventoBruto[];
@@ -64,8 +62,16 @@ export async function carregarEntradasDia(usuarioId: string, data: string): Prom
   return { eventos, regras, pessoa: { usuarioId, cargoId, expediente } };
 }
 
-/** Calcula o dia do usuário a partir dos eventos brutos e grava o agregado em MonitorDia (sujo=false). */
-export async function recalcularDia(usuarioId: string, data: string): Promise<ResultadoDia> {
+/**
+ * Calcula o dia do usuário a partir dos eventos brutos e grava o agregado em MonitorDia (sujo=false).
+ * Dias anteriores ao limite de retenção não têm mais todos os eventos brutos: o total gravado é
+ * permanente e nunca é sobrescrito — só se limpa `sujo` e devolve null.
+ */
+export async function recalcularDia(usuarioId: string, data: string): Promise<ResultadoDia | null> {
+  if (data < limiteRetencao()) {
+    await prisma.monitorDia.updateMany({ where: { usuarioId, data, sujo: true }, data: { sujo: false } });
+    return null;
+  }
   const { eventos, regras, pessoa } = await carregarEntradasDia(usuarioId, data);
   const r = calcularDia(data, eventos, regras, pessoa);
 
@@ -125,9 +131,27 @@ export async function recalcularSujos(limite = 200): Promise<number> {
   return n;
 }
 
+/**
+ * Marca como sujos (para o cron recalcular) os dias ainda recalculáveis — `data >= limiteRetencao()` —
+ * das pessoas monitoradas no escopo: `usuarioId` → só ela; `cargoId` → quem tem o cargo; nenhum → todas.
+ * Usado quando regras, cargo ou expediente mudam.
+ */
+export async function sujarDias(escopo: { usuarioId?: string | null; cargoId?: string | null }): Promise<number> {
+  const usuario = escopo.usuarioId
+    ? { id: escopo.usuarioId, monitorado: true }
+    : escopo.cargoId
+      ? { monitorCargoId: escopo.cargoId, monitorado: true }
+      : { monitorado: true };
+  const r = await prisma.monitorDia.updateMany({
+    where: { data: { gte: limiteRetencao() }, sujo: false, usuario },
+    data: { sujo: true },
+  });
+  return r.count;
+}
+
 /** Retenção de eventos brutos: 90 dias. MonitorDia é permanente. */
 export async function apagarEventosAntigos(): Promise<number> {
-  const corte = new Date(Date.now() - RETENCAO_DIAS * DIA_MS);
+  const corte = new Date(corteRetencao());
   const r = await prisma.monitorEvento.deleteMany({ where: { inicio: { lt: corte } } });
   return r.count;
 }
