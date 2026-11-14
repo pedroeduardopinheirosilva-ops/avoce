@@ -9,6 +9,14 @@ import (
 	"time"
 )
 
+// Limites de tamanho dos campos — os mesmos que o servidor aplica em ingest.ts.
+const (
+	maxApp    = 300
+	maxTitulo = 500
+	maxURL    = 1000
+	limiteAW  = 5000 // eventos por página na API do aw-server
+)
+
 type awBucket struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
@@ -43,18 +51,30 @@ func str(m map[string]any, k string) string {
 	return s
 }
 
+// cortar limita s a n caracteres (runas), sem quebrar UTF-8.
+func cortar(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
 func converter(bucketTipo string, ev awEvento) eventoLote {
 	e := eventoLote{Bucket: bucketTipo, Inicio: ev.Timestamp, DuracaoSeg: ev.Duration}
 	switch bucketTipo {
 	case "janela":
-		e.App = str(ev.Data, "app")
-		e.Titulo = str(ev.Data, "title")
+		e.App = cortar(str(ev.Data, "app"), maxApp)
+		e.Titulo = cortar(str(ev.Data, "title"), maxTitulo)
 	case "afk":
 		v := str(ev.Data, "status") == "afk"
 		e.Afk = &v
 	case "web":
-		e.URL = str(ev.Data, "url")
-		e.Titulo = str(ev.Data, "title")
+		e.URL = cortar(str(ev.Data, "url"), maxURL)
+		e.Titulo = cortar(str(ev.Data, "title"), maxTitulo)
 	}
 	return e
 }
@@ -83,11 +103,51 @@ func (c *Coletor) listarBuckets(ctx context.Context) (map[string]string, error) 
 	return mapearBuckets(lista), nil
 }
 
+// eventosDesde lê todos os eventos do bucket a partir de `desde`. O aw-server devolve
+// os `limit` eventos MAIS NOVOS (do mais novo para o mais antigo); por isso, enquanto
+// uma página vier cheia, pede a próxima com `end` = timestamp mais antigo da página,
+// descartando os repetidos da fronteira. A ordem do resultado não é garantida.
 func (c *Coletor) eventosDesde(ctx context.Context, id string, desde time.Time) ([]awEvento, error) {
-	q := url.Values{}
-	q.Set("start", desde.UTC().Format(time.RFC3339))
-	q.Set("limit", "5000")
-	var evs []awEvento
-	err := c.getJSON(ctx, c.AwURL+"/api/0/buckets/"+url.PathEscape(id)+"/events?"+q.Encode(), &evs)
-	return evs, err
+	return c.eventosPaginados(ctx, id, desde, limiteAW)
+}
+
+func (c *Coletor) eventosPaginados(ctx context.Context, id string, desde time.Time, limite int) ([]awEvento, error) {
+	vistos := map[string]bool{}
+	var todos []awEvento
+	fim := ""
+	for {
+		q := url.Values{}
+		q.Set("start", desde.UTC().Format(time.RFC3339))
+		if fim != "" {
+			q.Set("end", fim)
+		}
+		q.Set("limit", fmt.Sprint(limite))
+		var pagina []awEvento
+		if err := c.getJSON(ctx, c.AwURL+"/api/0/buckets/"+url.PathEscape(id)+"/events?"+q.Encode(), &pagina); err != nil {
+			return nil, err
+		}
+		novos := 0
+		var maisAntigo time.Time
+		for _, ev := range pagina {
+			t, err := time.Parse(time.RFC3339Nano, ev.Timestamp)
+			if err != nil {
+				continue
+			}
+			if maisAntigo.IsZero() || t.Before(maisAntigo) {
+				maisAntigo = t
+			}
+			chave := t.UTC().Format(time.RFC3339Nano)
+			if vistos[chave] {
+				continue
+			}
+			vistos[chave] = true
+			todos = append(todos, ev)
+			novos++
+		}
+		// Página incompleta = acabou; página só com repetidos = não há como avançar.
+		if len(pagina) < limite || novos == 0 || maisAntigo.IsZero() {
+			return todos, nil
+		}
+		fim = maisAntigo.UTC().Format(time.RFC3339Nano)
+	}
 }

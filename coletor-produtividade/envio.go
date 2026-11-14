@@ -15,12 +15,15 @@ import (
 )
 
 const (
-	tamanhoLote      = 2000
+	tamanhoLote      = 500
 	sobreposicao     = 15 * time.Minute
 	janelaInicial    = 24 * time.Hour
 	awURLPadrao      = "http://localhost:5600"
 	errTokenRevogado = "token revogado"
 )
+
+// errLoteGrande: o Avoce (ou o nginx na frente dele) recusou o corpo por tamanho (413).
+var errLoteGrande = errors.New("lote grande demais (413)")
 
 type eventoLote struct {
 	Bucket     string  `json:"bucket"`
@@ -73,13 +76,22 @@ func (c *Coletor) enviar(ctx context.Context, eventos []eventoLote) error {
 	if resp.StatusCode == http.StatusUnauthorized {
 		return errors.New(errTokenRevogado)
 	}
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return errLoteGrande
+	}
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("Avoce respondeu %d", resp.StatusCode)
 	}
 	return nil
 }
 
+type eventoDatado struct {
+	t time.Time
+	e eventoLote
+}
+
 // ciclo lê os buckets do ActivityWatch e envia os eventos novos ao Avoce.
+// Falha num bucket não impede os demais (o estado daquele bucket só não avança).
 // Sempre envia ao menos um lote (vazio) como sinal de vida.
 func (c *Coletor) ciclo(ctx context.Context) error {
 	buckets, err := c.listarBuckets(ctx)
@@ -110,39 +122,23 @@ func (c *Coletor) ciclo(ctx context.Context) error {
 			}
 			continue
 		}
-		type par struct {
-			t time.Time
-			e eventoLote
-		}
-		ps := make([]par, 0, len(evs))
+		ps := make([]eventoDatado, 0, len(evs))
 		for _, ev := range evs {
 			t, err := time.Parse(time.RFC3339Nano, ev.Timestamp)
 			if err != nil {
 				continue
 			}
-			ps = append(ps, par{t, converter(buckets[id], ev)})
+			ps = append(ps, eventoDatado{t, converter(buckets[id], ev)})
 		}
 		sort.Slice(ps, func(i, j int) bool { return ps[i].t.Before(ps[j].t) })
-		for i := 0; i < len(ps); i += tamanhoLote {
-			fim := min(i+tamanhoLote, len(ps))
-			lote := make([]eventoLote, 0, fim-i)
-			maior := ps[i].t
-			for _, p := range ps[i:fim] {
-				lote = append(lote, p.e)
-				if p.t.After(maior) {
-					maior = p.t
-				}
+		n, err := c.enviarBucket(ctx, id, ps, estado)
+		posts += n
+		if err != nil {
+			if primeiroErro == nil {
+				primeiroErro = err
 			}
-			posts++
-			if err := c.enviar(ctx, lote); err != nil {
-				c.Log.Printf("falha ao enviar %d eventos de %s: %v", len(lote), id, err)
-				return err
-			}
-			if atual, err := time.Parse(time.RFC3339Nano, estado[id]); err != nil || maior.After(atual) {
-				estado[id] = maior.UTC().Format(time.RFC3339Nano)
-				if err := c.salvarEstado(estado); err != nil {
-					c.Log.Printf("erro salvando estado: %v", err)
-				}
+			if err.Error() == errTokenRevogado {
+				return err // inútil tentar os outros buckets
 			}
 		}
 	}
@@ -153,6 +149,52 @@ func (c *Coletor) ciclo(ctx context.Context) error {
 		}
 	}
 	return primeiroErro
+}
+
+// enviarBucket envia os eventos (já em ordem cronológica) em lotes de até tamanhoLote,
+// avançando o estado do bucket a cada lote aceito. Num 413 o lote é dividido ao meio
+// (até 1 evento); um evento sozinho que ainda dá 413 é descartado com registro no log.
+// Devolve quantos POSTs foram feitos e o primeiro erro que interrompeu o bucket.
+func (c *Coletor) enviarBucket(ctx context.Context, id string, ps []eventoDatado, estado map[string]string) (int, error) {
+	posts := 0
+	tam := tamanhoLote
+	avancar := func(t time.Time) {
+		if atual, err := time.Parse(time.RFC3339Nano, estado[id]); err != nil || t.After(atual) {
+			estado[id] = t.UTC().Format(time.RFC3339Nano)
+			if err := c.salvarEstado(estado); err != nil {
+				c.Log.Printf("erro salvando estado: %v", err)
+			}
+		}
+	}
+	for i := 0; i < len(ps); {
+		fim := min(i+tam, len(ps))
+		lote := make([]eventoLote, 0, fim-i)
+		maior := ps[i].t
+		for _, p := range ps[i:fim] {
+			lote = append(lote, p.e)
+			if p.t.After(maior) {
+				maior = p.t
+			}
+		}
+		posts++
+		err := c.enviar(ctx, lote)
+		switch {
+		case err == nil:
+			avancar(maior)
+			i = fim
+		case errors.Is(err, errLoteGrande) && tam > 1:
+			tam = max(tam/2, 1)
+		case errors.Is(err, errLoteGrande):
+			c.Log.Printf("evento de %s em %s recusado por tamanho (413); descartado", id, ps[i].e.Inicio)
+			avancar(maior)
+			i = fim
+			tam = tamanhoLote
+		default:
+			c.Log.Printf("falha ao enviar %d eventos de %s: %v", len(lote), id, err)
+			return posts, err
+		}
+	}
+	return posts, nil
 }
 
 // parear troca o código de pareamento por um token e grava config.json em dir.
