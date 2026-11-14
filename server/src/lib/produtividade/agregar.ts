@@ -5,8 +5,14 @@ import type { EventoBruto, Expediente, Regra, ResultadoDia } from "./tipos.js";
 const DIA_MS = 86_400_000;
 const RETENCAO_DIAS = 90;
 
-/** Calcula o dia do usuário a partir dos eventos brutos e grava o agregado em MonitorDia (sujo=false). */
-export async function recalcularDia(usuarioId: string, data: string): Promise<ResultadoDia> {
+export type EntradasDia = {
+  eventos: EventoBruto[];
+  regras: Regra[];
+  pessoa: { usuarioId: string; cargoId: string | null; expediente: Expediente | null };
+};
+
+/** Carrega eventos brutos (com folga de 1 dia antes e 2 depois), regras aplicáveis, cargo e expediente do usuário. */
+export async function carregarEntradasDia(usuarioId: string, data: string): Promise<EntradasDia> {
   const usuario = await prisma.usuario.findUnique({
     where: { id: usuarioId },
     select: { monitorCargoId: true, monitorExpediente: true },
@@ -55,7 +61,13 @@ export async function recalcularDia(usuarioId: string, data: string): Promise<Re
   }));
 
   const expediente = (usuario?.monitorExpediente as Expediente | null | undefined) ?? null;
-  const r = calcularDia(data, eventos, regras, { usuarioId, cargoId, expediente });
+  return { eventos, regras, pessoa: { usuarioId, cargoId, expediente } };
+}
+
+/** Calcula o dia do usuário a partir dos eventos brutos e grava o agregado em MonitorDia (sujo=false). */
+export async function recalcularDia(usuarioId: string, data: string): Promise<ResultadoDia> {
+  const { eventos, regras, pessoa } = await carregarEntradasDia(usuarioId, data);
+  const r = calcularDia(data, eventos, regras, pessoa);
 
   const campos = {
     segAtivo: Math.round(r.dentro.ativo),

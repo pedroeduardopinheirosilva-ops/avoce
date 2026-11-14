@@ -53,7 +53,7 @@ export const authRouter = router({
   me: authProc.query(async ({ ctx }) => {
     const user = await prisma.usuario.findUniqueOrThrow({
       where: { id: ctx.userId },
-      select: { id: true, nome: true, email: true, empresaId: true, role: true, permissoes: true },
+      select: { id: true, nome: true, email: true, empresaId: true, role: true, permissoes: true, verProdutividade: true },
     });
     return user;
   }),

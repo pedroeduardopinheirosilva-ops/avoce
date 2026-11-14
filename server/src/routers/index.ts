@@ -28,6 +28,7 @@ import { metaSocialRouter }           from "./metaSocial.js";
 import { disparosRouter }             from "./disparos.js";
 import { acordosRouter }              from "./acordos.js";
 import { recebimentosRouter }         from "./recebimentos.js";
+import { produtividadeRouter }        from "./produtividade.js";
 
 export type { Context } from "./trpc.js";
 
@@ -61,6 +62,7 @@ export const appRouter = router({
   disparos:          disparosRouter,
   acordos:           acordosRouter,
   recebimentos:      recebimentosRouter,
+  produtividade:     produtividadeRouter,
 });
 
 export type AppRouter = typeof appRouter;
