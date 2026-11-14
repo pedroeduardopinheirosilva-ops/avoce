@@ -25,6 +25,8 @@ A rota `GET /api/produtividade/coletor/:arquivo` serve só esses 5 nomes.
 
 ## Reinstalação
 
+No Windows os binários do ActivityWatch ficam em `%LOCALAPPDATA%\activitywatch-app` (substituída a cada execução); `%LOCALAPPDATA%\activitywatch` (banco, logs e config do ActivityWatch) nunca é tocada. No Mac só `~/Applications/ActivityWatch.app` é substituído.
+
 Rodar de novo atualiza os binários sem duplicar: o coletor é parado antes de trocar o
 binário, o atalho da pasta Inicializar e o item de login são sobrescritos/recriados e o
 LaunchAgent é descarregado antes de recarregar.

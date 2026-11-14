@@ -15,7 +15,8 @@ $ExtId = 'nglaklhklhcoonedhgnpgddginnjdadi'   # ActivityWatch Web Watcher
 $ExtUrl = "https://chromewebstore.google.com/detail/activitywatch-web-watcher/$ExtId"
 $NomePc = $env:COMPUTERNAME
 
-$DirAw = Join-Path $env:LOCALAPPDATA 'activitywatch'
+# Só os binários; os dados do ActivityWatch (banco, logs, config) ficam em %LOCALAPPDATA%\activitywatch e nunca são apagados.
+$DirAw = Join-Path $env:LOCALAPPDATA 'activitywatch-app'
 $DirColetor = Join-Path $env:LOCALAPPDATA 'avoce-coletor'
 $Inicializar = [Environment]::GetFolderPath('Startup')
 $LogColetor = Join-Path $env:APPDATA 'avoce-coletor\coletor.log'
