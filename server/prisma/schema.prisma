@@ -81,6 +81,17 @@ model Usuario {
   voipRamal       String?
   voipRamalSenha  String?
 
+  // Monitor de produtividade
+  verProdutividade  Boolean @default(false)
+  monitorado        Boolean @default(false)
+  monitorCargoId    String?
+  monitorExpediente Json?   // { dias: number[] (0=dom..6=sáb), inicio: "HH:MM", fim: "HH:MM" } | null = padrão
+
+  monitorCargo         MonitorCargo?        @relation(fields: [monitorCargoId], references: [id], onDelete: SetNull)
+  monitorDispositivos  MonitorDispositivo[]
+  monitorDias          MonitorDia[]
+  monitorRegras        MonitorRegra[]
+
   empresa              Empresa?            @relation(fields: [empresaId], references: [id])
   projetoUsuarios      IaProjetoUsuario[]
   assistenteSessao     AssistenteSession?
@@ -2088,4 +2099,92 @@ model FinAuditLog {
 
   @@index([emitenteId, criadoEm])
   @@index([entidade, entidadeId])
+}
+
+// ─── Monitor de produtividade ───────────────────────────────────────────────
+
+model MonitorCargo {
+  id       String   @id @default(cuid())
+  nome     String   @unique
+  criadoEm DateTime @default(now())
+
+  usuarios Usuario[]
+  regras   MonitorRegra[]
+}
+
+model MonitorDispositivo {
+  id               String    @id @default(cuid())
+  usuarioId        String
+  nome             String
+  so               String? // "windows" | "mac"
+  tokenHash        String?   @unique
+  codigoPareamento String?   @unique
+  codigoExpiraEm   DateTime?
+  pareadoEm        DateTime?
+  ultimoEnvioEm    DateTime?
+  versaoColetor    String?
+  bucketsVistos    String[]  @default([])
+  ultimoTituloEm   DateTime?
+  ativo            Boolean   @default(true)
+  criadoEm         DateTime  @default(now())
+
+  usuario Usuario         @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  eventos MonitorEvento[]
+
+  @@index([usuarioId])
+}
+
+model MonitorEvento {
+  id            BigInt   @id @default(autoincrement())
+  dispositivoId String
+  bucket        String // "janela" | "afk" | "web"
+  inicio        DateTime
+  duracaoSeg    Float
+  app           String?
+  titulo        String?
+  url           String?
+  dominio       String?
+  afk           Boolean?
+
+  dispositivo MonitorDispositivo @relation(fields: [dispositivoId], references: [id], onDelete: Cascade)
+
+  @@unique([dispositivoId, bucket, inicio])
+  @@index([dispositivoId, inicio])
+}
+
+model MonitorRegra {
+  id         String   @id @default(cuid())
+  alvo       String // "app" | "dominio" | "titulo"
+  padrao     String
+  categoria  String // "trabalho" | "pessoal" | "neutro"
+  cargoId    String?
+  usuarioId  String?
+  prioridade Int      @default(0)
+  criadoEm   DateTime @default(now())
+
+  cargo   MonitorCargo? @relation(fields: [cargoId], references: [id], onDelete: Cascade)
+  usuario Usuario?      @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+}
+
+model MonitorDia {
+  usuarioId       String
+  data            String // "YYYY-MM-DD" (fuso -03:00)
+  segAtivo        Int       @default(0)
+  segTrabalho     Int       @default(0)
+  segPessoal      Int       @default(0)
+  segNeutro       Int       @default(0)
+  segAtivoFora    Int       @default(0)
+  segTrabalhoFora Int       @default(0)
+  segPessoalFora  Int       @default(0)
+  segNeutroFora   Int       @default(0)
+  primeiroEvento  DateTime?
+  ultimoEvento    DateTime?
+  topJson         Json?
+  sujo            Boolean   @default(true)
+  calculadoEm     DateTime?
+
+  usuario Usuario @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+
+  @@id([usuarioId, data])
+  @@index([sujo])
 }
