@@ -623,8 +623,15 @@ app.post("/api/pix/webhook", async (req, reply) => {
 });
 
 // ── Monitor de produtividade — coletor do PC (sem JWT; token do dispositivo) ──
+const ipDoColetor = (req: any): string => {
+  const xff = String(req.headers["x-forwarded-for"] ?? "").split(",")[0].trim();
+  return xff || req.ip;
+};
+
 app.post("/api/produtividade/parear", async (req, reply) => {
   const { parear } = await import("./lib/produtividade/ingest.js");
+  const { permitir } = await import("./lib/produtividade/limite.js");
+  if (!permitir(`parear:${ipDoColetor(req)}`, 10, 60_000)) return reply.status(429).send({ error: "muitas_tentativas" });
   try {
     const b = (req.body ?? {}) as { codigo?: string; nome?: string; so?: string };
     const r = await parear({ codigo: b.codigo ?? "", nome: b.nome ?? "", so: b.so ?? "" });
@@ -638,6 +645,9 @@ app.post("/api/produtividade/parear", async (req, reply) => {
 
 app.post("/api/produtividade/ingest", { bodyLimit: 10 * 1024 * 1024 }, async (req, reply) => {
   const { ingerir } = await import("./lib/produtividade/ingest.js");
+  const { bloqueado, registrar } = await import("./lib/produtividade/limite.js");
+  const chaveFalha = `ingest-falha:${ipDoColetor(req)}`;
+  if (bloqueado(chaveFalha, 30, 60_000)) return reply.status(429).send({ error: "muitas_tentativas" });
   const auth = String(req.headers.authorization ?? "");
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   const lote = req.body as any;
@@ -648,7 +658,10 @@ app.post("/api/produtividade/ingest", { bodyLimit: 10 * 1024 * 1024 }, async (re
     const r = await ingerir(token, lote);
     return reply.send({ gravados: r.gravados });
   } catch (err: any) {
-    if (err?.message === "token_invalido") return reply.status(401).send({ error: "token_invalido" });
+    if (err?.message === "token_invalido") {
+      registrar(chaveFalha, 60_000);
+      return reply.status(401).send({ error: "token_invalido" });
+    }
     app.log.error({ err }, "[Produtividade] ingest");
     return reply.status(500).send({ error: "Internal error" });
   }

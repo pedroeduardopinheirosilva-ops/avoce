@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 type Disp = any;
-const st = vi.hoisted(() => ({ disps: [] as any[], eventos: [] as any[], dias: [] as any[] }));
+const st = vi.hoisted(() => ({ disps: [] as any[], eventos: [] as any[], dias: [] as any[], updates: 0 }));
 
 vi.mock("../../db.js", () => {
   const match = (o: any, w: any) => Object.entries(w).every(([k, v]) => o[k] === v);
@@ -10,6 +10,12 @@ vi.mock("../../db.js", () => {
       monitorDispositivo: {
         findFirst: async ({ where }: any) => st.disps.find((d) => match(d, where)) ?? null,
         update: async ({ where, data }: any) => { const d = st.disps.find((x) => x.id === where.id); Object.assign(d, data); return d; },
+        updateMany: async ({ where, data }: any) => {
+          const d = st.disps.find((x) => x.id === where.id && x.codigoPareamento === where.codigoPareamento && x.pareadoEm === null
+            && x.codigoExpiraEm && x.codigoExpiraEm.getTime() >= where.codigoExpiraEm.gte.getTime());
+          if (!d) return { count: 0 };
+          Object.assign(d, data); return { count: 1 };
+        },
       },
       monitorEvento: {
         findMany: async ({ where }: any) =>
@@ -18,7 +24,7 @@ vi.mock("../../db.js", () => {
         update: async ({ where, data }: any) => {
           const k = where.dispositivoId_bucket_inicio;
           const e = st.eventos.find((x) => x.dispositivoId === k.dispositivoId && x.bucket === k.bucket && x.inicio.getTime() === k.inicio.getTime());
-          Object.assign(e, data); return e;
+          st.updates++; Object.assign(e, data); return e;
         },
       },
       monitorDia: {
@@ -38,7 +44,7 @@ const { dataLocal } = await import("./calculo.js");
 const disp = (o: Partial<Disp> = {}): Disp => ({ id: "d1", usuarioId: "u1", nome: "x", so: null, tokenHash: null, codigoPareamento: null, codigoExpiraEm: null, pareadoEm: null, bucketsVistos: [], ativo: true, ...o });
 const iso = (ms: number) => new Date(ms).toISOString();
 
-beforeEach(() => { st.disps = []; st.eventos = []; st.dias = []; });
+beforeEach(() => { st.disps = []; st.eventos = []; st.dias = []; st.updates = 0; });
 
 describe("gerarCodigoPareamento", () => {
   it("8 caracteres do alfabeto sem ambíguos", () => {
@@ -84,6 +90,29 @@ describe("ingerir", () => {
     const r = await ingerir(tok, lote([{ bucket: "afk", inicio: iso(t), duracaoSeg: 30, afk: false }]));
     expect(r.dias).toContain(dataLocal(new Date(t)));
     expect(st.dias.find((d) => d.data === dataLocal(new Date(t)))?.sujo).toBe(true);
+  });
+  it("durações absurdas ou negativas são descartadas e o resto do lote é salvo", async () => {
+    ativo();
+    const t = Date.now() - 60_000;
+    const r = await ingerir(tok, lote([
+      { bucket: "afk", inicio: iso(t), duracaoSeg: 1e300 },
+      { bucket: "afk", inicio: iso(t - 1000), duracaoSeg: 1e15 },
+      { bucket: "afk", inicio: iso(t - 2000), duracaoSeg: -1 },
+      { bucket: "afk", inicio: iso(t - 3000), duracaoSeg: 86401 },
+      { bucket: "afk", inicio: iso(t - 4000), duracaoSeg: 20 },
+    ]));
+    expect(r.gravados).toBe(1);
+    expect(st.eventos).toHaveLength(1);
+  });
+  it("reenvio de lote idêntico não faz nenhum update de evento nem suja dias", async () => {
+    ativo();
+    const l = lote([{ bucket: "janela", inicio: iso(Date.now() - 3600_000), duracaoSeg: 60, app: "x", titulo: "t" }]);
+    await ingerir(tok, l);
+    st.dias.forEach((d) => (d.sujo = false));
+    const r = await ingerir(tok, l);
+    expect(st.updates).toBe(0);
+    expect(r.dias).toEqual([]);
+    expect(st.dias.every((d) => d.sujo === false)).toBe(true);
   });
   it("evento no futuro distante é descartado", async () => {
     ativo();

@@ -25,8 +25,8 @@ export async function parear(input: { codigo: string; nome: string; so: string }
     throw new Error("codigo_invalido");
   }
   const token = randomBytes(32).toString("hex");
-  await prisma.monitorDispositivo.update({
-    where: { id: disp.id },
+  const r = await prisma.monitorDispositivo.updateMany({
+    where: { id: disp.id, codigoPareamento: codigo, pareadoEm: null, codigoExpiraEm: { gte: new Date() } },
     data: {
       tokenHash: hashToken(token),
       codigoPareamento: null,
@@ -36,6 +36,7 @@ export async function parear(input: { codigo: string; nome: string; so: string }
       so: input.so ? String(input.so).slice(0, 50) : disp.so,
     },
   });
+  if (r.count !== 1) throw new Error("codigo_invalido");
   return { token, dispositivoId: disp.id };
 }
 
@@ -49,6 +50,7 @@ export type LoteIngest = {
 function diasCobertos(inicio: Date, fim: Date): string[] {
   const ini = dataLocal(inicio);
   const ate = dataLocal(fim);
+  if (isNaN(fim.getTime())) return [ini];
   const out = [ini];
   let cur = ini;
   let t = new Date(`${ini}T12:00:00-03:00`).getTime();
@@ -77,7 +79,7 @@ export async function ingerir(token: string, lote: LoteIngest): Promise<{ gravad
     if (!e || !(BUCKETS as readonly string[]).includes(e.bucket)) continue;
     const inicio = new Date(e.inicio);
     const dur = Number(e.duracaoSeg);
-    if (isNaN(inicio.getTime()) || !isFinite(dur) || dur < 0) continue;
+    if (isNaN(inicio.getTime()) || !isFinite(dur) || dur < 0 || dur > 86400) continue;
     if (inicio.getTime() > max || inicio.getTime() < min) continue;
     const url = e.url ? String(e.url).slice(0, 1000) : null;
     validos.set(`${e.bucket}|${inicio.getTime()}`, {
@@ -93,10 +95,11 @@ export async function ingerir(token: string, lote: LoteIngest): Promise<{ gravad
   }
   const eventos = [...validos.values()];
 
+  const mudados: typeof eventos = []; // criados ou realmente alterados
   if (eventos.length) {
     const existentes = await prisma.monitorEvento.findMany({
       where: { dispositivoId: disp.id, inicio: { in: eventos.map((e) => e.inicio) } },
-      select: { id: true, bucket: true, inicio: true, duracaoSeg: true },
+      select: { id: true, bucket: true, inicio: true, duracaoSeg: true, app: true, titulo: true, url: true, dominio: true, afk: true },
     });
     const porChave = new Map(existentes.map((x) => [`${x.bucket}|${x.inicio.getTime()}`, x]));
     const novos = eventos.filter((e) => !porChave.has(`${e.bucket}|${e.inicio.getTime()}`));
@@ -106,9 +109,12 @@ export async function ingerir(token: string, lote: LoteIngest): Promise<{ gravad
         skipDuplicates: true,
       });
     }
+    for (const e of novos) mudados.push(e);
     for (const e of eventos) {
       const ex = porChave.get(`${e.bucket}|${e.inicio.getTime()}`);
       if (!ex) continue;
+      if (ex.duracaoSeg === e.duracaoSeg && ex.app === e.app && ex.titulo === e.titulo && ex.url === e.url && ex.dominio === e.dominio && ex.afk === e.afk) continue;
+      mudados.push(e);
       await prisma.monitorEvento.update({
         where: { dispositivoId_bucket_inicio: { dispositivoId: disp.id, bucket: e.bucket, inicio: e.inicio } },
         data: { duracaoSeg: e.duracaoSeg, app: e.app, titulo: e.titulo, url: e.url, dominio: e.dominio, afk: e.afk },
@@ -132,7 +138,7 @@ export async function ingerir(token: string, lote: LoteIngest): Promise<{ gravad
   });
 
   const dias = new Set<string>();
-  for (const e of eventos) {
+  for (const e of mudados) {
     for (const d of diasCobertos(e.inicio, new Date(e.inicio.getTime() + e.duracaoSeg * 1000))) dias.add(d);
   }
   for (const data of dias) {
